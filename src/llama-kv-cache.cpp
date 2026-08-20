@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -291,6 +292,19 @@ llama_kv_cache::llama_kv_cache(
         LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
 
         ggml_backend_buffer_clear(buf, 0);
+        if (getenv("GGML_CUDA_PREFER_KV_HOST") != nullptr && ggml_backend_buffer_get_size(buf) > 0) {
+            ggml_backend_dev_t dev_kv = ggml_backend_buft_get_device(buft);
+            if (dev_kv != nullptr) {
+                ggml_backend_reg_t reg_kv = ggml_backend_dev_backend_reg(dev_kv);
+                using prefer_host_fn_t = bool (*)(ggml_backend_buffer_t);
+                auto * prefer_host_fn = (prefer_host_fn_t) ggml_backend_reg_get_proc_address(
+                    reg_kv, "ggml_backend_cuda_buffer_set_preferred_host");
+                if (prefer_host_fn != nullptr) {
+                    (void) prefer_host_fn(buf);
+                }
+            }
+        }
+
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 

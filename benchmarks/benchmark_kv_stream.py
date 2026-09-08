@@ -62,7 +62,6 @@ def parse_token_count(value: str) -> int:
 
 
 def parse_fill(value: str | None) -> list[list[int]] | None:
-    # "," separates measurement points, "+" joins concurrent requests in a point
     if value is None:
         return None
     return [
@@ -271,7 +270,6 @@ def clean_server_env(
 
 
 def slot_capacity(args: argparse.Namespace, context_capacity: int) -> int:
-    # only the unified cache gives every slot the full context
     if args.kv_unified == "on":
         return context_capacity
     return context_capacity // args.parallel

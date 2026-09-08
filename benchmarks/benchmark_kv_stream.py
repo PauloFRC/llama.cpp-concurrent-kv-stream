@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 from dataclasses import dataclass
 import datetime as dt
@@ -58,6 +59,16 @@ def parse_token_count(value: str) -> int:
     if result <= 0:
         raise argparse.ArgumentTypeError("token count must be positive")
     return result
+
+
+def parse_fill(value: str | None) -> list[list[int]] | None:
+    # "," separates measurement points, "+" joins concurrent requests in a point
+    if value is None:
+        return None
+    return [
+        [parse_token_count(depth) for depth in point.split("+")]
+        for point in value.split(",")
+    ]
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -117,6 +128,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="use exactly this KV pool size and skip per-context probing",
     )
     parser.add_argument(
+        "--parallel", type=int, default=1,
+        help="server slot count (-np)",
+    )
+    parser.add_argument(
+        "--kv-unified", choices=("auto", "on", "off"), default="auto",
+        help="pin the KV cache mode",
+    )
+    parser.add_argument(
+        "--fill",
+        help="KV depths to test (e.g. 4K,16K,100K+10K)",
+    )
+    parser.add_argument(
+        "--n-gpu-layers", default="all",
+        help="layers to offload to the GPU",
+    )
+    parser.add_argument(
         "--trace-kv-stream",
         action="store_true",
         help="enable and parse adaptive KV residency trace logging",
@@ -142,6 +169,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="append a server argument (repeat; use --extra-server-arg=--flag)",
     )
     args = parser.parse_args(argv)
+    args.fill = parse_fill(args.fill)
     args.model = args.model.resolve()
     args.server = args.server.resolve()
     if not args.server.is_file():
@@ -242,12 +270,28 @@ def clean_server_env(
     return env
 
 
+def slot_capacity(args: argparse.Namespace, context_capacity: int) -> int:
+    # only the unified cache gives every slot the full context
+    if args.kv_unified == "on":
+        return context_capacity
+    return context_capacity // args.parallel
+
+
+def request_shapes(
+    args: argparse.Namespace,
+    context_capacity: int,
+) -> list[tuple[int, ...]]:
+    if args.fill is not None:
+        return [tuple(point) for point in args.fill]
+    return [(slot_capacity(args, context_capacity),)]
+
+
 def server_command(
     args: argparse.Namespace,
     context_capacity: int,
     pool_mib: int,
 ) -> list[str]:
-    return [
+    command = [
         str(args.server),
         "-m",
         str(args.model),
@@ -266,21 +310,26 @@ def server_command(
         "-ctv",
         args.cache_type_v,
         "-ngl",
-        "all",
+        args.n_gpu_layers,
         "-b",
         str(args.batch_size),
         "-ub",
         str(args.ubatch_size),
         "-np",
-        "1",
+        str(args.parallel),
         "--no-mmproj",
         "--no-warmup",
         "--reasoning-format",
         "none",
         "--kv-stream-stage-mib",
         str(pool_mib),
-        *args.extra_server_arg,
     ]
+    if args.kv_unified != "auto":
+        command.append(
+            "--kv-unified" if args.kv_unified == "on" else "--no-kv-unified"
+        )
+    command.extend(args.extra_server_arg)
+    return command
 
 
 class Server:
@@ -419,15 +468,25 @@ def append_jsonl(path: Path, row: dict) -> None:
     print(json.dumps(row, sort_keys=True), flush=True)
 
 
-def load_measurements(path: Path) -> dict[int, dict]:
-    rows: dict[int, dict] = {}
+def row_fill_tokens(row: dict) -> int:
+    return int(row.get("fill_tokens") or row["context_capacity"])
+
+
+def measurement_key(row: dict) -> tuple[int, tuple[int, ...]]:
+    capacity = int(row["context_capacity"])
+    shape = row.get("fill_shape") or [capacity]
+    return capacity, tuple(int(fill) for fill in shape)
+
+
+def load_measurements(path: Path) -> dict[tuple[int, tuple[int, ...]], dict]:
+    rows: dict[tuple[int, tuple[int, ...]], dict] = {}
     if not path.is_file():
         return rows
     with path.open() as stream:
         for line in stream:
             row = json.loads(line)
             if row.get("type") == "measurement" and row.get("status") == "ok":
-                rows[int(row["context_capacity"])] = row
+                rows[measurement_key(row)] = row
     return rows
 
 
@@ -452,6 +511,10 @@ def resume_signature(args: argparse.Namespace, capacities: list[int]) -> dict:
         "cache_type_k": args.cache_type_k,
         "cache_type_v": args.cache_type_v,
         "fixed_pool_mib": args.fixed_pool_mib,
+        "parallel": args.parallel,
+        "kv_unified": args.kv_unified,
+        "n_gpu_layers": args.n_gpu_layers,
+        "fill": args.fill,
         "trace_kv_stream": args.trace_kv_stream,
         "capacities": capacities,
         "decode_tokens": args.decode_tokens,
@@ -585,66 +648,115 @@ def parse_kv_stream_trace(log_path: Path) -> dict:
 
 
 
+def decode_request(
+    args: argparse.Namespace,
+    server: Server,
+    prompt: list[int],
+) -> dict:
+    started = time.monotonic()
+    response = http_json(
+        server.url("/completion"),
+        {
+            "prompt": prompt,
+            "n_predict": args.decode_tokens,
+            "ignore_eos": True,
+            "cache_prompt": False,
+            "temperature": 0,
+            "seed": 1,
+            "reasoning_format": "none",
+            "response_fields": ["timings"],
+        },
+        args.request_timeout,
+    )
+    timings = response.get("timings") or {}
+    if timings.get("predicted_n") != args.decode_tokens:
+        raise RuntimeError(
+            f"incomplete decode: expected {args.decode_tokens}, "
+            f"received {timings.get('predicted_n')}"
+        )
+    return {
+        "prompt_tokens": timings.get("prompt_n"),
+        "prompt_ms": timings.get("prompt_ms"),
+        "prefill_tps": timings.get("prompt_per_second"),
+        "predicted_ms": timings.get("predicted_ms"),
+        "decode_tps": timings.get("predicted_per_second"),
+        "wall_seconds": time.monotonic() - started,
+    }
+
+
+def summarize_streams(
+    streams: list[dict],
+    window_seconds: float,
+    decode_tokens: int,
+) -> dict:
+    return {
+        "concurrency": len(streams),
+        "prefill_tps": sum(stream["prefill_tps"] for stream in streams),
+        "decode_tps": sum(stream["decode_tps"] for stream in streams),
+        "end_to_end_tps": len(streams) * decode_tokens / window_seconds,
+        "decode_tps_per_stream": [stream["decode_tps"] for stream in streams],
+        "prefill_tps_per_stream": [stream["prefill_tps"] for stream in streams],
+        "prompt_ms": max(stream["prompt_ms"] for stream in streams),
+        "predicted_ms": max(stream["predicted_ms"] for stream in streams),
+    }
+
+
 def run_measurement(
     args: argparse.Namespace,
     context_capacity: int,
+    fills: tuple[int, ...],
     pool_mib: int,
     baseline_used_mib: int,
     logs_dir: Path,
 ) -> dict:
-    prompt_tokens = context_capacity - args.decode_tokens
+    label = "-".join(str(fill) for fill in fills)
     server: Server | None = None
     try:
         server = Server(
             args,
             context_capacity,
             pool_mib,
-            logs_dir / f"context-{context_capacity}-pool-{pool_mib}.log",
+            logs_dir
+            / f"context-{context_capacity}-fill-{label}-pool-{pool_mib}.log",
         )
         suffix, fill_token_id = prepare_server(args, server)
-        prefix_count = prompt_tokens - len(suffix)
-        if prefix_count < 0:
-            raise RuntimeError("context capacity is too small for the prompt")
-        prompt = [fill_token_id] * prefix_count + suffix
+        prompts = []
+        for fill in fills:
+            prefix_count = fill - args.decode_tokens - len(suffix)
+            if prefix_count < 0:
+                raise RuntimeError(f"fill {fill} is too small for the prompt")
+            prompts.append([fill_token_id] * prefix_count + suffix)
         before = query_gpu_memory(args.nvidia_smi, args.gpu_index)
         started = time.monotonic()
-        response = http_json(
-            server.url("/completion"),
-            {
-                "prompt": prompt,
-                "n_predict": args.decode_tokens,
-                "ignore_eos": True,
-                "cache_prompt": False,
-                "temperature": 0,
-                "seed": 1,
-                "reasoning_format": "none",
-                "response_fields": ["timings"],
-            },
-            args.request_timeout,
-        )
-        timings = response.get("timings") or {}
-        if timings.get("predicted_n") != args.decode_tokens:
-            raise RuntimeError(
-                f"incomplete decode: expected {args.decode_tokens}, "
-                f"received {timings.get('predicted_n')}"
-            )
+        with concurrent.futures.ThreadPoolExecutor(len(prompts)) as pool:
+            futures = [
+                pool.submit(decode_request, args, server, prompt)
+                for prompt in prompts
+            ]
+            try:
+                streams = [future.result() for future in futures]
+            except Exception:
+                server.stop()
+                raise
+        window_seconds = time.monotonic() - started
         after = query_gpu_memory(args.nvidia_smi, args.gpu_index)
         measurement = {
             "type": "measurement",
             "status": "ok",
             "context_capacity": context_capacity,
-            "prompt_tokens": prompt_tokens,
+            "fill_shape": list(fills),
+            "fill_tokens": max(fills),
+            "prompt_tokens": sum(stream["prompt_tokens"] for stream in streams),
             "decode_tokens": args.decode_tokens,
+            "parallel": args.parallel,
+            "kv_unified": args.kv_unified,
             "pool_mib": pool_mib,
             "fill_token_id": fill_token_id,
-            "prompt_ms": timings.get("prompt_ms"),
-            "prefill_tps": timings.get("prompt_per_second"),
-            "predicted_ms": timings.get("predicted_ms"),
-            "decode_tps": timings.get("predicted_per_second"),
-            "wall_seconds": time.monotonic() - started,
+            "wall_seconds": window_seconds,
             "vram_before_mib": before.used_mib,
             "vram_after_mib": after.used_mib,
             "vram_free_after_mib": after.free_mib,
+            **summarize_streams(streams, window_seconds, args.decode_tokens),
         }
         if args.trace_kv_stream:
             measurement.update(parse_kv_stream_trace(server.log_path))
@@ -658,6 +770,7 @@ def run_measurement(
 def benchmark_with_backoff(
     args: argparse.Namespace,
     context_capacity: int,
+    fills: tuple[int, ...],
     selected_pool_mib: int,
     baseline_used_mib: int,
     logs_dir: Path,
@@ -675,6 +788,7 @@ def benchmark_with_backoff(
             return run_measurement(
                 args,
                 context_capacity,
+                fills,
                 pool_mib,
                 baseline_used_mib,
                 logs_dir,
@@ -687,6 +801,7 @@ def benchmark_with_backoff(
                     "type": "measurement_attempt",
                     "status": "failed",
                     "context_capacity": context_capacity,
+                    "fill_shape": list(fills),
                     "pool_mib": pool_mib,
                     "attempt": attempt + 1,
                     "error": last_error[-4000:],
@@ -705,14 +820,21 @@ def benchmark_with_backoff(
     )
 
 
-def write_csv(path: Path, rows: dict[int, dict]) -> None:
+def write_csv(path: Path, rows: dict[tuple[int, tuple[int, ...]], dict]) -> None:
     fields = [
         "context_capacity",
+        "fill_tokens",
+        "fill_shape",
+        "concurrency",
+        "parallel",
+        "kv_unified",
         "prompt_tokens",
         "decode_tokens",
         "pool_mib",
         "prefill_tps",
         "decode_tps",
+        "end_to_end_tps",
+        "decode_tps_per_stream",
         "prompt_ms",
         "predicted_ms",
         "wall_seconds",
@@ -730,8 +852,8 @@ def write_csv(path: Path, rows: dict[int, dict]) -> None:
     with path.open("w", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields)
         writer.writeheader()
-        for context in sorted(rows):
-            writer.writerow({field: rows[context].get(field) for field in fields})
+        for key in sorted(rows):
+            writer.writerow({field: rows[key].get(field) for field in fields})
 
 
 def require_matplotlib():
@@ -745,11 +867,11 @@ def require_matplotlib():
     return plt
 
 
-def plot_results(output_dir: Path, rows: dict[int, dict], plt) -> None:
+def plot_results(output_dir: Path, rows: dict[tuple, dict], plt) -> None:
     if not rows:
         return
-    contexts = sorted(rows)
-    x = [context / 1024 for context in contexts]
+    contexts = sorted(rows, key=lambda key: row_fill_tokens(rows[key]))
+    x = [row_fill_tokens(rows[key]) / 1024 for key in contexts]
 
     fig, (decode_ax, pool_ax) = plt.subplots(
         2,
@@ -789,7 +911,7 @@ def plot_results(output_dir: Path, rows: dict[int, dict], plt) -> None:
     decode_ax.set_title("Adaptive KV streaming context sweep")
     decode_ax.set_ylabel("Decode speed (tokens/s)")
     prefill_ax.set_ylabel("Prefill speed (tokens/s)")
-    pool_ax.set_xlabel("Configured context capacity (Ki tokens)")
+    pool_ax.set_xlabel("Fill depth (Ki tokens)")
     pool_ax.set_ylabel("Pool (MiB)")
     decode_ax.set_ylim(bottom=0)
     prefill_ax.set_ylim(bottom=0)
@@ -834,8 +956,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("minimum context must not exceed maximum context")
     if args.ubatch_size > args.batch_size:
         raise SystemExit("ubatch size must not exceed batch size")
-    if args.fixed_pool_mib is not None and args.fixed_pool_mib <= 0:
-        raise SystemExit("fixed pool must be positive")
+    if args.fixed_pool_mib is not None and args.fixed_pool_mib < 0:
+        raise SystemExit("fixed pool must not be negative")
     if (
         args.pool_retries < 0
         or args.release_slack_mib < 0
@@ -853,6 +975,21 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("prompt suffix must not be empty")
     if args.fill_token_id is not None and args.fill_token_id < 0:
         raise SystemExit("fill token ID must not be negative")
+    if args.parallel < 1:
+        raise SystemExit("parallel slot count must be at least 1")
+    capacity = slot_capacity(args, args.min_context)
+    for shape in request_shapes(args, args.min_context):
+        if len(shape) > args.parallel:
+            raise SystemExit(
+                f"Shape {list(shape)} needs {len(shape)} slots, but --parallel is {args.parallel}."
+            )
+        for fill in shape:
+            if fill > capacity:
+                raise SystemExit(
+                    f"Fill {fill} exceeds slot capacity {capacity}."
+                )
+            if fill <= args.decode_tokens:
+                raise SystemExit(f"fill {fill} must exceed the decode token count")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -893,7 +1030,6 @@ def main(argv: list[str] | None = None) -> int:
                 "cache_type_k": args.cache_type_k,
                 "cache_type_v": args.cache_type_v,
                 "flash_attention": True,
-                "parallel": 1,
                 "baseline_vram_used_mib": baseline.used_mib,
                 "baseline_vram_total_mib": baseline.total_mib,
                 "uvm": False,
@@ -910,40 +1046,49 @@ def main(argv: list[str] | None = None) -> int:
         flush=True,
     )
 
+    probed_pools: dict[int, int] = {}
     interrupted = False
     failed = False
     try:
-        for index, context_capacity in enumerate(capacities, start=1):
-            if context_capacity in rows:
+        points = [
+            (capacity, shape)
+            for capacity in capacities
+            for shape in request_shapes(args, capacity)
+        ]
+        for index, point in enumerate(points, start=1):
+            context_capacity, fills = point
+            if point in rows:
                 print(
-                    f"[{index}/{len(capacities)}] {context_capacity}: "
-                    "already complete",
+                    f"[{index}/{len(points)}] {context_capacity}, "
+                    f"fill {list(fills)}: already complete",
                     flush=True,
                 )
                 continue
             print(
-                f"[{index}/{len(capacities)}] context capacity "
-                f"{context_capacity}",
+                f"[{index}/{len(points)}] context capacity "
+                f"{context_capacity}, fill {list(fills)}",
                 flush=True,
             )
             try:
                 if args.fixed_pool_mib is None:
-                    selected_pool = probe_pool(
-                        args, context_capacity, baseline.used_mib,
-                        logs_dir, results_path,
-                    )
+                    if context_capacity not in probed_pools:
+                        probed_pools[context_capacity] = probe_pool(
+                            args, context_capacity, baseline.used_mib,
+                            logs_dir, results_path,
+                        )
+                    selected_pool = probed_pools[context_capacity]
                     measurement = benchmark_with_backoff(
-                        args, context_capacity, selected_pool,
+                        args, context_capacity, fills, selected_pool,
                         baseline.used_mib, logs_dir, results_path,
                     )
                 else:
                     selected_pool = args.fixed_pool_mib
                     measurement = run_measurement(
-                        args, context_capacity, selected_pool,
+                        args, context_capacity, fills, selected_pool,
                         baseline.used_mib, logs_dir,
                     )
                 append_jsonl(results_path, measurement)
-                rows[context_capacity] = measurement
+                rows[point] = measurement
                 write_csv(csv_path, rows)
                 plot_results(args.output_dir, rows, plt)
             except Exception as exc:
@@ -954,6 +1099,7 @@ def main(argv: list[str] | None = None) -> int:
                         "type": "point_failure",
                         "status": "failed",
                         "context_capacity": context_capacity,
+                        "fill_shape": list(fills),
                         "error": str(exc)[-4000:],
                     },
                 )

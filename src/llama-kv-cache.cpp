@@ -239,95 +239,8 @@ llama_kv_cache::llama_kv_cache(
                 }
 
                 if (kv_stream_runtime.runtime == nullptr) {
-                    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
-                    using type_pair_supported_fn_t = bool (*)(ggml_type, ggml_type);
-                    using page_bytes_fn_t = bool (*)(
-                        ggml_type, ggml_type, uint32_t, uint32_t, uint32_t, uint32_t, size_t *);
-                    using runtime_new_fn_t = void * (*)(
-                        ggml_backend_dev_t, size_t, size_t, size_t, uint32_t);
-                    using runtime_free_fn_t = void (*)(void *);
-                    using buffer_type_fn_t = ggml_backend_buffer_type_t (*)(void *);
-                    using feedback_fn_t = kv_stream_runtime_owner::feedback_fn_t;
-                    using span_feedback_fn_t = kv_stream_runtime_owner::span_feedback_fn_t;
-                    using reconfigure_fn_t = kv_stream_runtime_owner::reconfigure_fn_t;
-                    using repartition_fn_t = kv_stream_runtime_owner::repartition_fn_t;
-                    using decode_layout_fn_t = kv_stream_runtime_owner::decode_layout_fn_t;
-                    using mark_dirty_rows_fn_t = kv_stream_runtime_owner::mark_dirty_rows_fn_t;
-
-                    auto * type_pair_supported_fn = (type_pair_supported_fn_t) ggml_backend_reg_get_proc_address(
-                        reg, "ggml_backend_cuda_kv_stream_type_pair_supported");
-                    auto * page_bytes_fn = (page_bytes_fn_t) ggml_backend_reg_get_proc_address(
-                        reg, "ggml_backend_cuda_kv_stream_page_bytes");
-                    auto * workspace_bytes_fn = (page_bytes_fn_t) ggml_backend_reg_get_proc_address(
-                        reg, "ggml_backend_cuda_kv_stream_workspace_bytes");
-                    auto * runtime_new_fn = (runtime_new_fn_t) ggml_backend_reg_get_proc_address(
-                        reg, "ggml_backend_cuda_kv_stream_runtime_new_for_device");
-                    auto * runtime_free_fn = (runtime_free_fn_t) ggml_backend_reg_get_proc_address(
-                        reg, "ggml_backend_cuda_kv_stream_runtime_free");
-                    auto * buffer_type_fn = (buffer_type_fn_t) ggml_backend_reg_get_proc_address(
-                        reg, "ggml_backend_cuda_kv_stream_buffer_type");
-                    auto * feedback_fn = (feedback_fn_t) ggml_backend_reg_get_proc_address(
-                        reg, "ggml_backend_cuda_kv_stream_feedback");
-                    auto * span_feedback_fn = (span_feedback_fn_t) ggml_backend_reg_get_proc_address(
-                        reg, "ggml_backend_cuda_kv_stream_observe_decode_latency");
-                    auto * reconfigure_fn = (reconfigure_fn_t) ggml_backend_reg_get_proc_address(
-                        reg, "ggml_backend_cuda_kv_stream_reconfigure");
-                    auto * repartition_fn = (repartition_fn_t) ggml_backend_reg_get_proc_address(
-                        reg, "ggml_backend_cuda_kv_stream_repartition");
-                    auto * decode_layout_fn = (decode_layout_fn_t) ggml_backend_reg_get_proc_address(
-                        reg, "ggml_backend_cuda_kv_stream_set_decode_layout");
-                    auto * mark_dirty_rows_fn = (mark_dirty_rows_fn_t) ggml_backend_reg_get_proc_address(
-                        reg, "ggml_backend_cuda_kv_stream_mark_dirty_rows");
-
-                    if (type_pair_supported_fn == nullptr || page_bytes_fn == nullptr ||
-                            workspace_bytes_fn == nullptr || runtime_new_fn == nullptr ||
-                            runtime_free_fn == nullptr ||
-                            buffer_type_fn == nullptr || feedback_fn == nullptr ||
-                            span_feedback_fn == nullptr ||
-                            repartition_fn == nullptr || decode_layout_fn == nullptr ||
-                            reconfigure_fn == nullptr ||
-                            mark_dirty_rows_fn == nullptr) {
-                        throw std::runtime_error("block KV streaming requires the CUDA backend");
-                    }
-
-                    if (!type_pair_supported_fn(type_k, type_v)) {
-                        throw std::runtime_error(
-                            "block KV streaming does not support K " + std::string(ggml_type_name(type_k)) +
-                            " and V " + ggml_type_name(type_v));
-                    }
-
-                    size_t page_bytes = 0;
-                    if (!page_bytes_fn(
-                            type_k, type_v,
-                            hparams.n_embd_head_k(il), hparams.n_embd_head_v(il), hparams.n_head_kv(il),
-                            256, &page_bytes)) {
-                        throw std::runtime_error("invalid block KV streaming page geometry");
-                    }
-                    size_t conversion_bytes = 0;
-                    if (!workspace_bytes_fn(
-                            type_k, type_v,
-                            hparams.n_embd_head_k(il), hparams.n_embd_head_v(il), hparams.n_head_kv(il),
-                            256, &conversion_bytes)) {
-                        throw std::runtime_error("invalid block KV streaming conversion workspace geometry");
-                    }
-                    kv_stream_runtime.runtime = runtime_new_fn(
-                        dev, kv_stream_stage_bytes, page_bytes, conversion_bytes, kv_stream_layer_count);
-                    kv_stream_runtime.free_fn = runtime_free_fn;
-                    kv_stream_runtime.feedback_fn = feedback_fn;
-                    kv_stream_runtime.span_feedback_fn = span_feedback_fn;
-                    kv_stream_runtime.repartition_fn = repartition_fn;
-                    kv_stream_runtime.reconfigure_fn = reconfigure_fn;
-                    kv_stream_runtime.decode_layout_fn = decode_layout_fn;
-                    kv_stream_runtime.mark_dirty_rows_fn = mark_dirty_rows_fn;
-                    kv_stream_runtime.layer_count = kv_stream_layer_count;
-                    if (kv_stream_runtime.runtime == nullptr) {
-                        throw std::runtime_error("failed to create CUDA block KV streaming runtime");
-                    }
-
-                    kv_stream_buft = buffer_type_fn(kv_stream_runtime.runtime);
-                    if (kv_stream_buft == nullptr) {
-                        throw std::runtime_error("failed to obtain CUDA block KV streaming buffer type");
-                    }
+                    kv_stream_buft = kv_stream_init_runtime(
+                        dev, kv_stream_stage_bytes, kv_stream_layer_count, type_k, type_v, il);
                     kv_stream_dev = dev;
                 }
 
@@ -1472,6 +1385,106 @@ bool llama_kv_cache::kv_stream_adapt(uint32_t active_tokens, uint32_t query_toke
         100.0*(delta.valid ? delta.deadline_miss_ratio : 0.0),
         100.0*copy_busy_ratio);
     return true;
+}
+
+ggml_backend_buffer_type_t llama_kv_cache::kv_stream_init_runtime(
+        ggml_backend_dev_t dev,
+                    size_t stage_bytes,
+                  uint32_t layer_count,
+                 ggml_type type_k,
+                 ggml_type type_v,
+                  uint32_t il) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    using type_pair_supported_fn_t = bool (*)(ggml_type, ggml_type);
+    using page_bytes_fn_t = bool (*)(
+        ggml_type, ggml_type, uint32_t, uint32_t, uint32_t, uint32_t, size_t *);
+    using runtime_new_fn_t = void * (*)(
+        ggml_backend_dev_t, size_t, size_t, size_t, uint32_t);
+    using runtime_free_fn_t = void (*)(void *);
+    using buffer_type_fn_t = ggml_backend_buffer_type_t (*)(void *);
+    using feedback_fn_t = kv_stream_runtime_owner::feedback_fn_t;
+    using span_feedback_fn_t = kv_stream_runtime_owner::span_feedback_fn_t;
+    using reconfigure_fn_t = kv_stream_runtime_owner::reconfigure_fn_t;
+    using repartition_fn_t = kv_stream_runtime_owner::repartition_fn_t;
+    using decode_layout_fn_t = kv_stream_runtime_owner::decode_layout_fn_t;
+    using mark_dirty_rows_fn_t = kv_stream_runtime_owner::mark_dirty_rows_fn_t;
+
+    auto * type_pair_supported_fn = (type_pair_supported_fn_t) ggml_backend_reg_get_proc_address(
+        reg, "ggml_backend_cuda_kv_stream_type_pair_supported");
+    auto * page_bytes_fn = (page_bytes_fn_t) ggml_backend_reg_get_proc_address(
+        reg, "ggml_backend_cuda_kv_stream_page_bytes");
+    auto * workspace_bytes_fn = (page_bytes_fn_t) ggml_backend_reg_get_proc_address(
+        reg, "ggml_backend_cuda_kv_stream_workspace_bytes");
+    auto * runtime_new_fn = (runtime_new_fn_t) ggml_backend_reg_get_proc_address(
+        reg, "ggml_backend_cuda_kv_stream_runtime_new_for_device");
+    auto * runtime_free_fn = (runtime_free_fn_t) ggml_backend_reg_get_proc_address(
+        reg, "ggml_backend_cuda_kv_stream_runtime_free");
+    auto * buffer_type_fn = (buffer_type_fn_t) ggml_backend_reg_get_proc_address(
+        reg, "ggml_backend_cuda_kv_stream_buffer_type");
+    auto * feedback_fn = (feedback_fn_t) ggml_backend_reg_get_proc_address(
+        reg, "ggml_backend_cuda_kv_stream_feedback");
+    auto * span_feedback_fn = (span_feedback_fn_t) ggml_backend_reg_get_proc_address(
+        reg, "ggml_backend_cuda_kv_stream_observe_decode_latency");
+    auto * reconfigure_fn = (reconfigure_fn_t) ggml_backend_reg_get_proc_address(
+        reg, "ggml_backend_cuda_kv_stream_reconfigure");
+    auto * repartition_fn = (repartition_fn_t) ggml_backend_reg_get_proc_address(
+        reg, "ggml_backend_cuda_kv_stream_repartition");
+    auto * decode_layout_fn = (decode_layout_fn_t) ggml_backend_reg_get_proc_address(
+        reg, "ggml_backend_cuda_kv_stream_set_decode_layout");
+    auto * mark_dirty_rows_fn = (mark_dirty_rows_fn_t) ggml_backend_reg_get_proc_address(
+        reg, "ggml_backend_cuda_kv_stream_mark_dirty_rows");
+
+    if (type_pair_supported_fn == nullptr || page_bytes_fn == nullptr ||
+            workspace_bytes_fn == nullptr || runtime_new_fn == nullptr ||
+            runtime_free_fn == nullptr ||
+            buffer_type_fn == nullptr || feedback_fn == nullptr ||
+            span_feedback_fn == nullptr ||
+            repartition_fn == nullptr || decode_layout_fn == nullptr ||
+            reconfigure_fn == nullptr ||
+            mark_dirty_rows_fn == nullptr) {
+        throw std::runtime_error("block KV streaming requires the CUDA backend");
+    }
+
+    if (!type_pair_supported_fn(type_k, type_v)) {
+        throw std::runtime_error(
+            "block KV streaming does not support K " + std::string(ggml_type_name(type_k)) +
+            " and V " + ggml_type_name(type_v));
+    }
+
+    size_t page_bytes = 0;
+    if (!page_bytes_fn(
+            type_k, type_v,
+            hparams.n_embd_head_k(il), hparams.n_embd_head_v(il), hparams.n_head_kv(il),
+            256, &page_bytes)) {
+        throw std::runtime_error("invalid block KV streaming page geometry");
+    }
+    size_t conversion_bytes = 0;
+    if (!workspace_bytes_fn(
+            type_k, type_v,
+            hparams.n_embd_head_k(il), hparams.n_embd_head_v(il), hparams.n_head_kv(il),
+            256, &conversion_bytes)) {
+        throw std::runtime_error("invalid block KV streaming conversion workspace geometry");
+    }
+    kv_stream_runtime.runtime = runtime_new_fn(
+        dev, stage_bytes, page_bytes, conversion_bytes, layer_count);
+    kv_stream_runtime.free_fn = runtime_free_fn;
+    kv_stream_runtime.feedback_fn = feedback_fn;
+    kv_stream_runtime.span_feedback_fn = span_feedback_fn;
+    kv_stream_runtime.repartition_fn = repartition_fn;
+    kv_stream_runtime.reconfigure_fn = reconfigure_fn;
+    kv_stream_runtime.decode_layout_fn = decode_layout_fn;
+    kv_stream_runtime.mark_dirty_rows_fn = mark_dirty_rows_fn;
+    kv_stream_runtime.layer_count = layer_count;
+    if (kv_stream_runtime.runtime == nullptr) {
+        throw std::runtime_error("failed to create CUDA block KV streaming runtime");
+    }
+
+    ggml_backend_buffer_type_t buft = buffer_type_fn(kv_stream_runtime.runtime);
+    if (buft == nullptr) {
+        throw std::runtime_error("failed to obtain CUDA block KV streaming buffer type");
+    }
+
+    return buft;
 }
 
 bool llama_kv_cache::get_has_shift() const {

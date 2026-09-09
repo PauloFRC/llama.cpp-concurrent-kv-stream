@@ -360,6 +360,15 @@ private:
     size_t size_k_bytes() const;
     size_t size_v_bytes() const;
 
+    // resolves the CUDA entry points, creates the runtime and returns its buffer type
+    ggml_backend_buffer_type_t kv_stream_init_runtime(
+            ggml_backend_dev_t dev,
+                        size_t stage_bytes,
+                      uint32_t layer_count,
+                     ggml_type type_k,
+                     ggml_type type_v,
+                      uint32_t il);
+
     ggml_tensor * build_rope_shift(
             const llama_cparams & cparams,
                    ggml_context * ctx,

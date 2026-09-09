@@ -4,9 +4,7 @@
 #include <cmath>
 #include <cstdint>
 
-// Chooses between the ordinary coalesced streamed-attention kernel and a
-// bounded-span pipeline using end-to-end decode graph timings. The tuner is
-// reset whenever the resident/ring layout changes.
+// Chooses between greedy and fixed copy batches using decode graph timings.
 class ggml_cuda_kv_stream_span_tuner {
 public:
     explicit ggml_cuda_kv_stream_span_tuner(

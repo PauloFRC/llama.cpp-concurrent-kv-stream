@@ -183,6 +183,8 @@ struct ggml_cuda_kv_stream_transfer_ring {
     uint32_t active_slots = 0;
     uint32_t forced_decode_span_pages = 0;
     uint32_t graph_decode_span_pages = UINT32_MAX;
+    uint32_t graph_copy_batch_pages = KV_STREAM_COPY_BATCH_PAGES;
+    bool graph_copy_batch_greedy = false;
     cudaStream_t copy_stream = nullptr;
     cudaEvent_t producer_ready = nullptr;
     cudaEvent_t eval_start = nullptr;
@@ -384,10 +386,10 @@ bool ggml_cuda_kv_stream_transfer_ring_observe_decode_latency(
         ring->last_graph_bounded);
     if (!was_selected && ring->span_tuner.selected()) {
         GGML_LOG_WARN(
-            "%s: selected %s decode spans from end-to-end latency "
+            "%s: selected %s decode copy batches from end-to-end latency "
             "(unbounded %.3f ms, %u-page %.3f ms)\n",
             __func__, ring->span_tuner.use_bounded() ? "bounded" : "unbounded",
-            ring->span_tuner.unbounded_average_ms(), KV_STREAM_DECODE_SPAN_PAGES,
+            ring->span_tuner.unbounded_average_ms(), KV_STREAM_COPY_BATCH_PAGES,
             ring->span_tuner.bounded_average_ms());
     }
     return true;
@@ -1454,7 +1456,7 @@ static uint32_t kv_stream_graph_batch_pages(
     GGML_ASSERT(!first.scheduled && !first.consumed);
 
     const uint32_t maximum = std::min<uint32_t>({
-        KV_STREAM_COPY_BATCH_PAGES,
+        ring->graph_copy_batch_pages,
         ring->active_slots - first_slot,
         uint32_t(ring->graph_requests.size() - ring->next_request),
     });
@@ -1567,8 +1569,10 @@ void ggml_cuda_kv_stream_graph_begin(ggml_cuda_kv_stream_transfer_ring * ring) {
     ring->graph_active = true;
     ring->graph_decode = true;
     ring->graph_decode_span_pages = ring->forced_decode_span_pages != 0 ?
-        ring->forced_decode_span_pages :
-        (ring->span_tuner.use_bounded() ? KV_STREAM_DECODE_SPAN_PAGES : UINT32_MAX);
+        ring->forced_decode_span_pages : KV_STREAM_DECODE_SPAN_PAGES;
+    ring->graph_copy_batch_greedy = ring->span_tuner.use_bounded();
+    ring->graph_copy_batch_pages = ring->graph_copy_batch_greedy ?
+        ring->active_slots : KV_STREAM_COPY_BATCH_PAGES;
     ring->graph_layer_count = 0;
     ring->current_layer = KV_STREAM_NO_LAYER;
     ring->next_request = 0;
@@ -1687,7 +1691,7 @@ void ggml_cuda_kv_stream_graph_finalize(
         ggml_cuda_kv_stream_transfer_ring * ring, cudaStream_t compute_stream) {
     GGML_ASSERT(ring != nullptr);
     ring->last_graph_decode = ring->graph_decode;
-    ring->last_graph_bounded = ring->graph_decode_span_pages != UINT32_MAX;
+    ring->last_graph_bounded = ring->graph_copy_batch_greedy;
     ring->last_graph_streamed = !ring->graph_requests.empty();
     if (ring->graph_requests.empty()) {
         ring->timing_current = false;

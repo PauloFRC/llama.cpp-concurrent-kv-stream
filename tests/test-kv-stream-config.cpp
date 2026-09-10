@@ -26,6 +26,22 @@ int main() {
         t.assert_true("config is enabled", result.enabled);
     });
 
+    t.test("multi-sequence with unified KV is accepted and enabled", [](testing & t) {
+        llama_kv_stream_config config;
+        config.stage_bytes         = 64ULL*1024ULL*1024ULL;
+        config.minimum_stage_bytes = 1664ULL*256ULL;
+        config.arch_qwen35         = true;
+        config.context_default     = true;
+        config.single_sequence     = false;
+        config.kv_unified          = true;
+        config.flash_attention     = true;
+        config.kv_offload          = true;
+
+        const auto result = llama_kv_stream_config_validate(config);
+        t.assert_true("config is valid", result.valid);
+        t.assert_true("config is enabled", result.enabled);
+    });
+
     t.test("each unsupported condition fails loudly", [](testing & t) {
         llama_kv_stream_config base;
         base.stage_bytes         = 64ULL*1024ULL*1024ULL;
@@ -49,13 +65,15 @@ int main() {
         expect_invalid("draft/MTP context", config);
         config = base;
         config.single_sequence = false;
-        expect_invalid("parallel sequences", config);
+        config.kv_unified = false;
+        expect_invalid("parallel sequences without unified KV", config);
         config = base;
         config.flash_attention = false;
         expect_invalid("Flash Attention disabled", config);
         config = base;
         config.kv_offload = false;
         expect_invalid("KV offload disabled", config);
+        config = base;
         config.stage_bytes = config.minimum_stage_bytes - 1;
         expect_invalid("stage smaller than one page", config);
     });

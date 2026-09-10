@@ -10,6 +10,7 @@ struct llama_kv_stream_config {
     bool arch_qwen35     = false;
     bool context_default = false;
     bool single_sequence = false;
+    bool kv_unified      = false;
     bool flash_attention = false;
     bool kv_offload      = false;
 };

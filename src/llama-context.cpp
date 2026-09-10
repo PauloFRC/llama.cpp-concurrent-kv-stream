@@ -406,6 +406,7 @@ llama_context::llama_context(
             /*.arch_qwen35         =*/ model.arch == LLM_ARCH_QWEN35,
             /*.context_default     =*/ cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT,
             /*.single_sequence     =*/ cparams.n_seq_max == 1,
+            /*.kv_unified          =*/ cparams.kv_unified,
             /*.flash_attention     =*/ cparams.flash_attn,
             /*.kv_offload          =*/ cparams.offload_kqv,
         };

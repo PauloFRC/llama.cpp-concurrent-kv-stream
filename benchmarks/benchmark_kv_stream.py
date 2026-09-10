@@ -105,6 +105,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         help="result directory; reuse it to resume an interrupted sweep",
     )
+    parser.add_argument(
+        "--no-plot",
+        action="store_true",
+        help="skip the plot, so the run needs no matplotlib",
+    )
     parser.add_argument("--decode-tokens", type=int, default=256)
     parser.add_argument(
         "--batch-size", type=int, default=256,
@@ -866,7 +871,7 @@ def require_matplotlib():
 
 
 def plot_results(output_dir: Path, rows: dict[tuple, dict], plt) -> None:
-    if not rows:
+    if not rows or plt is None:
         return
     contexts = sorted(rows, key=lambda key: row_fill_tokens(rows[key]))
     x = [row_fill_tokens(rows[key]) / 1024 for key in contexts]
@@ -993,7 +998,7 @@ def validate_args(args: argparse.Namespace) -> None:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     validate_args(args)
-    plt = require_matplotlib()
+    plt = None if args.no_plot else require_matplotlib()
 
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     if args.output_dir is None:
@@ -1119,7 +1124,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"JSONL: {results_path}", flush=True)
     if rows:
         print(f"CSV:   {csv_path}", flush=True)
-        print(f"Plot:  {args.output_dir / 'kv-stream-sweep.png'}", flush=True)
+        if plt is not None:
+            print(f"Plot:  {args.output_dir / 'kv-stream-sweep.png'}", flush=True)
     if interrupted:
         return 130
     return 1 if failed else 0

@@ -5,7 +5,6 @@
 #include <cstdint>
 
 // Chooses between greedy and fixed copy batches using decode graph timings.
-// The fixed arm is measured first, then the greedy arm, then the faster arm is kept.
 class ggml_cuda_kv_stream_span_tuner {
 public:
     explicit ggml_cuda_kv_stream_span_tuner(

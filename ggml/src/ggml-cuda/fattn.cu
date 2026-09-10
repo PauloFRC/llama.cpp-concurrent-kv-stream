@@ -226,7 +226,7 @@ struct ggml_cuda_kv_stream_transfer_ring {
     bool timing_pending = false;
     bool timing_current = false;
     bool last_graph_decode = false;
-    bool last_graph_bounded = false;
+    bool last_graph_copy_batch_greedy = false;
     bool last_graph_streamed = false;
     bool copy_sample_recorded = false;
 };
@@ -383,14 +383,14 @@ bool ggml_cuda_kv_stream_transfer_ring_observe_decode_latency(
     const bool was_selected = ring->span_tuner.selected();
     ring->span_tuner.observe(
         elapsed_ms, ring->last_graph_decode && ring->last_graph_streamed,
-        ring->last_graph_bounded);
+        ring->last_graph_copy_batch_greedy);
     if (!was_selected && ring->span_tuner.selected()) {
         GGML_LOG_WARN(
             "%s: selected %s decode copy batches from end-to-end latency "
-            "(unbounded %.3f ms, %u-page %.3f ms)\n",
-            __func__, ring->span_tuner.use_bounded() ? "bounded" : "unbounded",
-            ring->span_tuner.unbounded_average_ms(), KV_STREAM_COPY_BATCH_PAGES,
-            ring->span_tuner.bounded_average_ms());
+            "(fixed %u-page %.3f ms, greedy %u-page %.3f ms)\n",
+            __func__, ring->span_tuner.use_greedy_batch() ? "greedy" : "fixed",
+            KV_STREAM_COPY_BATCH_PAGES, ring->span_tuner.fixed_average_ms(),
+            ring->active_slots, ring->span_tuner.greedy_average_ms());
     }
     return true;
 }
@@ -1570,7 +1570,7 @@ void ggml_cuda_kv_stream_graph_begin(ggml_cuda_kv_stream_transfer_ring * ring) {
     ring->graph_decode = true;
     ring->graph_decode_span_pages = ring->forced_decode_span_pages != 0 ?
         ring->forced_decode_span_pages : KV_STREAM_DECODE_SPAN_PAGES;
-    ring->graph_copy_batch_greedy = ring->span_tuner.use_bounded();
+    ring->graph_copy_batch_greedy = ring->span_tuner.use_greedy_batch();
     ring->graph_copy_batch_pages = ring->graph_copy_batch_greedy ?
         ring->active_slots : KV_STREAM_COPY_BATCH_PAGES;
     ring->graph_layer_count = 0;
@@ -1691,7 +1691,7 @@ void ggml_cuda_kv_stream_graph_finalize(
         ggml_cuda_kv_stream_transfer_ring * ring, cudaStream_t compute_stream) {
     GGML_ASSERT(ring != nullptr);
     ring->last_graph_decode = ring->graph_decode;
-    ring->last_graph_bounded = ring->graph_copy_batch_greedy;
+    ring->last_graph_copy_batch_greedy = ring->graph_copy_batch_greedy;
     ring->last_graph_streamed = !ring->graph_requests.empty();
     if (ring->graph_requests.empty()) {
         ring->timing_current = false;

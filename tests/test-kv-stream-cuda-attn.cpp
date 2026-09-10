@@ -408,49 +408,49 @@ std::vector<float> run_attention_layers(
 int main() {
     testing t;
 
-    t.test("decode span tuner selects the faster measured mode per layout", [](testing & t) {
+    t.test("decode copy batch tuner selects the faster measured mode per layout", [](testing & t) {
         ggml_cuda_kv_stream_span_tuner production_tuner;
-        production_tuner.observe(100.0, /* streamed = */ true, /* bounded = */ false);
+        production_tuner.observe(100.0, /* streamed = */ true, /* greedy = */ false);
         for (uint32_t sample = 0; sample < 4; ++sample) {
-            production_tuner.observe(10.0, /* streamed = */ true, /* bounded = */ false);
+            production_tuner.observe(10.0, /* streamed = */ true, /* greedy = */ false);
         }
         t.assert_true("production tuner does not decide from four samples",
-            !production_tuner.use_bounded() && !production_tuner.selected());
+            !production_tuner.use_greedy_batch() && !production_tuner.selected());
 
         ggml_cuda_kv_stream_span_tuner tuner(/* trial_samples = */ 2, 0.005, /* warmup_samples = */ 1);
 
-        tuner.observe(100.0, /* streamed = */ false, /* bounded = */ false);
-        t.assert_true("non-streamed graphs do not start a trial", !tuner.use_bounded());
+        tuner.observe(100.0, /* streamed = */ false, /* greedy = */ false);
+        t.assert_true("non-streamed graphs do not start a trial", !tuner.use_greedy_batch());
         t.assert_true("non-streamed graphs do not select a mode", !tuner.selected());
 
-        tuner.observe(100.0, /* streamed = */ true, /* bounded = */ false);
-        t.assert_true("unbounded warmup is not measured", !tuner.use_bounded());
+        tuner.observe(100.0, /* streamed = */ true, /* greedy = */ false);
+        t.assert_true("fixed warmup is not measured", !tuner.use_greedy_batch());
 
-        tuner.observe(10.0, /* streamed = */ true, /* bounded = */ false);
-        tuner.observe(10.2, /* streamed = */ true, /* bounded = */ false);
-        t.assert_true("tuner advances to bounded trials", tuner.use_bounded());
+        tuner.observe(10.0, /* streamed = */ true, /* greedy = */ false);
+        tuner.observe(10.2, /* streamed = */ true, /* greedy = */ false);
+        t.assert_true("tuner advances to greedy trials", tuner.use_greedy_batch());
         t.assert_true("both modes are measured before selection", !tuner.selected());
 
-        tuner.observe(100.0, /* streamed = */ true, /* bounded = */ true);
-        t.assert_true("bounded warmup is not measured", !tuner.selected());
+        tuner.observe(100.0, /* streamed = */ true, /* greedy = */ true);
+        t.assert_true("greedy warmup is not measured", !tuner.selected());
 
-        tuner.observe(8.0, /* streamed = */ true, /* bounded = */ true);
-        tuner.observe(8.2, /* streamed = */ true, /* bounded = */ true);
-        t.assert_true("bounded mode is selected when materially faster", tuner.selected());
-        t.assert_true("bounded mode remains active after selection", tuner.use_bounded());
+        tuner.observe(8.0, /* streamed = */ true, /* greedy = */ true);
+        tuner.observe(8.2, /* streamed = */ true, /* greedy = */ true);
+        t.assert_true("greedy mode is selected when materially faster", tuner.selected());
+        t.assert_true("greedy mode remains active after selection", tuner.use_greedy_batch());
 
         tuner.reset();
-        tuner.observe(100.0, /* streamed = */ true, /* bounded = */ false);
-        tuner.observe(10.0, /* streamed = */ true, /* bounded = */ false);
-        tuner.observe(10.0, /* streamed = */ true, /* bounded = */ false);
-        tuner.observe(100.0, /* streamed = */ true, /* bounded = */ true);
-        tuner.observe(10.0, /* streamed = */ true, /* bounded = */ true);
-        tuner.observe(10.0, /* streamed = */ true, /* bounded = */ true);
+        tuner.observe(100.0, /* streamed = */ true, /* greedy = */ false);
+        tuner.observe(10.0, /* streamed = */ true, /* greedy = */ false);
+        tuner.observe(10.0, /* streamed = */ true, /* greedy = */ false);
+        tuner.observe(100.0, /* streamed = */ true, /* greedy = */ true);
+        tuner.observe(10.0, /* streamed = */ true, /* greedy = */ true);
+        tuner.observe(10.0, /* streamed = */ true, /* greedy = */ true);
         t.assert_true("tuner selects after both trials", tuner.selected());
-        t.assert_true("noise does not displace the ordinary kernel", !tuner.use_bounded());
+        t.assert_true("noise does not displace the fixed copy batch", !tuner.use_greedy_batch());
 
-        tuner.observe(1.0, /* streamed = */ true, /* bounded = */ true);
-        t.assert_true("selection remains stable until layout reset", !tuner.use_bounded());
+        tuner.observe(1.0, /* streamed = */ true, /* greedy = */ true);
+        t.assert_true("selection remains stable until layout reset", !tuner.use_greedy_batch());
     });
 
     t.test("all native CUDA KV pairs preserve streamed prefill results", [](testing & t) {

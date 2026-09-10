@@ -35,7 +35,8 @@ struct attention_inputs {
 
 attention_inputs make_inputs(
         int64_t n_kv, int64_t n_batch, int64_t query_start = 0,
-        ggml_type type_k = GGML_TYPE_Q8_0, ggml_type type_v = GGML_TYPE_Q4_0) {
+        ggml_type type_k = GGML_TYPE_Q8_0, ggml_type type_v = GGML_TYPE_Q4_0,
+        float phase = 0.0f) {
     attention_inputs result;
     result.type_k = type_k;
     result.type_v = type_v;
@@ -48,7 +49,7 @@ attention_inputs make_inputs(
     const int64_t nrows = n_kv*N_KV_HEAD;
     std::vector<float> source(HEAD_DIM*nrows);
     for (size_t i = 0; i < source.size(); ++i) {
-        source[i] = 0.4f*std::sin(float(i)*0.001953125f) + 0.2f*std::cos(float(i)*0.00048828125f);
+        source[i] = 0.4f*std::sin(float(i)*0.001953125f + phase) + 0.2f*std::cos(float(i)*0.00048828125f + phase);
     }
 
     result.k.resize(ggml_row_size(type_k, HEAD_DIM)*nrows);
@@ -57,7 +58,7 @@ attention_inputs make_inputs(
     GGML_ASSERT(k_written == result.k.size());
 
     for (size_t i = 0; i < source.size(); ++i) {
-        source[i] = 0.35f*std::cos(float(i)*0.00146484375f) - 0.1f*std::sin(float(i)*0.00390625f);
+        source[i] = 0.35f*std::cos(float(i)*0.00146484375f + phase) - 0.1f*std::sin(float(i)*0.00390625f + phase);
     }
     result.v.resize(ggml_row_size(type_v, HEAD_DIM)*nrows);
     const size_t v_written = ggml_quantize_chunk(
@@ -130,7 +131,8 @@ std::vector<float> run_attention(
         ggml_backend_cuda_kv_stream_runtime_t dirty_runtime = nullptr,
         bool change_indices = false,
         bool replace_cache = false,
-        uint64_t graph_uid = 0) {
+        uint64_t graph_uid = 0,
+        const int64_t * custom_rows = nullptr) {
     constexpr size_t N_TENSORS = 32;
     const size_t context_bytes = ggml_tensor_overhead()*N_TENSORS + ggml_graph_overhead_custom(N_TENSORS, false);
 
@@ -201,10 +203,12 @@ std::vector<float> run_attention(
     ggml_backend_tensor_set(k_update, k_update_data.data(), 0, k_update_data.size()*sizeof(float));
     ggml_backend_tensor_set(v_update, v_update_data.data(), 0, v_update_data.size()*sizeof(float));
     std::vector<int64_t> dirty_rows(update_rows);
-    for (int64_t row = 0; row < update_rows; ++row) { dirty_rows[row] = row; }
+    for (int64_t row = 0; row < update_rows; ++row) {
+        dirty_rows[row] = custom_rows != nullptr ? custom_rows[row] : row;
+    }
     if (index_type == GGML_TYPE_I32) {
         std::vector<int32_t> update_index_data(update_rows);
-        for (int64_t row = 0; row < update_rows; ++row) { update_index_data[row] = int32_t(row); }
+        for (int64_t row = 0; row < update_rows; ++row) { update_index_data[row] = int32_t(dirty_rows[row]); }
         ggml_backend_tensor_set(
             update_index, update_index_data.data(), 0, update_index_data.size()*sizeof(int32_t));
     } else {
@@ -1779,6 +1783,290 @@ int main() {
         std::fprintf(stderr, "ring-bounded decode max_abs=%g layers=%g,%g,%g\n",
             max_abs, layer_max_abs[0], layer_max_abs[1], layer_max_abs[2]);
         t.assert_true("ring-bounded decode remains equivalent", max_abs <= 3e-4f);
+    });
+
+    t.test("multi-slot concurrent attention with staged PCIe streaming", [](testing & t) {
+        constexpr int64_t n_kv = 1024;
+        constexpr int64_t n_batch = 2;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        // Slot 0 attends tokens 0..500 in pages 0..1.
+        // Slot 1 attends tokens 512..1000 in pages 2..3.
+        attention_inputs inputs = make_inputs(n_kv, n_batch, n_kv - 1);
+        for (int64_t token = 0; token < n_kv; ++token) {
+            if (token > 500) {
+                inputs.mask[0*n_kv + token] = ggml_fp32_to_fp16(-INFINITY);
+            }
+            if (token < 512 || token > 1000) {
+                inputs.mask[1*n_kv + token] = ggml_fp32_to_fp16(-INFINITY);
+            }
+        }
+        const std::vector<float> expected = run_attention(
+            backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()), n_kv, n_batch);
+
+        const size_t k_page_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t v_page_bytes = ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
+        ggml_backend_cuda_kv_stream_params params{};
+        params.device               = 0;
+        params.stage_bytes          = page_bytes;
+        params.stage_slots          = 2;
+        params.pool_bytes           = 3*page_bytes;
+        params.resident_layer_count = 1;
+        params.page_tokens          = 256;
+        auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+        if (!t.assert_true("stream runtime initializes", runtime != nullptr)) {
+            return;
+        }
+
+        const std::vector<float> actual = run_attention(
+            backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime), n_kv, n_batch);
+        const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
+        ggml_backend_cuda_kv_stream_runtime_free(runtime);
+
+        t.assert_equal(uint64_t(3), stats.streamed_pages);
+        if (!t.assert_equal(expected.size(), actual.size())) {
+            return;
+        }
+        bool all_finite = true;
+        float max_abs = 0.0f;
+        for (size_t i = 0; i < expected.size(); ++i) {
+            all_finite = all_finite && std::isfinite(actual[i]);
+            max_abs = std::max(max_abs, std::abs(expected[i] - actual[i]));
+        }
+        std::fprintf(stderr, "multi-slot staged max_abs=%g streamed_pages=%llu\n",
+            max_abs, (unsigned long long) stats.streamed_pages);
+        t.assert_true("multi-slot output remains finite", all_finite);
+        t.assert_true("multi-slot output remains equivalent", max_abs <= 3e-4f);
+    });
+
+    t.test("interleaved prefill and decode preserve layer identity across graphs", [](testing & t) {
+        constexpr int64_t n_kv = 512;
+        constexpr size_t n_layers = 2;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        std::vector<attention_inputs> decode_inputs{
+            make_inputs(n_kv, 1, n_kv - 1, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 0.0f),
+            make_inputs(n_kv, 1, n_kv - 1, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 1.0f),
+        };
+        std::vector<attention_inputs> prefill_inputs{
+            make_inputs(n_kv, 2, n_kv - 2, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 0.0f),
+            make_inputs(n_kv, 2, n_kv - 2, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 1.0f),
+        };
+
+        for (size_t l = 0; l < n_layers; ++l) {
+            decode_inputs[l].mask[0] = ggml_fp32_to_fp16(-INFINITY);
+            prefill_inputs[l].mask[0] = ggml_fp32_to_fp16(-INFINITY);
+            prefill_inputs[l].mask[n_kv] = ggml_fp32_to_fp16(-INFINITY);
+        }
+
+        ggml_backend_buffer_type_t reference_buft = ggml_backend_get_default_buffer_type(backend.get());
+        const std::vector<float> expected_decode = run_attention_layers(
+            backend.get(), decode_inputs, reference_buft, n_kv, 1);
+        std::vector<std::vector<float>> expected_prefill;
+        for (size_t l = 0; l < n_layers; ++l) {
+            expected_prefill.push_back(run_attention(
+                backend.get(), prefill_inputs[l], reference_buft, n_kv, 2));
+        }
+
+        const size_t k_page_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t v_page_bytes = ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
+        ggml_backend_cuda_kv_stream_params params{};
+        params.device               = 0;
+        params.stage_bytes          = page_bytes;
+        params.stage_slots          = 2;
+        params.pool_bytes           = 4*page_bytes;
+        params.resident_layer_count = n_layers;
+        params.page_tokens          = 256;
+        auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+        if (!t.assert_true("shared runtime initializes", runtime != nullptr)) {
+            return;
+        }
+
+        constexpr size_t N_TENSORS = 64;
+        const size_t ctx_bytes = ggml_tensor_overhead()*N_TENSORS + ggml_graph_overhead_custom(N_TENSORS, false);
+        ggml_init_params iparams{ ctx_bytes, nullptr, true };
+        ggml_context_ptr kv_ctx(ggml_init(iparams));
+        ggml_tensor * k_storage[n_layers];
+        ggml_tensor * v_storage[n_layers];
+        ggml_tensor * k_perm[n_layers];
+        ggml_tensor * v_perm[n_layers];
+
+        for (size_t l = 0; l < n_layers; ++l) {
+            k_storage[l] = ggml_new_tensor_2d(kv_ctx.get(), GGML_TYPE_Q8_0, HEAD_DIM*N_KV_HEAD, n_kv);
+            v_storage[l] = ggml_new_tensor_2d(kv_ctx.get(), GGML_TYPE_Q4_0, HEAD_DIM*N_KV_HEAD, n_kv);
+            ggml_tensor * k_cache = ggml_view_4d(
+                kv_ctx.get(), k_storage[l], HEAD_DIM, N_KV_HEAD, n_kv, 1,
+                ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM),
+                ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM*N_KV_HEAD),
+                ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM*N_KV_HEAD)*n_kv, 0);
+            ggml_tensor * v_cache = ggml_view_4d(
+                kv_ctx.get(), v_storage[l], HEAD_DIM, N_KV_HEAD, n_kv, 1,
+                ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM),
+                ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM*N_KV_HEAD),
+                ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM*N_KV_HEAD)*n_kv, 0);
+            k_perm[l] = ggml_permute(kv_ctx.get(), k_cache, 0, 2, 1, 3);
+            v_perm[l] = ggml_permute(kv_ctx.get(), v_cache, 0, 2, 1, 3);
+        }
+
+        ggml_backend_buffer_ptr kv_buffer(
+            ggml_backend_alloc_ctx_tensors_from_buft(kv_ctx.get(), ggml_backend_cuda_kv_stream_buffer_type(runtime)));
+        GGML_ASSERT(kv_buffer != nullptr);
+
+        for (size_t l = 0; l < n_layers; ++l) {
+            ggml_backend_tensor_set(k_storage[l], decode_inputs[l].k.data(), 0, decode_inputs[l].k.size());
+            ggml_backend_tensor_set(v_storage[l], decode_inputs[l].v.data(), 0, decode_inputs[l].v.size());
+        }
+
+        auto run_prefill_graph = [&](size_t layer) {
+            ggml_context_ptr comp_ctx(ggml_init(iparams));
+            ggml_tensor * q = ggml_new_tensor_4d(comp_ctx.get(), GGML_TYPE_F32, HEAD_DIM, 2, N_Q_HEAD, 1);
+            ggml_tensor * mask = ggml_new_tensor_4d(comp_ctx.get(), GGML_TYPE_F16, n_kv, 2, 1, 1);
+            ggml_tensor * out = ggml_flash_attn_ext(
+                comp_ctx.get(), q, k_perm[layer], v_perm[layer], mask, 1.0f/std::sqrt(float(HEAD_DIM)), 0.0f, 0.0f);
+            ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+
+            ggml_backend_buffer_ptr comp_buf(ggml_backend_alloc_ctx_tensors(comp_ctx.get(), backend.get()));
+            const attention_inputs & input = prefill_inputs[layer];
+            ggml_backend_tensor_set(q, input.q.data(), 0, input.q.size()*sizeof(float));
+            ggml_backend_tensor_set(mask, input.mask.data(), 0, input.mask.size()*sizeof(uint16_t));
+
+            ggml_cgraph * graph = ggml_new_graph_custom(comp_ctx.get(), N_TENSORS, false);
+            ggml_build_forward_expand(graph, out);
+            GGML_ASSERT(ggml_backend_graph_compute(backend.get(), graph) == GGML_STATUS_SUCCESS);
+
+            std::vector<float> result(ggml_nelements(out));
+            ggml_backend_tensor_get(out, result.data(), 0, result.size()*sizeof(float));
+            return result;
+        };
+
+        const std::vector<float> actual_prefill_late = run_prefill_graph(1);
+        const std::vector<float> actual_prefill_early = run_prefill_graph(0);
+
+        std::vector<float> actual_decode;
+        {
+            ggml_context_ptr comp_ctx(ggml_init(iparams));
+            ggml_tensor * q[n_layers];
+            ggml_tensor * mask[n_layers];
+            ggml_tensor * out[n_layers];
+            for (size_t l = 0; l < n_layers; ++l) {
+                q[l] = ggml_new_tensor_4d(comp_ctx.get(), GGML_TYPE_F32, HEAD_DIM, 1, N_Q_HEAD, 1);
+                mask[l] = ggml_new_tensor_4d(comp_ctx.get(), GGML_TYPE_F16, n_kv, 1, 1, 1);
+                out[l] = ggml_flash_attn_ext(
+                    comp_ctx.get(), q[l], k_perm[l], v_perm[l], mask[l], 1.0f/std::sqrt(float(HEAD_DIM)), 0.0f, 0.0f);
+                ggml_flash_attn_ext_set_prec(out[l], GGML_PREC_F32);
+            }
+
+            ggml_backend_buffer_ptr comp_buf(ggml_backend_alloc_ctx_tensors(comp_ctx.get(), backend.get()));
+            for (size_t l = 0; l < n_layers; ++l) {
+                ggml_backend_tensor_set(q[l], decode_inputs[l].q.data(), 0, decode_inputs[l].q.size()*sizeof(float));
+                ggml_backend_tensor_set(mask[l], decode_inputs[l].mask.data(), 0, decode_inputs[l].mask.size()*sizeof(uint16_t));
+            }
+
+            ggml_cgraph * graph = ggml_new_graph_custom(comp_ctx.get(), N_TENSORS, false);
+            for (size_t l = 0; l < n_layers; ++l) {
+                ggml_build_forward_expand(graph, out[l]);
+            }
+            GGML_ASSERT(ggml_backend_graph_compute(backend.get(), graph) == GGML_STATUS_SUCCESS);
+
+            for (size_t l = 0; l < n_layers; ++l) {
+                const size_t begin = actual_decode.size();
+                actual_decode.resize(begin + ggml_nelements(out[l]));
+                ggml_backend_tensor_get(out[l], actual_decode.data() + begin, 0, ggml_nbytes(out[l]));
+            }
+        }
+        const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
+        ggml_backend_cuda_kv_stream_runtime_free(runtime);
+
+        auto compare = [&t](const std::string & name,
+                const std::vector<float> & expected, const std::vector<float> & actual) {
+            if (!t.assert_equal(name + " output size", expected.size(), actual.size())) {
+                return;
+            }
+            bool all_finite = true;
+            float max_abs = 0.0f;
+            for (size_t i = 0; i < expected.size(); ++i) {
+                all_finite = all_finite && std::isfinite(actual[i]);
+                max_abs = std::max(max_abs, std::abs(expected[i] - actual[i]));
+            }
+            std::fprintf(stderr, "%s max_abs=%g\n", name.c_str(), max_abs);
+            t.assert_true(name + " stays finite", all_finite);
+            t.assert_true(name + " keeps its own layer payload", max_abs <= 3e-4f);
+        };
+
+        t.assert_equal(uint64_t(4), stats.streamed_pages);
+        compare("prefill on the late layer", expected_prefill[1], actual_prefill_late);
+        compare("prefill on the early layer", expected_prefill[0], actual_prefill_early);
+        compare("decode across both layers", expected_decode, actual_decode);
+    });
+
+    t.test("scattered multi-slot set_rows preserves resident mirror coherence across steps", [](testing & t) {
+        constexpr int64_t n_kv = 512;
+        constexpr int64_t n_batch = 2;
+        constexpr int64_t update_rows = 2;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        attention_inputs inputs = make_inputs(n_kv, n_batch, n_kv - 1);
+        for (int64_t token = 0; token < n_kv; ++token) {
+            if (token >= 256) {
+                inputs.mask[0*n_kv + token] = ggml_fp32_to_fp16(-INFINITY);
+            } else {
+                inputs.mask[1*n_kv + token] = ggml_fp32_to_fp16(-INFINITY);
+            }
+        }
+
+        const int64_t scattered_rows[update_rows] = { 50, 300 };
+        const std::vector<float> expected = run_attention(
+            backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()),
+            n_kv, n_batch, 2, update_rows, true, GGML_TYPE_I64, false, nullptr, false, false, 0, scattered_rows);
+
+        const size_t k_page_bytes = ggml_row_size(inputs.type_k, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t v_page_bytes = ggml_row_size(inputs.type_v, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
+        ggml_backend_cuda_kv_stream_params params{};
+        params.device               = 0;
+        params.stage_bytes          = page_bytes;
+        params.stage_slots          = 2;
+        params.pool_bytes           = 4*page_bytes;
+        params.resident_layer_count = 1;
+        params.page_tokens          = 256;
+        auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+        if (!t.assert_true("stream runtime initializes", runtime != nullptr)) {
+            return;
+        }
+
+        const std::vector<float> actual = run_attention(
+            backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime),
+            n_kv, n_batch, 2, update_rows, true, GGML_TYPE_I64, false, nullptr, false, false, 0, scattered_rows);
+        const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
+        ggml_backend_cuda_kv_stream_runtime_free(runtime);
+
+        t.assert_equal(uint64_t(0), stats.streamed_pages);
+        t.assert_equal(uint64_t(0), stats.staged_set_rows);
+        t.assert_equal(uint64_t(2), stats.resident_hits);
+        t.assert_equal(uint64_t(2), stats.resident_misses);
+        if (!t.assert_equal(expected.size(), actual.size())) {
+            return;
+        }
+        bool all_finite = true;
+        float max_abs = 0.0f;
+        for (size_t i = 0; i < expected.size(); ++i) {
+            all_finite = all_finite && std::isfinite(actual[i]);
+            max_abs = std::max(max_abs, std::abs(expected[i] - actual[i]));
+        }
+        std::fprintf(stderr, "scattered multi-slot set_rows max_abs=%g\n", max_abs);
+        t.assert_true("scattered multi-slot output remains finite", all_finite);
+        t.assert_true("scattered multi-slot writes keep resident mirror coherent", max_abs <= 3e-4f);
     });
 
     ggml_quantize_free();

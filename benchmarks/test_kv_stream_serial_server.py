@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
+import re
 import signal
 import subprocess
 import time
@@ -10,10 +12,7 @@ import urllib.request
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_MODEL = Path(
-    "/home/raymond/LLM/llama-cache/models--unsloth--Qwen3.8-27B-GGUF/"
-    "blobs/8c2a45ff85e7674ca185ec8eb6cdeab0e617ed9d8018caed0b64380eb2a67a5e"
-)
+DEFAULT_SERVER = ROOT / "build/bin/llama-server"
 
 
 def request(port: int, path: str, payload: dict | None, timeout: int = 600) -> dict:
@@ -26,15 +25,18 @@ def request(port: int, path: str, payload: dict | None, timeout: int = 600) -> d
 
 
 class Server:
-    def __init__(self, model: Path, port: int, cache_mib: int, log: Path):
+    def __init__(self, server: Path, model: Path, port: int, cache_mib: int, log: Path,
+                 n_parallel: int = 1, ctx_size: int = 8448, extra: list[str] = ()):
         command = [
-            str(ROOT / "build-kv-cuda/bin/llama-server"),
+            str(server),
             "-m", str(model), "--host", "127.0.0.1", "--port", str(port),
-            "--ctx-size", "8448", "-fa", "on", "-ctk", "q8_0", "-ctv", "q4_0",
-            "-ngl", "all", "-b", "256", "-ub", "256", "-np", "1",
+            "--ctx-size", str(ctx_size), "-fa", "on", "-ctk", "q8_0", "-ctv", "q4_0",
+            "-ngl", "all", "-b", "256", "-ub", "256", "-np", str(n_parallel),
             "--no-mmproj", "--no-warmup", "--reasoning-format", "none",
             "--kv-stream-stage-mib", "128", "--cache-ram", str(cache_mib),
+            *extra,
         ]
+        self.log_path = log
         self.log_file = log.open("wb")
         self.process = subprocess.Popen(
             command, stdout=self.log_file, stderr=subprocess.STDOUT)
@@ -61,10 +63,10 @@ class Server:
         self.log_file.close()
 
 
-def completion(server: Server, prompt: list[int], cache_prompt: bool) -> dict:
+def completion(server: Server, prompt: list[int], cache_prompt: bool, n_predict: int = 16) -> dict:
     return request(server.port, "/completion", {
         "prompt": prompt,
-        "n_predict": 16,
+        "n_predict": n_predict,
         "ignore_eos": True,
         "cache_prompt": cache_prompt,
         "temperature": 0,
@@ -77,8 +79,8 @@ def patterned(size: int, tokens: tuple[int, ...]) -> list[int]:
     return [tokens[i % len(tokens)] for i in range(size)]
 
 
-def run_serial(model: Path, port: int, output: Path):
-    server = Server(model, port, 0, output / "serial.log")
+def run_serial(binary: Path, model: Path, port: int, output: Path):
+    server = Server(binary, model, port, 0, output / "serial.log")
     try:
         short = patterned(1024, (23066, 1000, 2000))
         medium = patterned(4096, (23066, 3000, 4000, 5000))
@@ -106,8 +108,8 @@ def run_serial(model: Path, port: int, output: Path):
         server.stop()
 
 
-def run_prompt_cache(model: Path, port: int, output: Path):
-    server = Server(model, port, 1536, output / "prompt-cache.log")
+def run_prompt_cache(binary: Path, model: Path, port: int, output: Path):
+    server = Server(binary, model, port, 1536, output / "prompt-cache.log")
     try:
         cached = patterned(4096, (23066, 1100, 2100, 3100))
         unrelated = patterned(2048, (23066, 4100, 5100, 6100))
@@ -123,15 +125,71 @@ def run_prompt_cache(model: Path, port: int, output: Path):
         server.stop()
 
 
+RESTORE_RUNS = re.compile(rb"state_read_data: restoring (\d+) cells in (\d+) runs")
+
+
+def run_parked_slots(binary: Path, model: Path, port: int, output: Path):
+    server = Server(binary, model, port, 1536, output / "parked-slots.log",
+                    n_parallel=2, ctx_size=12288, extra=["--kv-unified", "--cache-idle-slots", "-lv", "5"])
+    try:
+        parent = patterned(4096, (23066, 1200, 2200, 3200))
+        child_a = patterned(2048, (23066, 4200, 5200, 6200))
+        child_b = patterned(2048, (23066, 7200, 8200, 9200))
+
+        expected = completion(server, parent, True)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            fut_a = pool.submit(completion, server, child_a, True, 64)
+            fut_b = pool.submit(completion, server, child_b, True, 256)
+            child_a_result = fut_a.result()
+            child_b_result = fut_b.result()
+
+        restored = completion(server, parent, True)
+
+        details = {
+            "expected": expected["content"],
+            "restored": restored["content"],
+            "expected_slot": expected["id_slot"],
+            "restored_slot": restored["id_slot"],
+            "child_slots": [child_a_result["id_slot"], child_b_result["id_slot"]],
+            "restored_timings": restored["timings"],
+        }
+        if restored["content"] != expected["content"]:
+            raise RuntimeError(f"parked-slot restore output changed: {json.dumps(details)}")
+        cache_n = restored["timings"].get("cache_n", 0)
+        if cache_n < len(parent) - 256:
+            raise RuntimeError(f"parked-slot restore reused only {cache_n} tokens: {json.dumps(details)}")
+
+        server.log_file.flush()
+        restores = RESTORE_RUNS.findall(server.log_path.read_bytes())
+        if not restores:
+            raise RuntimeError("no state_read_data restore found in the server log")
+        cells, runs = (int(x) for x in restores[-1])
+        if runs < 2:
+            raise RuntimeError(
+                f"restore landed in {runs} run(s), the test did not fragment the pool: {json.dumps(details)}")
+        print(f"parked-slot restore test: PASS (cache_n={cache_n}, slot {expected['id_slot']} -> "
+              f"{restored['id_slot']}, {cells} cells in {runs} runs, "
+              f"prompt_ms={restored['timings']['prompt_ms']:.1f})", flush=True)
+    finally:
+        server.stop()
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
+    parser.add_argument("--model", type=Path, required=True)
+    parser.add_argument("--server", type=Path, default=DEFAULT_SERVER)
     parser.add_argument("--port", type=int, default=12358)
     parser.add_argument("--output", type=Path, default=ROOT / "benchmarks/results/serial-server")
+    parser.add_argument("--only", choices=["serial", "prompt-cache", "parked-slots"])
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
-    run_serial(args.model, args.port, args.output)
-    run_prompt_cache(args.model, args.port, args.output)
+    if args.only in (None, "serial"):
+        run_serial(args.server, args.model, args.port, args.output)
+    if args.only in (None, "prompt-cache"):
+        run_prompt_cache(args.server, args.model, args.port, args.output)
+    if args.only in (None, "parked-slots"):
+        run_parked_slots(args.server, args.model, args.port, args.output)
 
 
 if __name__ == "__main__":

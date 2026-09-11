@@ -2813,6 +2813,8 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         }
     }
 
+    LLAMA_LOG_DEBUG("%s: restoring %u cells in %zu runs\n", __func__, cell_count, runs.size());
+
     uint32_t v_trans;
     uint32_t n_layer;
 

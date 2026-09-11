@@ -1573,7 +1573,12 @@ static bool kv_stream_page_live(
         const ggml_cuda_kv_stream_transfer_ring * ring,
         uint32_t page,
         uint32_t nchunks) {
-    return ring->live_pages.size() != nchunks || ring->live_pages[page] != 0;
+    if (ring->live_pages.empty()) {
+        return true;
+    }
+    // host and device must agree on n_kv and page_tokens
+    GGML_ASSERT(ring->live_pages.size() == nchunks && page < nchunks);
+    return ring->live_pages[page] != 0;
 }
 
 static void kv_stream_graph_release(

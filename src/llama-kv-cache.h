@@ -317,6 +317,7 @@ private:
         repartition_fn_t repartition_fn = nullptr;
         decode_layout_fn_t decode_layout_fn = nullptr;
         mark_dirty_rows_fn_t mark_dirty_rows_fn = nullptr;
+        mutable std::vector<uint8_t> live_pages;
         uint32_t layer_count = 0;
         uint32_t minimum_ring_slots = 0;
         uint32_t decode_layout_pages = 0;
@@ -404,6 +405,13 @@ private:
     bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1, const slot_info * sinfo_in = nullptr);
     bool state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo);
 };
+
+void llama_kv_cache_live_pages(
+    const llama_kv_cells & cells,
+    const std::bitset<LLAMA_MAX_SEQ> & ubatch_seqs,
+    uint32_t n_kv,
+    uint32_t page_tokens,
+    std::vector<uint8_t> & out);
 
 class llama_kv_cache_context : public llama_memory_context_i {
 public:

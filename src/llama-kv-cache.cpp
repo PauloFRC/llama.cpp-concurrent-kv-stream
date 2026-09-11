@@ -2183,9 +2183,41 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         set_input_kq_mask_impl<float>(args, (float *) dst->data, causal_attn);
     }
 
+    if (kv_stream_runtime.runtime != nullptr) {
+        GGML_ASSERT(v_cells.size() == 1);
+
+        std::bitset<LLAMA_MAX_SEQ> ubatch_seqs;
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            ubatch_seqs.set(ubatch->seq_id[i][0]);
+        }
+
+        llama_kv_cache_live_pages(v_cells[0], ubatch_seqs, n_kv, page_tokens, kv_stream_runtime.live_pages);
+    }
+
     //const int64_t t_end = ggml_time_us();
 
     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
+}
+
+void llama_kv_cache_live_pages(
+    const llama_kv_cells & cells,
+    const std::bitset<LLAMA_MAX_SEQ> & ubatch_seqs,
+    uint32_t n_kv,
+    uint32_t page_tokens,
+    std::vector<uint8_t> & out) {
+    GGML_ASSERT(n_kv % page_tokens == 0);
+    GGML_ASSERT(n_kv <= cells.size());
+
+    out.assign(n_kv/page_tokens, 0);
+
+    for (uint32_t p = 0; p < out.size(); ++p) {
+        for (uint32_t i = p*page_tokens; i < (p + 1)*page_tokens; ++i) {
+            if (!cells.is_empty(i) && (cells.seq_get_all(i) & ubatch_seqs).any()) {
+                out[p] = 1;
+                break;
+            }
+        }
+    }
 }
 
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

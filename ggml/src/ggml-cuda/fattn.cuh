@@ -26,6 +26,7 @@ struct ggml_cuda_kv_stream_transfer_stats {
     uint64_t host_to_device_copy_commands = 0;
     uint64_t compute_stream_waits = 0;
     uint64_t stage_slot_reuses = 0;
+    uint64_t skipped_pages = 0;
     uint64_t cross_layer_prefetches = 0;
     uint64_t deadline_samples = 0;
     uint64_t deadline_misses = 0;

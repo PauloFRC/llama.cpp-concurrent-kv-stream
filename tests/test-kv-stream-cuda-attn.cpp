@@ -912,11 +912,13 @@ int main() {
             int64_t mask_begin;
             int64_t mask_end;
             uint64_t expected_streamed;
+            uint64_t expected_skipped;
         };
 
         const test_case cases[] = {
-            { { 1, 1, 0, 1 }, 2*256, 3*256, 2 },
-            { { 1, 0, 0, 1 }, 1*256, 3*256, 1 },
+            { { 1, 1, 0, 1 }, 2*256, 3*256, 2, 1 },
+            { { 1, 0, 0, 1 }, 1*256, 3*256, 1, 2 },
+            { { 1, 0, 0, 0 }, 1*256, 4*256, 0, 3 },
         };
 
         for (const auto & tc : cases) {
@@ -947,6 +949,7 @@ int main() {
                 const auto baseline_stats = ggml_backend_cuda_kv_stream_get_stats(baseline);
                 ggml_backend_cuda_kv_stream_runtime_free(baseline);
                 t.assert_equal(uint64_t(3), baseline_stats.streamed_pages);
+                t.assert_equal(uint64_t(0), baseline_stats.skipped_pages);
 
                 auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
                 if (!t.assert_true("stream runtime initializes", runtime != nullptr)) {
@@ -960,6 +963,7 @@ int main() {
                 ggml_backend_cuda_kv_stream_runtime_free(runtime);
 
                 t.assert_equal(tc.expected_streamed, stats.streamed_pages);
+                t.assert_equal(tc.expected_skipped, stats.skipped_pages);
                 if (!t.assert_equal(expected.size(), actual.size())) {
                     return;
                 }

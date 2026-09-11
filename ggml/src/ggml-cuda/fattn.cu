@@ -226,6 +226,7 @@ struct ggml_cuda_kv_stream_transfer_ring {
     uint64_t host_to_device_copy_commands = 0;
     uint64_t compute_stream_waits = 0;
     uint64_t stage_slot_reuses = 0;
+    uint64_t skipped_pages = 0;
     uint64_t cross_layer_prefetches = 0;
     uint32_t current_occupancy = 0;
     uint32_t ring_peak_occupancy = 0;
@@ -429,6 +430,7 @@ ggml_cuda_kv_stream_transfer_stats ggml_cuda_kv_stream_transfer_ring_get_stats(
         ring->host_to_device_copy_commands,
         ring->compute_stream_waits,
         ring->stage_slot_reuses,
+        ring->skipped_pages,
         ring->cross_layer_prefetches,
         ring->deadline_counters_host[0],
         ring->deadline_counters_host[1],
@@ -1896,12 +1898,14 @@ void ggml_cuda_flash_attn_ext_streamed(
                 }
             } else if (!kv_stream_page_live(transfer_ring, page, uint32_t(nchunks))) {
                 desc.skipped = true;
+                ++transfer_ring->skipped_pages;
             } else {
                 ++resident_cache->stats.streamed_pages;
                 desc.streamed = true;
             }
         } else if (!kv_stream_page_live(transfer_ring, uint32_t(chunk), uint32_t(nchunks))) {
             desc.skipped = true;
+            ++transfer_ring->skipped_pages;
         } else {
             desc.streamed = true;
         }

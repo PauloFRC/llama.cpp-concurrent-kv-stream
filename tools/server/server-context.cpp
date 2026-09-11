@@ -1658,7 +1658,10 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
-                ret->prompt_save(*prompt_cache);
+                // saving this slot must not evict the prompt we are about to load
+                if (!prompt_cache->has_match(ret->prompt, task.tokens) || prompt_cache->can_fit(ret->prompt_state_size(), ret->prompt.n_tokens())) {
+                    ret->prompt_save(*prompt_cache);
+                }
 
                 // free other idle slots without eviction so restore lands contiguously
                 if (params_base.cache_idle_slots && params_base.kv_unified) {

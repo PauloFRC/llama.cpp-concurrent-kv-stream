@@ -129,7 +129,7 @@ RESTORE_RUNS = re.compile(rb"state_read_data: restoring (\d+) cells in (\d+) run
 
 
 def run_parked_slots(binary: Path, model: Path, port: int, output: Path):
-    server = Server(binary, model, port, 1536, output / "parked-slots.log",
+    server = Server(binary, model, port, 2048, output / "parked-slots.log",
                     n_parallel=2, ctx_size=12288, extra=["--kv-unified", "--cache-idle-slots", "-lv", "5"])
     try:
         parent = patterned(4096, (23066, 1200, 2200, 3200))
@@ -142,9 +142,10 @@ def run_parked_slots(binary: Path, model: Path, port: int, output: Path):
             fut_a = pool.submit(completion, server, child_a, True, 64)
             fut_b = pool.submit(completion, server, child_b, True, 256)
             child_a_result = fut_a.result()
+            restored = completion(server, parent, True)
             child_b_result = fut_b.result()
 
-        restored = completion(server, parent, True)
+        restored_a = completion(server, child_a, True, 64)
 
         details = {
             "expected": expected["content"],
@@ -164,13 +165,21 @@ def run_parked_slots(binary: Path, model: Path, port: int, output: Path):
         restores = RESTORE_RUNS.findall(server.log_path.read_bytes())
         if not restores:
             raise RuntimeError("no state_read_data restore found in the server log")
-        cells, runs = (int(x) for x in restores[-1])
+        if len(restores) < 2:
+            raise RuntimeError(f"expected two restores, found {len(restores)}")
+        cells, runs = (int(x) for x in restores[-2])
         if runs < 2:
             raise RuntimeError(
                 f"restore landed in {runs} run(s), the test did not fragment the pool: {json.dumps(details)}")
+        cells_a, runs_a = (int(x) for x in restores[-1])
+        if restored_a["content"] != child_a_result["content"]:
+            raise RuntimeError("child restore output changed: "
+                               f"{json.dumps([child_a_result['content'], restored_a['content']])}")
+        if runs_a != 1:
+            raise RuntimeError(f"child restore landed in {runs_a} runs, the idle parent was not parked first")
         print(f"parked-slot restore test: PASS (cache_n={cache_n}, slot {expected['id_slot']} -> "
               f"{restored['id_slot']}, {cells} cells in {runs} runs, "
-              f"prompt_ms={restored['timings']['prompt_ms']:.1f})", flush=True)
+              f"prompt_ms={restored['timings']['prompt_ms']:.1f}; child back in {cells_a} cells, {runs_a} run)", flush=True)
     finally:
         server.stop()
 

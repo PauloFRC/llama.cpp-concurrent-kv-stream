@@ -386,6 +386,19 @@ public:
         return seq_pos[seq_id].rbegin()->first;
     }
 
+    // cell index carrying maximum position of sequence seq_id
+    // return -1 if sequence not present
+    int64_t seq_cell_max(llama_seq_id seq_id) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        if (seq_pos[seq_id].empty()) {
+            return -1;
+        }
+
+        return seq_pos[seq_id].rbegin()->second;
+    }
+
     // note: call only if the cell is not empty
     llama_pos pos_get(uint32_t i) const {
         assert(i < pos.size());

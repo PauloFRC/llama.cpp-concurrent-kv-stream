@@ -1182,15 +1182,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot_paged(const llama_ubatch & u
         auto & last = seq_last[seq_id];
 
         if (last == -2) {
-            last = -1;
-            if (cells.seq_pos_max(seq_id) >= 0) {
-                for (uint32_t j = cells.used_max_p1(); j-- > 0;) {
-                    if (cells.seq_has(j, seq_id)) {
-                        last = j;
-                        break;
-                    }
-                }
-            }
+            last = cells.seq_cell_max(seq_id);
         }
 
         int64_t idx = -1;
@@ -1201,6 +1193,35 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot_paged(const llama_ubatch & u
             for (uint32_t j = last + 1; j < page_end; ++j) {
                 if (cells.is_empty(j) && !claimed[j]) {
                     idx = j;
+                    break;
+                }
+            }
+        }
+
+        // reuse a page the sequence already owns
+        if (idx < 0 && last >= 0) {
+            for (uint32_t p = 0; p < n_pages; ++p) {
+                const uint32_t p0 = p*page_tokens;
+                const uint32_t p1 = std::min<uint32_t>(cells.size(), p0 + page_tokens);
+
+                bool has_seq   = false;
+                bool has_other = false;
+                int64_t candidate_idx = -1;
+
+                for (uint32_t j = p0; j < p1 && !has_other; ++j) {
+                    if (cells.is_empty(j)) {
+                        if (!claimed[j] && candidate_idx < 0) {
+                            candidate_idx = j;
+                        }
+                    } else if (cells.seq_has(j, seq_id)) {
+                        has_seq = true;
+                    } else {
+                        has_other = true;
+                    }
+                }
+
+                if (has_seq && !has_other && candidate_idx >= 0) {
+                    idx = candidate_idx;
                     break;
                 }
             }

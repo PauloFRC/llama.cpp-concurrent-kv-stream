@@ -33,7 +33,8 @@ static void log_callback(ggml_log_level level, const char * text, void * /*user_
     }
 
     // parse cell layout dump
-    if (text[0] == '\n' && text[1] != '\0' && strchr(".0123456789M", text[1]) && text[2] != ' ') {
+    const char * sp = strchr(text, ' ');
+    if (text[0] == '\n' && text[1] != '\0' && strchr(".0123456789M", text[1]) && (sp == nullptr || sp[1] == '*')) {
         g_cell_map.clear();
         for (const char * c = text + 1; *c; ++c) {
             if (*c == '.' || *c == 'M' || (*c >= '0' && *c <= '9')) {
@@ -56,6 +57,14 @@ static int page_seq_count(size_t page, size_t page_size) {
         }
     }
     return (int) seen.size();
+}
+
+static int page_cell_count(size_t page, size_t page_size, char c) {
+    int n = 0;
+    for (size_t i = page*page_size; i < std::min(g_cell_map.size(), (page + 1)*page_size); ++i) {
+        n += g_cell_map[i] == c;
+    }
+    return n;
 }
 
 static int check_pages_pure(const char * who, size_t n_pages, size_t page_size) {
@@ -222,6 +231,82 @@ static int test_concurrent_decode_pages(llama_context * ctx, llama_batch & batch
     }
 
     fprintf(stderr, "%s : SUCCESS - each sequence stayed in its own page\n", __func__);
+    return 0;
+}
+
+static int test_decode_after_park_stays_in_page(llama_context * ctx, llama_batch & batch) {
+    llama_memory_t mem = llama_get_memory(ctx);
+    llama_memory_clear(mem, true);
+
+    // seq 0 fills pages 0-1, seq 1 fills page 2 exactly
+    const int n_prefill[2] = { 512, 256 };
+    for (int s = 0; s < 2; s++) {
+        common_batch_clear(batch);
+        for (int i = 0; i < n_prefill[s]; i++) {
+            common_batch_add(batch, 1, i, {s}, false);
+        }
+        if (llama_decode(ctx, batch)) {
+            fprintf(stderr, "%s : failed to prefill seq %d\n", __func__, s);
+            return 1;
+        }
+    }
+
+    llama_memory_seq_rm(mem, 0, -1, -1);
+
+    // 8 decode steps, the 9th only triggers the dump
+    for (int i = 0; i < 9; i++) {
+        common_batch_clear(batch);
+        common_batch_add(batch, 1, 256 + i, {1}, false);
+        if (llama_decode(ctx, batch)) {
+            fprintf(stderr, "%s : failed to decode step %d\n", __func__, i);
+            return 1;
+        }
+    }
+
+    if (page_cell_count(0, 256, '1') != 8 || page_seq_count(1, 256) != 0) {
+        fprintf(stderr, "%s : FAILED - decode tokens scattered across pages: %s\n", __func__, g_cell_map.substr(0, 512).c_str());
+        return 1;
+    }
+
+    fprintf(stderr, "%s : SUCCESS - decode after park filled one page\n", __func__);
+    return 0;
+}
+
+static int test_full_tail_reuses_owned_page(llama_context * ctx, llama_batch & batch) {
+    llama_memory_t mem = llama_get_memory(ctx);
+    llama_memory_clear(mem, true);
+
+    const int n_prefill[2] = { 256, 512 };
+    for (int s = 1; s >= 0; s--) {
+        common_batch_clear(batch);
+        for (int i = 0; i < n_prefill[s]; i++) {
+            common_batch_add(batch, 1, i, {s}, false);
+        }
+        if (llama_decode(ctx, batch)) {
+            fprintf(stderr, "%s : failed to prefill seq %d\n", __func__, s);
+            return 1;
+        }
+    }
+
+    llama_memory_seq_rm(mem, 1, 100, 200);
+
+    // 4 decode steps, the 5th triggers the dump
+    for (int i = 0; i < 5; i++) {
+        common_batch_clear(batch);
+        common_batch_add(batch, 1, 512 + i, {1}, false);
+        if (llama_decode(ctx, batch)) {
+            fprintf(stderr, "%s : failed to decode step %d\n", __func__, i);
+            return 1;
+        }
+    }
+
+    if (page_cell_count(0, 256, '1') != 160 || page_seq_count(3, 256) != 0) {
+        fprintf(stderr, "%s : FAILED - decode opened a new page instead of the owned hole: page 0 holds %d, page 3 holds %d seqs\n",
+                __func__, page_cell_count(0, 256, '1'), page_seq_count(3, 256));
+        return 1;
+    }
+
+    fprintf(stderr, "%s : SUCCESS - full tail page fell back to the sequence's own page\n", __func__);
     return 0;
 }
 
@@ -401,6 +486,12 @@ int main(int argc, char ** argv) {
             }
             if (ret == 0) {
                 ret = test_restore_takes_empty_pages(ctx_pages, batch);
+            }
+            if (ret == 0) {
+                ret = test_decode_after_park_stays_in_page(ctx_pages, batch);
+            }
+            if (ret == 0) {
+                ret = test_full_tail_reuses_owned_page(ctx_pages, batch);
             }
             llama_free(ctx_pages);
         }

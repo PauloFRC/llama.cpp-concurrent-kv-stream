@@ -168,9 +168,9 @@ def run_parked_slots(binary: Path, model: Path, port: int, output: Path):
         if len(restores) < 2:
             raise RuntimeError(f"expected two restores, found {len(restores)}")
         cells, runs = (int(x) for x in restores[-2])
-        if runs < 2:
+        if runs != 1:
             raise RuntimeError(
-                f"restore landed in {runs} run(s), the test did not fragment the pool: {json.dumps(details)}")
+                f"restore landed in {runs} runs, the free block above the live child was not preferred: {json.dumps(details)}")
         cells_a, runs_a = (int(x) for x in restores[-1])
         if restored_a["content"] != child_a_result["content"]:
             raise RuntimeError("child restore output changed: "

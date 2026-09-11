@@ -3,8 +3,9 @@
 // The issue was that state restore required contiguous KV cache slots,
 // which fails when the cache is fragmented.
 //
-// The fix changes find_slot(ubatch, true) to find_slot(ubatch, false)
-// in state_read_meta(), allowing non-contiguous slot allocation.
+// The fix lets state_read_meta() fall back to find_slot(ubatch, false),
+// allowing non-contiguous slot allocation. A contiguous block is still
+// preferred when one is free, so a restore does not scatter needlessly.
 
 #include "arg.h"
 #include "common.h"
@@ -13,6 +14,69 @@
 #include <vector>
 #include <cstdio>
 #include <cstring>
+
+// run count of the last state_read_data restore
+static int g_restore_runs = -1;
+
+static void log_callback(ggml_log_level level, const char * text, void * /*user_data*/) {
+    unsigned cells = 0;
+    size_t   runs  = 0;
+
+    if (sscanf(text, "state_read_data: restoring %u cells in %zu runs", &cells, &runs) == 2) {
+        g_restore_runs = (int) runs;
+    }
+
+    if (level != GGML_LOG_LEVEL_DEBUG) {
+        fputs(text, stderr);
+    }
+}
+
+static int test_contiguous_first(llama_context * ctx, llama_batch & batch) {
+    llama_memory_t mem = llama_get_memory(ctx);
+    llama_memory_clear(mem, true);
+
+    common_batch_clear(batch);
+    for (int i = 0; i < 32; i++) {
+        common_batch_add(batch, 1, i, {0}, false);
+        common_batch_add(batch, 1, i, {1}, false);
+    }
+    if (llama_decode(ctx, batch)) {
+        fprintf(stderr, "%s : failed to decode seq 0, 1\n", __func__);
+        return 1;
+    }
+
+    common_batch_clear(batch);
+    for (int i = 0; i < 64; i++) {
+        common_batch_add(batch, 1, i, {2}, false);
+    }
+    if (llama_decode(ctx, batch)) {
+        fprintf(stderr, "%s : failed to decode seq 2\n", __func__);
+        return 1;
+    }
+
+    std::vector<uint8_t> seq_state(llama_state_seq_get_size(ctx, 2));
+    if (llama_state_seq_get_data(ctx, seq_state.data(), seq_state.size(), 2) != seq_state.size()) {
+        fprintf(stderr, "%s : failed to save seq 2 state\n", __func__);
+        return 1;
+    }
+
+    llama_memory_seq_rm(mem, 0, -1, -1);
+    llama_memory_seq_rm(mem, 2, -1, -1);
+
+    g_restore_runs = -1;
+    if (llama_state_seq_set_data(ctx, seq_state.data(), seq_state.size(), 2) != seq_state.size()) {
+        fprintf(stderr, "%s : failed to restore seq 2 state\n", __func__);
+        return 1;
+    }
+
+    if (g_restore_runs != 1) {
+        fprintf(stderr, "%s : FAILED - seq 2 restored in %d runs, expected 1 (contiguous block was available)\n", __func__, g_restore_runs);
+        return 1;
+    }
+
+    fprintf(stderr, "%s : SUCCESS - seq 2 restored into the contiguous block\n", __func__);
+    return 0;
+}
 
 int main(int argc, char ** argv) {
     common_params params;
@@ -23,6 +87,8 @@ int main(int argc, char ** argv) {
     params.n_ctx = 256;
 
     common_init();
+
+    llama_log_set(log_callback, nullptr);
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
         return 1;
@@ -118,8 +184,10 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "%s : successfully decoded with restored state, generated: '%s'\n", __func__, next_token_str.c_str());
     fprintf(stderr, "%s : SUCCESS - state restore works with fragmented KV cache\n", __func__);
 
+    const int ret = test_contiguous_first(ctx, batch);
+
     llama_sampler_free(smpl);
     llama_batch_free(batch);
 
-    return 0;
+    return ret;
 }

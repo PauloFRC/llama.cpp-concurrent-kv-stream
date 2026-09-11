@@ -2703,7 +2703,11 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
                 }
             }
         } else {
-            sinfo = find_slot(ubatch, false);
+            // a contiguous block keeps the sequence in its own pages
+            sinfo = find_slot(ubatch, true);
+            if (sinfo.empty()) {
+                sinfo = find_slot(ubatch, false);
+            }
             if (sinfo.empty()) {
                 LLAMA_LOG_ERROR("%s: failed to find %d available cells in kv cache\n", __func__,  cell_count);
                 return false;

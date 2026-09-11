@@ -1393,9 +1393,12 @@ bool llama_kv_cache::kv_stream_adapt(uint32_t active_tokens, uint32_t query_toke
     uint32_t ring_slots = 0;
     uint32_t resident_pages = 0;
     uint32_t controlled_pages = 0;
+    uint64_t skipped_pages = 0;
+    uint64_t resident_pages_attended = 0;
     if (!owner.feedback_fn(owner.runtime,
             &deadline_samples, &deadline_misses, &copy_busy_ratio,
-            &peak_occupancy, &ring_slots, &resident_pages, &controlled_pages)) {
+            &peak_occupancy, &ring_slots, &resident_pages, &controlled_pages,
+            &skipped_pages, &resident_pages_attended)) {
         return false;
     }
 
@@ -1404,12 +1407,24 @@ bool llama_kv_cache::kv_stream_adapt(uint32_t active_tokens, uint32_t query_toke
         { owner.previous_deadline_samples, owner.previous_deadline_misses });
     owner.previous_deadline_samples = deadline_samples;
     owner.previous_deadline_misses = deadline_misses;
+
+    const uint64_t delta_skipped_pages =
+        skipped_pages >= owner.previous_skipped_pages ?
+            skipped_pages - owner.previous_skipped_pages : skipped_pages;
+    const uint64_t delta_resident_pages_attended =
+        resident_pages_attended >= owner.previous_resident_pages_attended ?
+            resident_pages_attended - owner.previous_resident_pages_attended : resident_pages_attended;
+    owner.previous_skipped_pages = skipped_pages;
+    owner.previous_resident_pages_attended = resident_pages_attended;
+
     if (getenv("LLAMA_KV_STREAM_TRACE") != nullptr) {
-        LLAMA_LOG_WARN("%s: active %u, resident %u, ring %u, samples %llu, misses %llu, copy busy %.1f%%, peak %u\n",
+        LLAMA_LOG_WARN("%s: active %u, resident %u, ring %u, samples %llu, misses %llu, copy busy %.1f%%, peak %u, skipped %llu, resident attended %llu\n",
             __func__, active_tokens, resident_pages, ring_slots,
             (unsigned long long) delta.deadline_samples,
             (unsigned long long) delta.deadline_misses,
-            100.0*copy_busy_ratio, peak_occupancy);
+            100.0*copy_busy_ratio, peak_occupancy,
+            (unsigned long long) delta_skipped_pages,
+            (unsigned long long) delta_resident_pages_attended);
     }
 
     const uint32_t active_pages = (active_tokens + page_tokens - 1)/page_tokens;

@@ -1292,7 +1292,7 @@ int main() {
 
         using feedback_fn_t = bool (*)(
             void *, uint64_t *, uint64_t *, double *, uint32_t *,
-            uint32_t *, uint32_t *, uint32_t *);
+            uint32_t *, uint32_t *, uint32_t *, uint64_t *, uint64_t *);
         ggml_backend_dev_t device = ggml_backend_get_device(backend.get());
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
         auto feedback_fn = reinterpret_cast<feedback_fn_t>(
@@ -1304,10 +1304,13 @@ int main() {
         uint32_t ring_slots = 0;
         uint32_t resident_pages = 0;
         uint32_t controlled_pages = 0;
+        uint64_t skipped_pages = 0;
+        uint64_t resident_pages_attended = 0;
         t.assert_true("feedback remains readable after resident graph replay",
             feedback_fn != nullptr && feedback_fn(
                 runtime, &deadline_samples, &deadline_misses, &copy_busy_ratio,
-                &peak_occupancy, &ring_slots, &resident_pages, &controlled_pages));
+                &peak_occupancy, &ring_slots, &resident_pages, &controlled_pages,
+                &skipped_pages, &resident_pages_attended));
         ggml_backend_cuda_kv_stream_runtime_free(runtime);
 
         t.assert_equal(uint64_t(2*page_bytes), stats.host_to_device_bytes);
@@ -1647,7 +1650,7 @@ int main() {
 
         using feedback_fn_t = bool (*)(
             void *, uint64_t *, uint64_t *, double *, uint32_t *,
-            uint32_t *, uint32_t *, uint32_t *);
+            uint32_t *, uint32_t *, uint32_t *, uint64_t *, uint64_t *);
         ggml_backend_dev_t device = ggml_backend_get_device(backend.get());
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
         auto feedback_fn = reinterpret_cast<feedback_fn_t>(
@@ -1664,9 +1667,14 @@ int main() {
         uint32_t ring_slots = 0;
         uint32_t resident_pages = 0;
         uint32_t controlled_pages = 0;
+        uint64_t skipped_pages = 0;
+        uint64_t resident_pages_attended = 0;
         t.assert_true("dynamic feedback is readable", feedback_fn(
             runtime, &deadline_samples, &deadline_misses, &copy_busy_ratio,
-            &peak_occupancy, &ring_slots, &resident_pages, &controlled_pages));
+            &peak_occupancy, &ring_slots, &resident_pages, &controlled_pages,
+            &skipped_pages, &resident_pages_attended));
+        t.assert_equal(stats.skipped_pages, skipped_pages);
+        t.assert_equal(stats.resident_pages_attended, resident_pages_attended);
         t.assert_equal(uint64_t(6), deadline_samples);
         t.assert_true("copy busy ratio is normalized",
             copy_busy_ratio >= 0.0 && copy_busy_ratio <= 1.0);

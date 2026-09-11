@@ -1524,6 +1524,7 @@ ggml_backend_buffer_type_t llama_kv_cache::kv_stream_init_runtime(
     using repartition_fn_t = kv_stream_runtime_owner::repartition_fn_t;
     using decode_layout_fn_t = kv_stream_runtime_owner::decode_layout_fn_t;
     using mark_dirty_rows_fn_t = kv_stream_runtime_owner::mark_dirty_rows_fn_t;
+    using set_live_pages_fn_t = kv_stream_runtime_owner::set_live_pages_fn_t;
 
     auto * type_pair_supported_fn = (type_pair_supported_fn_t) ggml_backend_reg_get_proc_address(
         reg, "ggml_backend_cuda_kv_stream_type_pair_supported");
@@ -1549,6 +1550,8 @@ ggml_backend_buffer_type_t llama_kv_cache::kv_stream_init_runtime(
         reg, "ggml_backend_cuda_kv_stream_set_decode_layout");
     auto * mark_dirty_rows_fn = (mark_dirty_rows_fn_t) ggml_backend_reg_get_proc_address(
         reg, "ggml_backend_cuda_kv_stream_mark_dirty_rows");
+    auto * set_live_pages_fn = (set_live_pages_fn_t) ggml_backend_reg_get_proc_address(
+        reg, "ggml_backend_cuda_kv_stream_set_live_pages");
 
     if (type_pair_supported_fn == nullptr || page_bytes_fn == nullptr ||
             workspace_bytes_fn == nullptr || runtime_new_fn == nullptr ||
@@ -1557,7 +1560,7 @@ ggml_backend_buffer_type_t llama_kv_cache::kv_stream_init_runtime(
             span_feedback_fn == nullptr ||
             repartition_fn == nullptr || decode_layout_fn == nullptr ||
             reconfigure_fn == nullptr ||
-            mark_dirty_rows_fn == nullptr) {
+            mark_dirty_rows_fn == nullptr || set_live_pages_fn == nullptr) {
         throw std::runtime_error("block KV streaming requires the CUDA backend");
     }
 
@@ -1590,6 +1593,7 @@ ggml_backend_buffer_type_t llama_kv_cache::kv_stream_init_runtime(
     kv_stream_runtime.reconfigure_fn = reconfigure_fn;
     kv_stream_runtime.decode_layout_fn = decode_layout_fn;
     kv_stream_runtime.mark_dirty_rows_fn = mark_dirty_rows_fn;
+    kv_stream_runtime.set_live_pages_fn = set_live_pages_fn;
     kv_stream_runtime.layer_count = layer_count;
     if (kv_stream_runtime.runtime == nullptr) {
         throw std::runtime_error("failed to create CUDA block KV streaming runtime");
@@ -2192,6 +2196,10 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         }
 
         llama_kv_cache_live_pages(v_cells[0], ubatch_seqs, n_kv, page_tokens, kv_stream_runtime.live_pages);
+        GGML_ASSERT(kv_stream_runtime.set_live_pages_fn(
+            kv_stream_runtime.runtime,
+            kv_stream_runtime.live_pages.data(),
+            kv_stream_runtime.live_pages.size()));
     }
 
     //const int64_t t_end = ggml_time_us();

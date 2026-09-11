@@ -118,6 +118,10 @@ GGML_BACKEND_API bool ggml_backend_cuda_kv_stream_mark_dirty_rows(
     ggml_backend_cuda_kv_stream_runtime_t runtime,
     const int64_t * rows,
     size_t count);
+GGML_BACKEND_API bool ggml_backend_cuda_kv_stream_set_live_pages(
+    ggml_backend_cuda_kv_stream_runtime_t runtime,
+    const uint8_t * live_pages,
+    size_t count);
 GGML_BACKEND_API struct ggml_backend_cuda_kv_stream_stats ggml_backend_cuda_kv_stream_get_stats(
     ggml_backend_cuda_kv_stream_runtime_t runtime);
 GGML_BACKEND_API bool ggml_backend_cuda_kv_stream_stage_upload(

@@ -897,6 +897,73 @@ int main() {
         t.assert_true("fully masked page output remains equivalent", max_abs <= 3e-4f);
     });
 
+    t.test("non-live streamed pages are skipped by the live-page bitmap", [](testing & t) {
+        constexpr int64_t n_kv = 1024;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        const size_t k_page_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t v_page_bytes = ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
+        const uint8_t live_pages[4] = { 1, 1, 0, 1 };
+
+        for (const int64_t n_batch : { int64_t(1), int64_t(4) }) {
+            attention_inputs inputs = make_inputs(n_kv, n_batch, n_kv - 1);
+            for (int64_t batch = 0; batch < n_batch; ++batch) {
+                for (int64_t token = 2*256; token < 3*256; ++token) {
+                    inputs.mask[batch*n_kv + token] = ggml_fp32_to_fp16(-INFINITY);
+                }
+            }
+            const std::vector<float> expected = run_attention(
+                backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()), n_kv, n_batch);
+
+            ggml_backend_cuda_kv_stream_params params{};
+            params.device               = 0;
+            params.stage_bytes          = page_bytes;
+            params.stage_slots          = 2;
+            params.pool_bytes           = 3*page_bytes;
+            params.resident_layer_count = 1;
+            params.page_tokens          = 256;
+
+            auto baseline = ggml_backend_cuda_kv_stream_runtime_new(params);
+            if (!t.assert_true("baseline runtime initializes", baseline != nullptr)) {
+                return;
+            }
+            (void) run_attention(
+                backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(baseline), n_kv, n_batch);
+            const auto baseline_stats = ggml_backend_cuda_kv_stream_get_stats(baseline);
+            ggml_backend_cuda_kv_stream_runtime_free(baseline);
+            t.assert_equal(uint64_t(3), baseline_stats.streamed_pages);
+
+            auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+            if (!t.assert_true("stream runtime initializes", runtime != nullptr)) {
+                return;
+            }
+            t.assert_true("live pages accepted",
+                ggml_backend_cuda_kv_stream_set_live_pages(runtime, live_pages, 4));
+            const std::vector<float> actual = run_attention(
+                backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime), n_kv, n_batch);
+            const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
+            ggml_backend_cuda_kv_stream_runtime_free(runtime);
+
+            t.assert_equal(uint64_t(2), stats.streamed_pages);
+            if (!t.assert_equal(expected.size(), actual.size())) {
+                return;
+            }
+            bool all_finite = true;
+            float max_abs = 0.0f;
+            for (size_t i = 0; i < expected.size(); ++i) {
+                all_finite = all_finite && std::isfinite(actual[i]);
+                max_abs = std::max(max_abs, std::abs(expected[i] - actual[i]));
+            }
+            std::fprintf(stderr, "live-page skip n_batch=%lld max_abs=%g\n", (long long) n_batch, max_abs);
+            t.assert_true("live-page skip output remains finite", all_finite);
+            t.assert_true("live-page skip output remains equivalent", max_abs <= 3e-4f);
+        }
+    });
+
     t.test("disjoint per-row pages keep multi-query output equivalent", [](testing & t) {
         constexpr int64_t n_kv = 1024;
         constexpr int64_t n_batch = 4;

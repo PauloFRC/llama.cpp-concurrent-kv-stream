@@ -308,6 +308,7 @@ private:
         using repartition_fn_t = bool (*)(void *, uint32_t);
         using decode_layout_fn_t = bool (*)(void *, uint32_t);
         using mark_dirty_rows_fn_t = bool (*)(void *, const int64_t *, size_t);
+        using set_live_pages_fn_t = bool (*)(void *, const uint8_t *, size_t);
 
         void * runtime = nullptr;
         void (*free_fn)(void *) = nullptr;
@@ -317,6 +318,7 @@ private:
         repartition_fn_t repartition_fn = nullptr;
         decode_layout_fn_t decode_layout_fn = nullptr;
         mark_dirty_rows_fn_t mark_dirty_rows_fn = nullptr;
+        set_live_pages_fn_t set_live_pages_fn = nullptr;
         mutable std::vector<uint8_t> live_pages;
         uint32_t layer_count = 0;
         uint32_t minimum_ring_slots = 0;

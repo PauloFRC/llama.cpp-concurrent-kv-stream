@@ -1841,6 +1841,17 @@ void ggml_cuda_flash_attn_ext_streamed(
     std::vector<size_t> streamed_chunks;
     streamed_chunks.reserve(nchunks);
 
+    // live resident pages are attended; pages outside it are skipped
+    uint32_t resident_first = UINT32_MAX;
+    uint32_t resident_last = 0;
+    for (uint32_t page = 0; page < std::min<uint32_t>(uint32_t(nchunks), resident_layer_pages); ++page) {
+        if (!kv_stream_page_live(transfer_ring, page, uint32_t(nchunks))) {
+            continue;
+        }
+        resident_first = std::min(resident_first, page);
+        resident_last = page;
+    }
+
     for (int chunk = 0; chunk < nchunks; ++chunk) {
         auto & desc = chunks[chunk];
         const int64_t token_begin = chunk*block_tokens;
@@ -1876,6 +1887,11 @@ void ggml_cuda_flash_attn_ext_streamed(
 
             const uint32_t page = token_begin/resident_cache->page_tokens;
             if (page < resident_layer_pages) {
+                if (page < resident_first || page > resident_last) {
+                    desc.skipped = true;
+                    ++transfer_ring->skipped_pages;
+                    continue;
+                }
                 const size_t resident_index =
                     kv_stream_resident_index(resident_cache, resident_layer, page);
                 // Keep each layer's resident K and V in separate token-major
@@ -2123,14 +2139,16 @@ void ggml_cuda_flash_attn_ext_streamed(
                 ++resident_cache->stats.resident_attention_spans;
                 ++resident_cache->stats.resident_pages_attended;
             } else {
-                // Native kernels consume the resident K/V prefix in one span.
-                if (chunk > 0) {
+                // Native kernels consume the live resident pages in one span.
+                if (uint32_t(chunk) != resident_first) {
                     continue;
                 }
-                const uint32_t resident_span_pages =
-                    std::min<uint32_t>(uint32_t(nchunks), resident_layer_pages);
-                GGML_ASSERT(resident_span_pages > 0);
-                for (uint32_t page = 0; page < resident_span_pages; ++page) {
+                if (resident_first > 0 ||
+                        resident_last + 1 < std::min<uint32_t>(uint32_t(nchunks), resident_layer_pages)) {
+                    GGML_ASSERT(resident_cache->precise_dirty_tracking[resident_layer]);
+                }
+                const uint32_t resident_span_pages = resident_last - resident_first + 1;
+                for (uint32_t page = resident_first; page <= resident_last; ++page) {
                     upload(chunks[page], ctx.stream());
                     if (chunks[page].upload &&
                             resident_cache->precise_dirty_tracking[resident_layer]) {
@@ -2317,6 +2335,7 @@ void ggml_cuda_flash_attn_ext_streamed(
             chunk += int(streamed_span_pages) - 1;
         }
     }
+    GGML_ASSERT(!first_chunk);
 
     const dim3 blocks(nrows, 1, 1);
     const dim3 threads(KV_STREAM_HEAD_DIM, 1, 1);

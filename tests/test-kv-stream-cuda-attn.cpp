@@ -909,24 +909,37 @@ int main() {
         const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
         struct test_case {
             uint8_t live_pages[4];
-            int64_t mask_begin;
-            int64_t mask_end;
+            size_t pool_pages;
             uint64_t expected_streamed;
+            uint64_t expected_resident_attended;
             uint64_t expected_skipped;
         };
 
         const test_case cases[] = {
-            { { 1, 1, 0, 1 }, 2*256, 3*256, 2, 1 },
-            { { 1, 0, 0, 1 }, 1*256, 3*256, 1, 2 },
-            { { 1, 0, 0, 0 }, 1*256, 4*256, 0, 3 },
+            { { 1, 1, 0, 1 }, 3, 2, 1, 1 },
+            { { 1, 0, 0, 1 }, 3, 1, 1, 2 },
+            // dead streamed tail
+            { { 1, 0, 0, 0 }, 3, 0, 1, 3 },
+            // trim resident head
+            { { 0, 1, 1, 1 }, 4, 2, 1, 1 },
+            // no live resident pages
+            { { 0, 0, 1, 1 }, 4, 2, 0, 2 },
+            // resident fast path
+            { { 1, 1, 0, 0 }, 4, 0, 2, 2 },
+            // interior dead resident page
+            { { 1, 0, 1, 1 }, 5, 1, 3, 0 },
+            // resident fast path starting above page 0
+            { { 0, 1, 1, 1 }, 6, 0, 3, 1 },
         };
 
         for (const auto & tc : cases) {
             for (const int64_t n_batch : { int64_t(1), int64_t(4) }) {
                 attention_inputs inputs = make_inputs(n_kv, n_batch, n_kv - 1);
                 for (int64_t batch = 0; batch < n_batch; ++batch) {
-                    for (int64_t token = tc.mask_begin; token < tc.mask_end; ++token) {
-                        inputs.mask[batch*n_kv + token] = ggml_fp32_to_fp16(-INFINITY);
+                    for (int64_t token = 0; token < n_kv; ++token) {
+                        if (!tc.live_pages[token/256]) {
+                            inputs.mask[batch*n_kv + token] = ggml_fp32_to_fp16(-INFINITY);
+                        }
                     }
                 }
                 const std::vector<float> expected = run_attention(
@@ -936,7 +949,7 @@ int main() {
                 params.device               = 0;
                 params.stage_bytes          = page_bytes;
                 params.stage_slots          = 2;
-                params.pool_bytes           = 3*page_bytes;
+                params.pool_bytes           = tc.pool_pages*page_bytes;
                 params.resident_layer_count = 1;
                 params.page_tokens          = 256;
 
@@ -948,7 +961,9 @@ int main() {
                     backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(baseline), n_kv, n_batch);
                 const auto baseline_stats = ggml_backend_cuda_kv_stream_get_stats(baseline);
                 ggml_backend_cuda_kv_stream_runtime_free(baseline);
-                t.assert_equal(uint64_t(3), baseline_stats.streamed_pages);
+                const uint64_t resident_pages = tc.pool_pages - params.stage_slots;
+                t.assert_equal(uint64_t(4) - resident_pages, baseline_stats.streamed_pages);
+                t.assert_equal(resident_pages, baseline_stats.resident_pages_attended);
                 t.assert_equal(uint64_t(0), baseline_stats.skipped_pages);
 
                 auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
@@ -964,6 +979,7 @@ int main() {
 
                 t.assert_equal(tc.expected_streamed, stats.streamed_pages);
                 t.assert_equal(tc.expected_skipped, stats.skipped_pages);
+                t.assert_equal(tc.expected_resident_attended, stats.resident_pages_attended);
                 if (!t.assert_equal(expected.size(), actual.size())) {
                     return;
                 }

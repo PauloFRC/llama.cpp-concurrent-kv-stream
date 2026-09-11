@@ -1841,7 +1841,7 @@ void ggml_cuda_flash_attn_ext_streamed(
     std::vector<size_t> streamed_chunks;
     streamed_chunks.reserve(nchunks);
 
-    // live resident pages are attended; pages outside it are skipped
+    // live resident pages form one span; pages outside it are skipped
     uint32_t resident_first = UINT32_MAX;
     uint32_t resident_last = 0;
     for (uint32_t page = 0; page < std::min<uint32_t>(uint32_t(nchunks), resident_layer_pages); ++page) {

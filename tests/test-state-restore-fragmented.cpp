@@ -294,10 +294,10 @@ int main(int argc, char ** argv) {
 
     ggml_backend_load_all();
 
-    common_init_result_ptr llama_init = common_init_from_params(params);
+    common_init_result_ptr llama_init = common_init_from_params(params, true);
 
     llama_model * model = llama_init->model();
-    llama_context * ctx = llama_init->context();
+    llama_context * ctx = llama_init_from_model(model, common_context_params_to_llama(params));
 
     if (model == nullptr || ctx == nullptr) {
         fprintf(stderr, "%s : failed to init\n", __func__);
@@ -382,6 +382,9 @@ int main(int argc, char ** argv) {
 
     int ret = test_contiguous_first(ctx, batch);
 
+    llama_sampler_free(smpl);
+    llama_free(ctx);
+
     if (ret == 0) {
         params.n_ctx = 1024;
         llama_context * ctx_pages = llama_init_from_model(model, common_context_params_to_llama(params));
@@ -403,7 +406,6 @@ int main(int argc, char ** argv) {
         }
     }
 
-    llama_sampler_free(smpl);
     llama_batch_free(batch);
 
     return ret;

@@ -1015,6 +1015,10 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
         n_tokens = n_tokens / n_seqs;
     }
 
+    if (!cont && is_paged()) {
+        return find_slot_paged(ubatch);
+    }
+
     slot_info res = {
         /*.s0   =*/ LLAMA_MAX_SEQ,
         /*.s1   =*/ 0,
@@ -1075,34 +1079,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
                 //const llama_pos    pos    = ubatch.pos[i];
                 //const llama_seq_id seq_id = ubatch.seq_id[i][0];
 
-                // can we use this cell? either:
-                //  - the cell is empty
-                //  - the cell is occupied only by one sequence:
-                //    - (disabled) mask causally, if the sequence is the same as the one we are inserting
-                //    - mask SWA, using current max pos for that sequence in the cache
-                //                always insert in the cell with minimum pos
-                bool can_use = cells.is_empty(idx);
-
-                if (!can_use && cells.seq_count(idx) == 1) {
-                    const llama_pos pos_cell = cells.pos_get(idx);
-
-                    // (disabled) causal mask
-                    // note: it's better to purge any "future" tokens beforehand
-                    //if (cells.seq_has(idx, seq_id)) {
-                    //    can_use = pos_cell >= pos;
-                    //}
-
-                    if (!can_use) {
-                        const llama_seq_id seq_id_cell = cells.seq_get(idx);
-
-                        // SWA mask
-                        if (llama_hparams::is_masked_swa(n_swa, swa_type, pos_cell, cells.seq_pos_max(seq_id_cell) + 1)) {
-                            can_use = true;
-                        }
-                    }
-                }
-
-                if (can_use) {
+                if (can_use_cell(cells, idx)) {
                     res.idxs[s].push_back(idx);
                 } else {
                     if (cont) {
@@ -1132,6 +1109,145 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
     }
 
     assert(res.s1 >= res.s0);
+
+    return res;
+}
+
+bool llama_kv_cache::can_use_cell(const llama_kv_cells & cells, uint32_t idx) const {
+    bool can_use = cells.is_empty(idx);
+
+    if (!can_use && cells.seq_count(idx) == 1) {
+        const llama_pos pos_cell = cells.pos_get(idx);
+
+        // (disabled) causal mask
+        // note: it's better to purge any "future" tokens beforehand
+        //if (cells.seq_has(idx, seq_id)) {
+        //    can_use = pos_cell >= pos;
+        //}
+
+        if (!can_use) {
+            const llama_seq_id seq_id_cell = cells.seq_get(idx);
+
+            // SWA mask
+            if (llama_hparams::is_masked_swa(n_swa, swa_type, pos_cell, cells.seq_pos_max(seq_id_cell) + 1)) {
+                can_use = true;
+            }
+        }
+    }
+
+    return can_use;
+}
+
+bool llama_kv_cache::is_paged() const {
+    return n_stream == 1 && v_cells[0].size() > page_tokens;
+}
+
+llama_kv_cache::slot_info llama_kv_cache::find_slot_paged(const llama_ubatch & ubatch) const {
+    const auto & cells = v_cells[0];
+
+    const uint32_t n_tokens = ubatch.n_tokens;
+    const uint32_t n_pages  = (cells.size() + page_tokens - 1)/page_tokens;
+
+    if (n_tokens > cells.size()) {
+        LLAMA_LOG_ERROR("%s: n_tokens = %d > size = %u\n", __func__, n_tokens, cells.size());
+        return { };
+    }
+
+    slot_info res = {
+        /*.s0   =*/ 0,
+        /*.s1   =*/ 0,
+        /*.strm =*/ { 0 },
+        /*.idxs =*/ { { } },
+    };
+
+    res.idxs[0].reserve(n_tokens);
+
+    std::vector<bool> claimed(cells.size(), false);
+
+    // -2: uninitialized, -1: sequence has no cells
+    int64_t seq_last[LLAMA_MAX_SEQ];
+    std::fill(std::begin(seq_last), std::end(seq_last), -2);
+
+    uint32_t page_cur = 0;
+
+    uint32_t head_cur = v_heads[0];
+    if (head_cur > cells.get_used() + 2*n_tokens) {
+        head_cur = 0;
+    }
+    uint32_t n_tested = 0;
+
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        const llama_seq_id seq_id = ubatch.seq_id[i][0];
+
+        auto & last = seq_last[seq_id];
+
+        if (last == -2) {
+            last = -1;
+            if (cells.seq_pos_max(seq_id) >= 0) {
+                for (uint32_t j = cells.used_max_p1(); j-- > 0;) {
+                    if (cells.seq_has(j, seq_id)) {
+                        last = j;
+                        break;
+                    }
+                }
+            }
+        }
+
+        int64_t idx = -1;
+
+        if (last >= 0) {
+            const uint32_t page_end = std::min<uint32_t>(cells.size(), (uint32_t(last)/page_tokens + 1)*page_tokens);
+
+            for (uint32_t j = last + 1; j < page_end; ++j) {
+                if (cells.is_empty(j) && !claimed[j]) {
+                    idx = j;
+                    break;
+                }
+            }
+        }
+
+        if (idx < 0) {
+            for (; page_cur < n_pages; ++page_cur) {
+                const uint32_t p0 = page_cur*page_tokens;
+                const uint32_t p1 = std::min<uint32_t>(cells.size(), p0 + page_tokens);
+
+                bool empty = true;
+                for (uint32_t j = p0; j < p1 && empty; ++j) {
+                    empty = cells.is_empty(j) && !claimed[j];
+                }
+
+                if (empty) {
+                    idx = p0;
+                    break;
+                }
+            }
+        }
+
+        if (idx < 0) {
+            while (n_tested < cells.size()) {
+                if (head_cur >= cells.size()) {
+                    head_cur = 0;
+                }
+
+                const uint32_t j = head_cur++;
+                n_tested++;
+
+                if (!claimed[j] && can_use_cell(cells, j)) {
+                    idx = j;
+                    break;
+                }
+            }
+
+            if (idx < 0) {
+                return { };
+            }
+        }
+
+        claimed[idx] = true;
+        last = idx;
+
+        res.idxs[0].push_back(idx);
+    }
 
     return res;
 }
@@ -1296,7 +1412,7 @@ bool llama_kv_cache::kv_stream_adapt(uint32_t active_tokens, uint32_t query_toke
             100.0*copy_busy_ratio, peak_occupancy);
     }
 
-    const uint32_t active_pages = (active_tokens + 255)/256;
+    const uint32_t active_pages = (active_tokens + page_tokens - 1)/page_tokens;
     // Prompt chunks use the uniform layout because it grows without
     // repartitioning. Decode-like microbatches concentrate the same page
     // budget into fewer split layers, bounded by the ring working set so copy
@@ -1455,14 +1571,14 @@ ggml_backend_buffer_type_t llama_kv_cache::kv_stream_init_runtime(
     if (!page_bytes_fn(
             type_k, type_v,
             hparams.n_embd_head_k(il), hparams.n_embd_head_v(il), hparams.n_head_kv(il),
-            256, &page_bytes)) {
+            page_tokens, &page_bytes)) {
         throw std::runtime_error("invalid block KV streaming page geometry");
     }
     size_t conversion_bytes = 0;
     if (!workspace_bytes_fn(
             type_k, type_v,
             hparams.n_embd_head_k(il), hparams.n_embd_head_v(il), hparams.n_head_kv(il),
-            256, &conversion_bytes)) {
+            page_tokens, &conversion_bytes)) {
         throw std::runtime_error("invalid block KV streaming conversion workspace geometry");
     }
     kv_stream_runtime.runtime = runtime_new_fn(
@@ -2703,8 +2819,10 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
                 }
             }
         } else {
-            // a contiguous block keeps the sequence in its own pages
-            sinfo = find_slot(ubatch, true);
+            // try contiguous block first when not paged
+            if (!is_paged()) {
+                sinfo = find_slot(ubatch, true);
+            }
             if (sinfo.empty()) {
                 sinfo = find_slot(ubatch, false);
             }

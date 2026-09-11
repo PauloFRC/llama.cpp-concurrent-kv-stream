@@ -3,6 +3,7 @@
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import json
+import os
 from pathlib import Path
 import re
 import signal
@@ -26,7 +27,7 @@ def request(port: int, path: str, payload: dict | None, timeout: int = 600) -> d
 
 class Server:
     def __init__(self, server: Path, model: Path, port: int, cache_mib: int, log: Path,
-                 n_parallel: int = 1, ctx_size: int = 8448, extra: list[str] = ()):
+                 n_parallel: int = 1, ctx_size: int = 8448, extra: list[str] = (), env: dict = None):
         command = [
             str(server),
             "-m", str(model), "--host", "127.0.0.1", "--port", str(port),
@@ -39,7 +40,7 @@ class Server:
         self.log_path = log
         self.log_file = log.open("wb")
         self.process = subprocess.Popen(
-            command, stdout=self.log_file, stderr=subprocess.STDOUT)
+            command, stdout=self.log_file, stderr=subprocess.STDOUT, env={**os.environ, **(env or {})})
         deadline = time.monotonic() + 180
         while time.monotonic() < deadline:
             if self.process.poll() is not None:
@@ -126,11 +127,17 @@ def run_prompt_cache(binary: Path, model: Path, port: int, output: Path):
 
 
 RESTORE_RUNS = re.compile(rb"state_read_data: restoring (\d+) cells in (\d+) runs")
+CELL_PAGE = re.compile(rb"^([.0-9M]{256}) \*$", re.MULTILINE)
+
+
+def mixed_pages(log: bytes) -> list[bytes]:
+    return [page for page in CELL_PAGE.findall(log) if len(set(page) - {ord(".")}) > 1]
 
 
 def run_parked_slots(binary: Path, model: Path, port: int, output: Path):
     server = Server(binary, model, port, 2048, output / "parked-slots.log",
-                    n_parallel=2, ctx_size=12288, extra=["--kv-unified", "--cache-idle-slots", "-lv", "5"])
+                    n_parallel=2, ctx_size=12288, extra=["--kv-unified", "--cache-idle-slots", "-lv", "5"],
+                    env={"LLAMA_KV_CACHE_DEBUG": "3"})
     try:
         parent = patterned(4096, (23066, 1200, 2200, 3200))
         child_a = patterned(2048, (23066, 4200, 5200, 6200))
@@ -162,15 +169,17 @@ def run_parked_slots(binary: Path, model: Path, port: int, output: Path):
             raise RuntimeError(f"parked-slot restore reused only {cache_n} tokens: {json.dumps(details)}")
 
         server.log_file.flush()
-        restores = RESTORE_RUNS.findall(server.log_path.read_bytes())
+        log = server.log_path.read_bytes()
+        restores = RESTORE_RUNS.findall(log)
         if not restores:
             raise RuntimeError("no state_read_data restore found in the server log")
         if len(restores) < 2:
             raise RuntimeError(f"expected two restores, found {len(restores)}")
         cells, runs = (int(x) for x in restores[-2])
-        if runs != 1:
+        mixed = mixed_pages(log)
+        if mixed:
             raise RuntimeError(
-                f"restore landed in {runs} runs, the free block above the live child was not preferred: {json.dumps(details)}")
+                f"{len(mixed)} page(s) held cells of more than one sequence, first: {mixed[0].decode()}")
         cells_a, runs_a = (int(x) for x in restores[-1])
         if restored_a["content"] != child_a_result["content"]:
             raise RuntimeError("child restore output changed: "

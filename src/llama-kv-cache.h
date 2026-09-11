@@ -211,6 +211,10 @@ public:
     // return empty slot_info on failure
     slot_info find_slot(const llama_ubatch & ubatch, bool cont) const;
 
+    bool is_paged() const;
+    slot_info find_slot_paged(const llama_ubatch & ubatch) const;
+    bool can_use_cell(const llama_kv_cells & cells, uint32_t idx) const;
+
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
     void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
 
@@ -290,6 +294,9 @@ private:
 
     // this is the SWA type of the cache - not to be confused with the model SWA type
     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
+
+    // cells per streamed page
+    static constexpr uint32_t page_tokens = 256;
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     struct kv_stream_runtime_owner {

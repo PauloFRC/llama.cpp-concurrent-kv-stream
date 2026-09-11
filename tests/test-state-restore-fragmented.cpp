@@ -12,11 +12,17 @@
 #include "llama.h"
 
 #include <vector>
+#include <string>
+#include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 // run count of the last state_read_data restore
 static int g_restore_runs = -1;
+
+// cell layout from LLAMA_KV_CACHE_DEBUG=3 dump
+static std::string g_cell_map;
 
 static void log_callback(ggml_log_level level, const char * text, void * /*user_data*/) {
     unsigned cells = 0;
@@ -26,9 +32,197 @@ static void log_callback(ggml_log_level level, const char * text, void * /*user_
         g_restore_runs = (int) runs;
     }
 
+    // parse cell layout dump
+    if (text[0] == '\n' && text[1] != '\0' && strchr(".0123456789M", text[1]) && text[2] != ' ') {
+        g_cell_map.clear();
+        for (const char * c = text + 1; *c; ++c) {
+            if (*c == '.' || *c == 'M' || (*c >= '0' && *c <= '9')) {
+                g_cell_map.push_back(*c);
+            }
+        }
+    }
+
     if (level != GGML_LOG_LEVEL_DEBUG) {
         fputs(text, stderr);
     }
+}
+
+static int page_seq_count(size_t page, size_t page_size) {
+    std::string seen;
+    for (size_t i = page*page_size; i < std::min(g_cell_map.size(), (page + 1)*page_size); ++i) {
+        const char c = g_cell_map[i];
+        if (c != '.' && seen.find(c) == std::string::npos) {
+            seen.push_back(c);
+        }
+    }
+    return (int) seen.size();
+}
+
+static int check_pages_pure(const char * who, size_t n_pages, size_t page_size) {
+    for (size_t p = 0; p < n_pages; ++p) {
+        const int n = page_seq_count(p, page_size);
+        if (n > 1) {
+            fprintf(stderr, "%s : FAILED - page %zu holds %d sequences: %s\n", who, p, n,
+                    g_cell_map.substr(p*page_size, page_size).c_str());
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int test_prefill_takes_empty_pages(llama_context * ctx, llama_batch & batch) {
+    llama_memory_t mem = llama_get_memory(ctx);
+    llama_memory_clear(mem, true);
+
+    for (int s = 0; s < 2; s++) {
+        common_batch_clear(batch);
+        for (int i = 0; i < 32; i++) {
+            common_batch_add(batch, 1, i, {s}, false);
+        }
+        if (llama_decode(ctx, batch)) {
+            fprintf(stderr, "%s : failed to prefill seq %d\n", __func__, s);
+            return 1;
+        }
+    }
+
+    llama_memory_seq_rm(mem, 0, -1, -1);
+
+    common_batch_clear(batch);
+    for (int i = 0; i < 300; i++) {
+        common_batch_add(batch, 1, i, {2}, false);
+    }
+    if (llama_decode(ctx, batch)) {
+        fprintf(stderr, "%s : failed to prefill seq 2\n", __func__);
+        return 1;
+    }
+
+    // trigger dump to inspect prefill layout
+    common_batch_clear(batch);
+    common_batch_add(batch, 1, 32, {1}, false);
+    if (llama_decode(ctx, batch)) {
+        fprintf(stderr, "%s : failed to decode seq 1\n", __func__);
+        return 1;
+    }
+
+    if (check_pages_pure(__func__, 4, 256)) {
+        return 1;
+    }
+
+    fprintf(stderr, "%s : SUCCESS - prefill took empty pages only\n", __func__);
+    return 0;
+}
+
+static int test_full_cache_uses_holes(llama_context * ctx, llama_batch & batch) {
+    llama_memory_t mem = llama_get_memory(ctx);
+    llama_memory_clear(mem, true);
+
+    const int n_prefill[3] = { 256, 256, 512 };
+    for (int s = 0; s < 3; s++) {
+        common_batch_clear(batch);
+        for (int i = 0; i < n_prefill[s]; i++) {
+            common_batch_add(batch, 1, i, {s}, false);
+        }
+        if (llama_decode(ctx, batch)) {
+            fprintf(stderr, "%s : failed to prefill seq %d\n", __func__, s);
+            return 1;
+        }
+    }
+
+    llama_memory_seq_rm(mem, 2, 0, 100);
+
+    for (int i = 0; i < 2; i++) {
+        common_batch_clear(batch);
+        common_batch_add(batch, 1, 256 + i, {0}, false);
+        if (llama_decode(ctx, batch)) {
+            fprintf(stderr, "%s : FAILED - decode of seq 0 failed with free cells in the cache\n", __func__);
+            return 1;
+        }
+    }
+
+    if (page_seq_count(2, 256) != 2) {
+        fprintf(stderr, "%s : FAILED - seq 0 did not land in page 2: %s\n", __func__, g_cell_map.substr(512, 256).c_str());
+        return 1;
+    }
+
+    fprintf(stderr, "%s : SUCCESS - seq 0 fell back to a hole\n", __func__);
+    return 0;
+}
+
+static int test_restore_takes_empty_pages(llama_context * ctx, llama_batch & batch) {
+    llama_memory_t mem = llama_get_memory(ctx);
+    llama_memory_clear(mem, true);
+
+    const int n_prefill[3] = { 40, 300, 100 };
+    for (int s = 0; s < 3; s++) {
+        common_batch_clear(batch);
+        for (int i = 0; i < n_prefill[s]; i++) {
+            common_batch_add(batch, 1, i, {s}, false);
+        }
+        if (llama_decode(ctx, batch)) {
+            fprintf(stderr, "%s : failed to prefill seq %d\n", __func__, s);
+            return 1;
+        }
+    }
+
+    std::vector<uint8_t> seq_state(llama_state_seq_get_size(ctx, 1));
+    if (llama_state_seq_get_data(ctx, seq_state.data(), seq_state.size(), 1) != seq_state.size()) {
+        fprintf(stderr, "%s : failed to save seq 1 state\n", __func__);
+        return 1;
+    }
+
+    llama_memory_seq_rm(mem, 1, -1, -1);
+
+    common_batch_clear(batch);
+    common_batch_add(batch, 1, 40, {0}, false);
+    if (llama_decode(ctx, batch)) {
+        fprintf(stderr, "%s : failed to decode seq 0\n", __func__);
+        return 1;
+    }
+
+    if (llama_state_seq_set_data(ctx, seq_state.data(), seq_state.size(), 1) != seq_state.size()) {
+        fprintf(stderr, "%s : failed to restore seq 1 state\n", __func__);
+        return 1;
+    }
+
+    common_batch_clear(batch);
+    common_batch_add(batch, 1, 41, {0}, false);
+    if (llama_decode(ctx, batch)) {
+        fprintf(stderr, "%s : failed to decode seq 0\n", __func__);
+        return 1;
+    }
+
+    if (check_pages_pure(__func__, 4, 256)) {
+        return 1;
+    }
+
+    fprintf(stderr, "%s : SUCCESS - restore took empty pages only\n", __func__);
+    return 0;
+}
+
+static int test_concurrent_decode_pages(llama_context * ctx, llama_batch & batch) {
+    llama_memory_clear(llama_get_memory(ctx), true);
+
+    for (int i = 0; i < 32; i++) {
+        common_batch_clear(batch);
+        common_batch_add(batch, 1, i, {0}, false);
+        common_batch_add(batch, 1, i, {1}, false);
+        if (llama_decode(ctx, batch)) {
+            fprintf(stderr, "%s : failed to decode step %d\n", __func__, i);
+            return 1;
+        }
+    }
+
+    if (g_cell_map.size() != 1024) {
+        fprintf(stderr, "%s : FAILED - no cell map captured (%zu cells)\n", __func__, g_cell_map.size());
+        return 1;
+    }
+
+    if (check_pages_pure(__func__, 4, 256)) {
+        return 1;
+    }
+
+    fprintf(stderr, "%s : SUCCESS - each sequence stayed in its own page\n", __func__);
+    return 0;
 }
 
 static int test_contiguous_first(llama_context * ctx, llama_batch & batch) {
@@ -90,6 +284,8 @@ int main(int argc, char ** argv) {
 
     llama_log_set(log_callback, nullptr);
 
+    setenv("LLAMA_KV_CACHE_DEBUG", "3", 1);
+
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
         return 1;
     }
@@ -115,7 +311,7 @@ int main(int argc, char ** argv) {
 
     // interleave the 3 sequences:
     // 01201230123...
-    llama_batch batch = llama_batch_init(params.n_parallel*tokens.size(), 0, 1);
+    llama_batch batch = llama_batch_init(512, 0, 1);
     for (size_t i = 0; i < tokens.size(); i++) {
         for (int s = 0; s < params.n_parallel; ++s) {
             common_batch_add(batch, tokens[i], i, {s}, false);
@@ -184,7 +380,28 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "%s : successfully decoded with restored state, generated: '%s'\n", __func__, next_token_str.c_str());
     fprintf(stderr, "%s : SUCCESS - state restore works with fragmented KV cache\n", __func__);
 
-    const int ret = test_contiguous_first(ctx, batch);
+    int ret = test_contiguous_first(ctx, batch);
+
+    if (ret == 0) {
+        params.n_ctx = 1024;
+        llama_context * ctx_pages = llama_init_from_model(model, common_context_params_to_llama(params));
+        if (ctx_pages == nullptr) {
+            fprintf(stderr, "%s : failed to init the 4-page context\n", __func__);
+            ret = 1;
+        } else {
+            ret = test_concurrent_decode_pages(ctx_pages, batch);
+            if (ret == 0) {
+                ret = test_prefill_takes_empty_pages(ctx_pages, batch);
+            }
+            if (ret == 0) {
+                ret = test_full_cache_uses_holes(ctx_pages, batch);
+            }
+            if (ret == 0) {
+                ret = test_restore_takes_empty_pages(ctx_pages, batch);
+            }
+            llama_free(ctx_pages);
+        }
+    }
 
     llama_sampler_free(smpl);
     llama_batch_free(batch);

@@ -13,6 +13,16 @@
 #include <unordered_map>
 #include <vector>
 
+// Best FlashAttention kernel for a specific GPU:
+enum best_fattn_kernel {
+    BEST_FATTN_KERNEL_NONE    =   0,
+    BEST_FATTN_KERNEL_TILE    = 200,
+    BEST_FATTN_KERNEL_VEC     = 100,
+    BEST_FATTN_KERNEL_MMA_F16 = 400,
+};
+
+static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst);
+
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 __launch_bounds__(256, 1)
 static __global__ void flash_attn_mask_to_sparse_indices(
@@ -1880,10 +1890,10 @@ void ggml_cuda_flash_attn_ext_streamed(
             streamed_chunks.push_back(chunk);
         }
     }
-
     const bool use_mma_prefill = !convert_to_f16 &&
         Q->ne[1] > 1 && Q->ne[0] == 256 && V->ne[0] == 256 &&
-        mask != nullptr && Q->ne[2] % K->ne[2] == 0 && Q->ne[2]/K->ne[2] <= 8;
+        mask != nullptr && Q->ne[2] % K->ne[2] == 0 && Q->ne[2]/K->ne[2] <= 8 &&
+        ggml_cuda_get_best_fattn_kernel(ctx.device, dst) == BEST_FATTN_KERNEL_MMA_F16;
     const int partial_count = use_mma_prefill ? 1 : kv_stream_parts_per_chunk();
     GGML_ASSERT(partial_count > 0 && partial_count <= KV_STREAM_MAX_PARTS_PER_CHUNK);
     GGML_ASSERT(Q->ne[1] > 0 && nrows % Q->ne[1] == 0);
@@ -2604,14 +2614,6 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
 
     GGML_ABORT("fatal error");
 }
-
-// Best FlashAttention kernel for a specific GPU:
-enum best_fattn_kernel {
-    BEST_FATTN_KERNEL_NONE    =   0,
-    BEST_FATTN_KERNEL_TILE    = 200,
-    BEST_FATTN_KERNEL_VEC     = 100,
-    BEST_FATTN_KERNEL_MMA_F16 = 400,
-};
 
 static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
     switch (type) {

@@ -1012,6 +1012,7 @@ void launch_fattn(
 
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
         ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K, need_f16_V);
+    GGML_ASSERT(!dst->buffer || f16_extra.end <= (uintptr_t) dst->data + ggml_backend_buffer_get_alloc_size(dst->buffer, dst));
 
     ggml_cuda_pool_alloc<int>    KV_max(pool);
     ggml_cuda_pool_alloc<float>  dst_tmp(pool);

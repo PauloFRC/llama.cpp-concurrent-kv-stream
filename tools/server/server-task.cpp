@@ -1867,6 +1867,24 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     return true;
 }
 
+size_t server_prompt_cache::limit_tokens_cur() const {
+    const float size_per_token = std::max<float>(1.0f, float(size()) / (std::max<size_t>(1, n_tokens())));
+
+    return limit_size > 0 ? std::max<size_t>(limit_tokens, limit_size/size_per_token) : limit_tokens;
+}
+
+bool server_prompt_cache::can_fit(size_t n_bytes, size_t n_tokens) const {
+    if (limit_size > 0 && size() + n_bytes > limit_size) {
+        return false;
+    }
+
+    if (limit_tokens > 0 && this->n_tokens() + n_tokens > limit_tokens_cur()) {
+        return false;
+    }
+
+    return true;
+}
+
 void server_prompt_cache::update() {
     if (limit_size > 0) {
         while (!states.empty() && size() > limit_size) {
@@ -1876,11 +1894,7 @@ void server_prompt_cache::update() {
         }
     }
 
-    // average size per token
-    const float size_per_token = std::max<float>(1.0f, float(size()) / (std::max<size_t>(1, n_tokens())));
-
-    // dynamically increase the token limit if it can fit in the memory limit
-    const size_t limit_tokens_cur = limit_size > 0 ? std::max<size_t>(limit_tokens, limit_size/size_per_token) : limit_tokens;
+    const size_t limit_tokens_cur = this->limit_tokens_cur();
 
     if (limit_tokens > 0) {
         while (!states.empty() && n_tokens() > limit_tokens_cur) {

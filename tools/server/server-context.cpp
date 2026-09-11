@@ -296,6 +296,20 @@ struct server_slot {
 
     server_prompt prompt;
 
+    size_t prompt_state_size() const {
+        size_t res = llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+
+        if (ctx_dft) {
+            res += llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        }
+
+        for (const auto & ckpt : prompt.checkpoints) {
+            res += ckpt.size();
+        }
+
+        return res;
+    }
+
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
             return false;
@@ -1646,6 +1660,11 @@ private:
 
                 ret->prompt_save(*prompt_cache);
 
+                // free other idle slots without eviction so restore lands contiguously
+                if (params_base.cache_idle_slots && params_base.kv_unified) {
+                    park_idle_slots(ret, true);
+                }
+
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
                 }
@@ -1657,6 +1676,31 @@ private:
         }
 
         return ret;
+    }
+
+    void park_idle_slots(const server_slot * skip, bool no_evict) {
+        for (auto & slot : slots) {
+            if (&slot == skip || slot.is_processing()) {
+                continue;
+            }
+
+            if (no_evict && !prompt_cache->can_fit(slot.prompt_state_size(), slot.prompt.n_tokens())) {
+                SLT_TRC(slot, "%s", "idle slot does not fit in prompt cache, keeping it\n");
+                continue;
+            }
+
+            SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
+
+            if (slot.prompt_save(*prompt_cache)) {
+                SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
+                prompt_cache->update();
+            }
+
+            if (params_base.kv_unified) {
+                // [TAG_IDLE_SLOT_CLEAR]
+                slot.prompt_clear();
+            }
+        }
     }
 
     // return true if at least one slot has been cleared
@@ -2418,21 +2462,7 @@ private:
                     }
 
                     if (params_base.cache_idle_slots) {
-                        for (auto & slot : slots) {
-                            if (!slot.is_processing()) {
-                                SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
-
-                                if (slot.prompt_save(*prompt_cache)) {
-                                    SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
-                                    prompt_cache->update();
-                                }
-
-                                if (params_base.kv_unified) {
-                                    // [TAG_IDLE_SLOT_CLEAR]
-                                    slot.prompt_clear();
-                                }
-                            }
-                        }
+                        park_idle_slots(nullptr, false);
                     }
                 } break;
             case SERVER_TASK_TYPE_CANCEL:

@@ -888,6 +888,7 @@ namespace {
 constexpr int KV_STREAM_HEAD_DIM = 256;
 constexpr int KV_STREAM_MAX_PARTS_PER_CHUNK = 16;
 constexpr int KV_STREAM_QUERY_WORKSPACE_TOKENS = 256;
+constexpr int64_t KV_STREAM_MAX_DECODE_QUERY_TOKENS = 32;
 
 static int kv_stream_parts_per_chunk() {
     static const int parts = []() {
@@ -1659,8 +1660,9 @@ bool ggml_cuda_kv_stream_graph_add_attention(
     if (ring->graph_resident_cache != nullptr && ring->graph_resident_cache != resident_cache) {
         return false;
     }
-    ring->graph_decode = ring->graph_decode && dst->src[0]->ne[1] == 1;
-    if (dst->src[0]->ne[1] != 1) {
+    const bool decode_shaped = dst->src[0]->ne[1] <= KV_STREAM_MAX_DECODE_QUERY_TOKENS;
+    ring->graph_decode = ring->graph_decode && decode_shaped;
+    if (!decode_shaped) {
         // Graphs are rebuilt across warmup, prompt chunks, and slot reuse.
         // Relearn pointer-to-layer identity once per prefill graph while the
         // resident page contents are refreshed by the local multi-token path.
@@ -1817,7 +1819,7 @@ void ggml_cuda_flash_attn_ext_streamed(
         resident_cache->page_tokens : kv_stream_block_tokens(dst, stage_bytes);
     const int nchunks = (K->ne[1] + block_tokens - 1)/block_tokens;
     const int nrows = ggml_nrows(dst);
-    const uint32_t maximum_streamed_span_pages = Q->ne[1] == 1 ?
+    const uint32_t maximum_streamed_span_pages = Q->ne[1] <= KV_STREAM_MAX_DECODE_QUERY_TOKENS ?
         transfer_ring->graph_decode_span_pages : UINT32_MAX;
 
     struct chunk_descriptor {

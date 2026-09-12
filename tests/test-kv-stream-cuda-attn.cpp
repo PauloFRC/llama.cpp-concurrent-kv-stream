@@ -2235,6 +2235,127 @@ int main() {
         t.assert_true("mid-span mutable output remains equivalent", max_abs <= 3e-4f);
     });
 
+    t.test("two-slot decode pipelines streamed pages across layers", [](testing & t) {
+        constexpr int64_t n_kv = 8*256;
+        constexpr int64_t n_batch = 2;
+        constexpr int64_t update_rows = 2;
+        constexpr size_t n_layers = 2;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        // slot 0 attends 0..300 (row 300); slot 1 attends 1024..1300 (row 1300)
+        const int64_t rows[update_rows] = { 300, 1300 };
+        std::vector<attention_inputs> inputs{
+            make_inputs(n_kv, n_batch, n_kv - 1, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 0.0f),
+            make_inputs(n_kv, n_batch, n_kv - 1, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 0.5f),
+        };
+        for (auto & input : inputs) {
+            for (int64_t token = 0; token < n_kv; ++token) {
+                if (token > 300) {
+                    input.mask[token] = ggml_fp32_to_fp16(-INFINITY);
+                }
+                if (token < 1024 || token > 1300) {
+                    input.mask[n_kv + token] = ggml_fp32_to_fp16(-INFINITY);
+                }
+            }
+        }
+        const std::vector<float> expected = run_attention_layers(
+            backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()),
+            n_kv, n_batch, 1, update_rows, GGML_TYPE_I64, nullptr, 0, rows);
+
+        const size_t k_page_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t v_page_bytes = ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
+        ggml_backend_cuda_kv_stream_params params{};
+        params.device               = 0;
+        params.stage_bytes          = page_bytes;
+        params.stage_slots          = 8;
+        params.pool_bytes           = (n_layers + 8)*page_bytes;
+        params.resident_layer_count = n_layers;
+        params.page_tokens          = 256;
+        params.decode_span_pages    = 32;
+        auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+        if (!t.assert_true("stream runtime initializes", runtime != nullptr)) {
+            return;
+        }
+
+        const std::vector<float> actual = run_attention_layers(
+            backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime),
+            n_kv, n_batch, 1, update_rows, GGML_TYPE_I64, runtime, 0, rows);
+        const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
+        ggml_backend_cuda_kv_stream_runtime_free(runtime);
+
+        t.assert_equal(uint64_t(14), stats.streamed_pages);
+        t.assert_true("two-slot decode is graph planned", stats.deadline_samples > 0);
+        t.assert_equal(uint64_t(4), stats.cross_layer_prefetches);
+        if (!t.assert_equal(expected.size(), actual.size())) {
+            return;
+        }
+        bool all_finite = true;
+        float max_abs = 0.0f;
+        for (size_t i = 0; i < expected.size(); ++i) {
+            all_finite = all_finite && std::isfinite(actual[i]);
+            max_abs = std::max(max_abs, std::abs(expected[i] - actual[i]));
+        }
+        std::fprintf(stderr, "two-slot pipelined max_abs=%g samples=%llu cross=%llu\n",
+            max_abs, (unsigned long long) stats.deadline_samples,
+            (unsigned long long) stats.cross_layer_prefetches);
+        t.assert_true("two-slot pipelined output remains finite", all_finite);
+        t.assert_true("two-slot pipelined output remains equivalent", max_abs <= 3e-4f);
+    });
+
+    t.test("two-query decode keeps the bounded streamed span", [](testing & t) {
+        constexpr int64_t n_kv = 41*256;
+        constexpr int64_t n_batch = 2;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        const attention_inputs inputs = make_inputs(n_kv, n_batch, n_kv - 2);
+        const std::vector<float> expected = run_attention(
+            backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()),
+            n_kv, n_batch);
+
+        const size_t k_page_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t v_page_bytes = ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
+        ggml_backend_cuda_kv_stream_params params{};
+        params.device               = 0;
+        params.stage_bytes          = page_bytes;
+        params.stage_slots          = 40;
+        params.pool_bytes           = 41*page_bytes;
+        params.resident_layer_count = 1;
+        params.page_tokens          = 256;
+        params.decode_span_pages    = 32;
+        auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+        if (!t.assert_true("chunk-pipelined runtime initializes", runtime != nullptr)) {
+            return;
+        }
+
+        const std::vector<float> actual = run_attention(
+            backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime),
+            n_kv, n_batch);
+        const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
+        ggml_backend_cuda_kv_stream_runtime_free(runtime);
+
+        t.assert_equal(uint64_t(40), stats.streamed_pages);
+        t.assert_equal(uint64_t(2), stats.streamed_attention_spans);
+        t.assert_equal(uint64_t(2), stats.deadline_samples);
+        if (!t.assert_equal(expected.size(), actual.size())) {
+            return;
+        }
+        float max_abs = 0.0f;
+        for (size_t i = 0; i < expected.size(); ++i) {
+            max_abs = std::max(max_abs, std::abs(expected[i] - actual[i]));
+        }
+        std::fprintf(stderr, "two-query bounded span max_abs=%g spans=%llu\n",
+            max_abs, (unsigned long long) stats.streamed_attention_spans);
+        t.assert_true("two-query bounded span output remains equivalent", max_abs <= 3e-4f);
+    });
+
     ggml_quantize_free();
     return t.summary();
 }

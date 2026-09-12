@@ -1961,7 +1961,7 @@ void ggml_cuda_flash_attn_ext_streamed(
         }
     }
     const bool use_mma_prefill = !convert_to_f16 &&
-        Q->ne[1] > 1 && Q->ne[0] == 256 && V->ne[0] == 256 &&
+        Q->ne[1] > KV_STREAM_MAX_DECODE_QUERY_TOKENS && Q->ne[0] == 256 && V->ne[0] == 256 &&
         mask != nullptr && Q->ne[2] % K->ne[2] == 0 && Q->ne[2]/K->ne[2] <= 8 &&
         ggml_cuda_get_best_fattn_kernel(ctx.device, dst) == BEST_FATTN_KERNEL_MMA_F16;
     const int partial_count = use_mma_prefill ? 1 : kv_stream_parts_per_chunk();

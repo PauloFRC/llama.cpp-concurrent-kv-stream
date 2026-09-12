@@ -1039,6 +1039,8 @@ int main() {
         ggml_backend_cuda_kv_stream_runtime_free(runtime);
 
         t.assert_true("disjoint row test exercises streamed pages", stats.streamed_pages > 0);
+        // decode-shaped batches take the vector partial, not MMA prefill
+        t.assert_equal(uint64_t(0), stats.mma_prefill_attention_spans);
         if (!t.assert_equal(expected.size(), actual.size())) {
             return;
         }

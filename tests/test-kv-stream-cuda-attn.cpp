@@ -273,7 +273,8 @@ std::vector<float> run_attention_layers(
         int64_t update_rows = 1,
         ggml_type index_type = GGML_TYPE_I32,
         ggml_backend_cuda_kv_stream_runtime_t dirty_runtime = nullptr,
-        uint32_t layout_after_first = 0) {
+        uint32_t layout_after_first = 0,
+        const int64_t * custom_rows = nullptr) {
     constexpr size_t N_TENSORS = 256;
     const size_t context_bytes = ggml_tensor_overhead()*N_TENSORS +
         ggml_graph_overhead_custom(N_TENSORS, false);
@@ -348,7 +349,9 @@ std::vector<float> run_attention_layers(
     GGML_ASSERT(kv_buffer && compute_buffer);
 
     std::vector<int64_t> dirty_rows(update_rows);
-    for (int64_t row = 0; row < update_rows; ++row) { dirty_rows[row] = row; }
+    for (int64_t row = 0; row < update_rows; ++row) {
+        dirty_rows[row] = custom_rows != nullptr ? custom_rows[row] : row;
+    }
     for (size_t layer = 0; layer < layers.size(); ++layer) {
         const auto & input = layers[layer];
         auto & current = tensors[layer];
@@ -369,7 +372,7 @@ std::vector<float> run_attention_layers(
             v_update_data.size()*sizeof(float));
         if (index_type == GGML_TYPE_I32) {
             std::vector<int32_t> rows_i32(update_rows);
-            for (int64_t row = 0; row < update_rows; ++row) { rows_i32[row] = int32_t(row); }
+            for (int64_t row = 0; row < update_rows; ++row) { rows_i32[row] = int32_t(dirty_rows[row]); }
             ggml_backend_tensor_set(
                 current.update_index, rows_i32.data(), 0, rows_i32.size()*sizeof(int32_t));
         } else {
@@ -2174,6 +2177,62 @@ int main() {
         std::fprintf(stderr, "scattered multi-slot set_rows max_abs=%g\n", max_abs);
         t.assert_true("scattered multi-slot output remains finite", all_finite);
         t.assert_true("scattered multi-slot writes keep resident mirror coherent", max_abs <= 3e-4f);
+    });
+
+    t.test("mid-span mutable pages do not stall cross-layer prefetch", [](testing & t) {
+        constexpr int64_t n_kv = 8*256;
+        constexpr int64_t n_batch = 1;
+        constexpr int64_t update_rows = 2;
+        constexpr size_t n_layers = 2;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        // pages 1, 5, 7 mutable; pages 2, 3, 4, 6 immutable streamed
+        const int64_t rows[update_rows] = { 300, 1300 };
+        std::vector<attention_inputs> inputs{
+            make_inputs(n_kv, n_batch, n_kv - 1, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 0.0f),
+            make_inputs(n_kv, n_batch, n_kv - 1, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 1.0f),
+        };
+        const std::vector<float> expected = run_attention_layers(
+            backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()),
+            n_kv, n_batch, 1, update_rows, GGML_TYPE_I64, nullptr, 0, rows);
+
+        const size_t k_page_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t v_page_bytes = ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
+        ggml_backend_cuda_kv_stream_params params{};
+        params.device               = 0;
+        params.stage_bytes          = page_bytes;
+        params.stage_slots          = 8;
+        params.pool_bytes           = (n_layers + 8)*page_bytes;
+        params.resident_layer_count = n_layers;
+        params.page_tokens          = 256;
+        params.decode_span_pages    = 32;
+        auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+        if (!t.assert_true("stream runtime initializes", runtime != nullptr)) {
+            return;
+        }
+
+        const std::vector<float> actual = run_attention_layers(
+            backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime),
+            n_kv, n_batch, 1, update_rows, GGML_TYPE_I64, runtime, 0, rows);
+        const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
+        ggml_backend_cuda_kv_stream_runtime_free(runtime);
+
+        t.assert_equal(uint64_t(14), stats.streamed_pages);
+        t.assert_equal(uint64_t(4), stats.cross_layer_prefetches);
+        if (!t.assert_equal(expected.size(), actual.size())) {
+            return;
+        }
+        float max_abs = 0.0f;
+        for (size_t i = 0; i < expected.size(); ++i) {
+            max_abs = std::max(max_abs, std::abs(expected[i] - actual[i]));
+        }
+        std::fprintf(stderr, "mid-span mutable max_abs=%g cross=%llu\n",
+            max_abs, (unsigned long long) stats.cross_layer_prefetches);
+        t.assert_true("mid-span mutable output remains equivalent", max_abs <= 3e-4f);
     });
 
     ggml_quantize_free();

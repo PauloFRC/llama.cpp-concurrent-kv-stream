@@ -1469,56 +1469,72 @@ static void kv_stream_graph_upload_batch(
 
 static uint32_t kv_stream_graph_batch_pages(
         const ggml_cuda_kv_stream_transfer_ring * ring,
-        uint32_t first_slot) {
+        uint32_t first_slot,
+        size_t * first_request) {
     if (!ring->graph_active || first_slot >= ring->active_slots ||
-            ring->next_request >= ring->graph_requests.size() ||
             ring->slot_request[first_slot] != KV_STREAM_NO_REQUEST) {
         return 0;
     }
-    const auto & first = ring->graph_requests[ring->next_request];
-    if (!first.eligible) {
+    uint32_t reserved = 0;
+    size_t index = ring->next_request;
+    for (; index < ring->graph_requests.size(); ++index) {
+        const auto & request = ring->graph_requests[index];
+        if (request.scheduled) {
+            continue;
+        }
+        if (request.eligible) {
+            break;
+        }
+        ++reserved;
+    }
+    if (index == ring->graph_requests.size() ||
+            ring->current_occupancy + reserved >= ring->active_slots) {
         return 0;
     }
-    GGML_ASSERT(!first.scheduled && !first.consumed);
 
     const uint32_t maximum = std::min<uint32_t>({
         ring->graph_copy_batch_pages,
         ring->active_slots - first_slot,
-        uint32_t(ring->graph_requests.size() - ring->next_request),
+        ring->active_slots - ring->current_occupancy - reserved,
+        uint32_t(ring->graph_requests.size() - index),
     });
     uint32_t pages = 1;
     while (pages < maximum) {
         if (ring->slot_request[first_slot + pages] != KV_STREAM_NO_REQUEST ||
                 !kv_stream_graph_request_follows(
-                    ring->graph_requests[ring->next_request + pages - 1],
-                    ring->graph_requests[ring->next_request + pages])) {
+                    ring->graph_requests[index + pages - 1],
+                    ring->graph_requests[index + pages])) {
             break;
         }
         ++pages;
     }
+    *first_request = index;
     return pages;
 }
 
 static uint32_t kv_stream_graph_schedule_batch(
         ggml_cuda_kv_stream_transfer_ring * ring,
         uint32_t first_slot) {
-    const uint32_t batch_pages = kv_stream_graph_batch_pages(ring, first_slot);
+    size_t first_request = KV_STREAM_NO_REQUEST;
+    const uint32_t batch_pages = kv_stream_graph_batch_pages(ring, first_slot, &first_request);
     if (batch_pages == 0) {
         return 0;
     }
-    const size_t first_request = ring->next_request;
     // Probe every immutable copy batch at its actual compute deadline. Mutable
     // tails are produced by this graph and are excluded from prefetch quality
     // feedback so they do not force unnecessary resident-page demotions.
     ring->graph_requests[first_request].deadline_sample =
         !ring->graph_requests[first_request].mutable_tail;
-    ring->next_request += batch_pages;
     if (batch_pages == 1) {
         kv_stream_graph_upload(
             ring, ring->graph_requests[first_request], first_slot);
     } else {
         kv_stream_graph_upload_batch(
             ring, first_request, first_slot, batch_pages);
+    }
+    while (ring->next_request < ring->graph_requests.size() &&
+            ring->graph_requests[ring->next_request].scheduled) {
+        ++ring->next_request;
     }
     return batch_pages;
 }

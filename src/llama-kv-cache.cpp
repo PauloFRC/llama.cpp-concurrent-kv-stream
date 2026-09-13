@@ -1438,26 +1438,29 @@ bool llama_kv_cache::kv_stream_adapt(uint32_t active_tokens, uint32_t query_toke
     owner.previous_skipped_pages = skipped_pages;
     owner.previous_resident_pages_attended = resident_pages_attended;
 
+    const uint32_t active_pages = (active_tokens + page_tokens - 1) / page_tokens;
+
+    uint32_t quantum = 16;
+    if (const char * env = getenv("LLAMA_KV_STREAM_LAYOUT_QUANTUM_PAGES")) {
+        quantum = std::max<uint32_t>(1, std::atoi(env));
+    }
+
+    const uint32_t decode_layout_pages = llama_kv_stream_decode_layout_pages(
+        owner.decode_layout_pages, active_pages, resident_pages,
+        query_tokens, MAX_DECODE_QUERY_TOKENS, quantum);
+
+    const bool entering_decode_layout =
+        decode_layout_pages != 0 && decode_layout_pages != owner.decode_layout_pages;
+
     if (getenv("LLAMA_KV_STREAM_TRACE") != nullptr) {
-        LLAMA_LOG_WARN("%s: active %u, resident %u, ring %u, samples %llu, misses %llu, copy busy %.1f%%, peak %u, skipped %llu, resident attended %llu\n",
-            __func__, active_tokens, resident_pages, ring_slots,
+        LLAMA_LOG_WARN("%s: active %u, resident %u, ring %u, layout %u, samples %llu, misses %llu, copy busy %.1f%%, peak %u, skipped %llu, resident attended %llu\n",
+            __func__, active_tokens, resident_pages, ring_slots, decode_layout_pages,
             (unsigned long long) delta.deadline_samples,
             (unsigned long long) delta.deadline_misses,
             100.0*copy_busy_ratio, peak_occupancy,
             (unsigned long long) delta_skipped_pages,
             (unsigned long long) delta_resident_pages_attended);
     }
-
-    const uint32_t active_pages = (active_tokens + page_tokens - 1)/page_tokens;
-    // Prompt chunks use the uniform layout because it grows without
-    // repartitioning. Decode-like microbatches concentrate the same page
-    // budget into fewer split layers, bounded by the ring working set so copy
-    // and compute can still overlap. A zero target restores prefill.
-    const uint32_t decode_layout_pages =
-        query_tokens <= MAX_DECODE_QUERY_TOKENS && active_pages > resident_pages ?
-            active_pages : 0;
-    const bool entering_decode_layout =
-        decode_layout_pages != 0 && decode_layout_pages != owner.decode_layout_pages;
 
     if (ring_slots != 0 && owner.minimum_ring_slots == 0) {
         owner.minimum_ring_slots = ring_slots;

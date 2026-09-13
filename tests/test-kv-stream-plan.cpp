@@ -60,6 +60,11 @@ size_t count_role(
     });
 }
 
+uint32_t decode_layout_pages(
+        uint32_t previous, uint32_t active, uint32_t query_tokens, uint32_t quantum = 16) {
+    return llama_kv_stream_decode_layout_pages(previous, active, 78, query_tokens, 32, quantum);
+}
+
 } // namespace
 
 int main() {
@@ -888,6 +893,35 @@ int main() {
         params.layers.push_back(layer);
         built = llama_kv_stream_regions_make(params);
         t.assert_true("duplicate logical layers are rejected", !built.valid);
+    });
+
+    t.test("decode layout target is quantized and stateless once concentrated", [](testing & t) {
+        // a prefill into the uniform layout stays uniform; the first decode enters
+        t.assert_equal(uint32_t(0),   decode_layout_pages(0, 100, 511));
+        t.assert_equal(uint32_t(112), decode_layout_pages(0, 100, 1));
+        t.assert_equal(uint32_t(80),  decode_layout_pages(0, 79, 1));
+        t.assert_equal(uint32_t(112), decode_layout_pages(0, 112, 2));
+
+        // inside the quantum nothing moves, for either ubatch kind
+        t.assert_equal(uint32_t(112), decode_layout_pages(112, 102, 511));
+        t.assert_equal(uint32_t(112), decode_layout_pages(112, 112, 1));
+
+        // growth past the quantum re-rounds on whichever ubatch sees it
+        t.assert_equal(uint32_t(128), decode_layout_pages(112, 113, 511));
+        t.assert_equal(uint32_t(128), decode_layout_pages(112, 113, 1));
+
+        // a shrink re-rounds down the same way
+        t.assert_equal(uint32_t(112), decode_layout_pages(208, 100, 1));
+        t.assert_equal(uint32_t(112), decode_layout_pages(208, 100, 511));
+
+        // an active set that fits the resident partition returns to uniform
+        t.assert_equal(uint32_t(0), decode_layout_pages(112, 78, 1));
+        t.assert_equal(uint32_t(0), decode_layout_pages(112, 60, 511));
+
+        // quantum one tracks the active pages exactly
+        t.assert_equal(uint32_t(97), decode_layout_pages(96, 97, 1, 1));
+        t.assert_equal(uint32_t(98), decode_layout_pages(97, 98, 511, 1));
+        t.assert_equal(uint32_t(97), decode_layout_pages(96, 97, 1, 0));
     });
 
     return t.summary();

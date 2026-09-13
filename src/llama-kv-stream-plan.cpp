@@ -508,3 +508,24 @@ llama_kv_stream_feedback_delta llama_kv_stream_feedback_delta_make(
     }
     return result;
 }
+
+uint32_t llama_kv_stream_decode_layout_pages(
+        uint32_t previous_layout_pages,
+        uint32_t active_pages_per_layer,
+        uint32_t resident_pages_per_layer,
+        uint32_t query_tokens,
+        uint32_t max_decode_query_tokens,
+        uint32_t quantum_pages) {
+    if (active_pages_per_layer <= resident_pages_per_layer) {
+        return 0;
+    }
+    if (previous_layout_pages == 0 && query_tokens > max_decode_query_tokens) {
+        return 0;
+    }
+    const uint32_t quantum = std::max<uint32_t>(1, quantum_pages);
+    if (active_pages_per_layer > std::numeric_limits<uint32_t>::max() - quantum) {
+        return active_pages_per_layer;
+    }
+    return (active_pages_per_layer + quantum - 1) / quantum * quantum;
+}
+

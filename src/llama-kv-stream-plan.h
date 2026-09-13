@@ -218,3 +218,11 @@ struct llama_kv_stream_feedback_delta {
 llama_kv_stream_feedback_delta llama_kv_stream_feedback_delta_make(
     const llama_kv_stream_feedback_counters & current,
     const llama_kv_stream_feedback_counters & previous);
+
+uint32_t llama_kv_stream_decode_layout_pages(
+    uint32_t previous_layout_pages,
+    uint32_t active_pages_per_layer,
+    uint32_t resident_pages_per_layer,
+    uint32_t query_tokens,
+    uint32_t max_decode_query_tokens,
+    uint32_t quantum_pages);

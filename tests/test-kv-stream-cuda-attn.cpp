@@ -274,7 +274,8 @@ std::vector<float> run_attention_layers(
         ggml_type index_type = GGML_TYPE_I32,
         ggml_backend_cuda_kv_stream_runtime_t dirty_runtime = nullptr,
         uint32_t layout_after_first = 0,
-        const int64_t * custom_rows = nullptr) {
+        const int64_t * custom_rows = nullptr,
+        bool graph_per_layer = false) {
     constexpr size_t N_TENSORS = 256;
     const size_t context_bytes = ggml_tensor_overhead()*N_TENSORS +
         ggml_graph_overhead_custom(N_TENSORS, false);
@@ -382,18 +383,24 @@ std::vector<float> run_attention_layers(
         }
     }
 
-    ggml_cgraph * graph = ggml_new_graph_custom(compute_ctx.get(), N_TENSORS, false);
-    for (auto & current : tensors) {
-        ggml_build_forward_expand(graph, current.updated_k);
-        ggml_build_forward_expand(graph, current.updated_v);
-        ggml_build_forward_expand(graph, current.out);
+    // one graph per ubatch, or one per layer the way the scheduler splits a ubatch around a CPU op
+    std::vector<ggml_cgraph *> graphs;
+    for (size_t layer = 0; layer < tensors.size(); ++layer) {
+        if (layer == 0 || graph_per_layer) {
+            graphs.push_back(ggml_new_graph_custom(compute_ctx.get(), N_TENSORS, false));
+        }
+        ggml_build_forward_expand(graphs.back(), tensors[layer].updated_k);
+        ggml_build_forward_expand(graphs.back(), tensors[layer].updated_v);
+        ggml_build_forward_expand(graphs.back(), tensors[layer].out);
     }
     for (int repeat = 0; repeat < repeats; ++repeat) {
         if (dirty_runtime != nullptr) {
             GGML_ASSERT(ggml_backend_cuda_kv_stream_mark_dirty_rows(
                 dirty_runtime, dirty_rows.data(), dirty_rows.size()));
         }
-        GGML_ASSERT(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+        for (ggml_cgraph * graph : graphs) {
+            GGML_ASSERT(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+        }
         if (repeat == 0 && layout_after_first != 0) {
             GGML_ASSERT(ggml_backend_cuda_kv_stream_set_decode_layout(
                 dirty_runtime, layout_after_first));
@@ -1545,6 +1552,55 @@ int main() {
             max_abs = std::max(max_abs, std::abs(expected[i] - actual[i]));
         }
         t.assert_true("chunk-pipelined logits remain equivalent", max_abs <= 3e-4f);
+    });
+
+    t.test("layer identity survives a prefill ubatch split across graphs", [](testing & t) {
+        constexpr int64_t n_kv = 1024;
+        constexpr int64_t n_batch = 64;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        std::vector<attention_inputs> inputs;
+        for (int layer = 0; layer < 4; ++layer) {
+            inputs.push_back(make_inputs(n_kv, n_batch, n_kv - 256, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 0.7f*layer));
+        }
+        const std::vector<float> expected = run_attention_layers(
+            backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()),
+            n_kv, n_batch, 1, 2, GGML_TYPE_I64);
+
+        const size_t k_page_bytes = ggml_row_size(GGML_TYPE_Q8_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t v_page_bytes = ggml_row_size(GGML_TYPE_Q4_0, HEAD_DIM)*N_KV_HEAD*256;
+        const size_t page_bytes = align_up(k_page_bytes, 128) + v_page_bytes;
+        ggml_backend_cuda_kv_stream_params params{};
+        params.device               = 0;
+        params.stage_bytes          = page_bytes;
+        params.stage_slots          = 8;
+        params.pool_bytes           = 24*page_bytes;
+        params.resident_layer_count = 4;
+        params.page_tokens          = 256;
+        auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+        if (!t.assert_true("shared runtime initializes", runtime != nullptr)) {
+            return;
+        }
+
+        const std::vector<float> actual = run_attention_layers(
+            backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime),
+            n_kv, n_batch, 1, 2, GGML_TYPE_I64, runtime, 0, nullptr, true);
+        ggml_backend_cuda_kv_stream_runtime_free(runtime);
+
+        if (!t.assert_equal(expected.size(), actual.size())) {
+            return;
+        }
+        const size_t per_layer = expected.size()/inputs.size();
+        for (size_t layer = 0; layer < inputs.size(); ++layer) {
+            float max_abs = 0.0f;
+            for (size_t i = layer*per_layer; i < (layer + 1)*per_layer; ++i) {
+                max_abs = std::max(max_abs, std::abs(expected[i] - actual[i]));
+            }
+            t.assert_true("layer attends over its own pages", max_abs <= 3e-4f);
+        }
     });
 
     t.test("sixteen attention layers share one resident/ring pool during causal prefill", [](testing & t) {

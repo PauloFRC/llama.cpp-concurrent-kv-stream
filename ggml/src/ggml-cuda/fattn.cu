@@ -448,6 +448,7 @@ struct ggml_cuda_kv_stream_resident_cache {
     uint32_t resident_pages_per_layer = 0;
     uint32_t decode_active_pages = 0;
     uint32_t next_layer = 0;
+    bool relearn_layers = true; // armed by mark_dirty_rows, consumed by the first prefill graph
     std::vector<uint32_t> layer_pages;
     std::vector<size_t> layer_offsets;
     std::unordered_map<const void *, uint32_t> layer_by_k;
@@ -743,6 +744,7 @@ bool ggml_cuda_kv_stream_resident_cache_mark_dirty_rows(
 
     cache->mutable_pages.clear();
     cache->all_pages_mutable = false;
+    cache->relearn_layers = true;
     if (count == 0) {
         cache->dirty_rows.clear();
     } else {
@@ -1664,12 +1666,16 @@ bool ggml_cuda_kv_stream_graph_add_attention(
     ring->graph_decode = ring->graph_decode && decode_shaped;
     if (!decode_shaped) {
         // Graphs are rebuilt across warmup, prompt chunks, and slot reuse.
-        // Relearn pointer-to-layer identity once per prefill graph while the
+        // Relearn pointer-to-layer identity once per prefill ubatch while the
         // resident page contents are refreshed by the local multi-token path.
+        // A ubatch may span several graphs when the scheduler splits it.
         if (ring->graph_resident_cache == nullptr) {
-            resident_cache->layer_by_k.clear();
-            resident_cache->layer_by_data.clear();
-            resident_cache->next_layer = 0;
+            if (resident_cache->relearn_layers) {
+                resident_cache->layer_by_k.clear();
+                resident_cache->layer_by_data.clear();
+                resident_cache->next_layer = 0;
+                resident_cache->relearn_layers = false;
+            }
             ring->graph_resident_cache = resident_cache;
         }
         const uint32_t resident_layer = kv_stream_resident_layer(resident_cache, K->data);

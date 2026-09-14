@@ -488,13 +488,17 @@ llama_kv_stream_feedback_delta llama_kv_stream_feedback_delta_make(
         const llama_kv_stream_feedback_counters & previous) {
     llama_kv_stream_feedback_delta result;
     if (current.deadline_samples < previous.deadline_samples ||
-            current.deadline_misses < previous.deadline_misses) {
+            current.deadline_misses < previous.deadline_misses ||
+            current.skipped_pages < previous.skipped_pages ||
+            current.resident_pages_attended < previous.resident_pages_attended) {
         result.error = "KV stream feedback counters moved backwards";
         return result;
     }
 
     result.deadline_samples = current.deadline_samples - previous.deadline_samples;
     result.deadline_misses = current.deadline_misses - previous.deadline_misses;
+    result.skipped_pages = current.skipped_pages - previous.skipped_pages;
+    result.resident_pages_attended = current.resident_pages_attended - previous.resident_pages_attended;
     if (result.deadline_misses > result.deadline_samples) {
         result.error = "KV stream deadline misses exceed samples";
         return result;

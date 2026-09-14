@@ -202,17 +202,21 @@ llama_kv_stream_partition llama_kv_stream_partition_adapt(
     const llama_kv_stream_partition_params & params);
 
 struct llama_kv_stream_feedback_counters {
-    uint64_t deadline_samples = 0;
-    uint64_t deadline_misses  = 0;
+    uint64_t deadline_samples        = 0;
+    uint64_t deadline_misses         = 0;
+    uint64_t skipped_pages           = 0;
+    uint64_t resident_pages_attended = 0;
 };
 
 struct llama_kv_stream_feedback_delta {
     bool valid = false;
     bool has_evaluation = false;
     std::string error;
-    uint64_t deadline_samples = 0;
-    uint64_t deadline_misses  = 0;
-    double deadline_miss_ratio = 0.0;
+    uint64_t deadline_samples        = 0;
+    uint64_t deadline_misses         = 0;
+    double deadline_miss_ratio       = 0.0;
+    uint64_t skipped_pages           = 0;
+    uint64_t resident_pages_attended = 0;
 };
 
 llama_kv_stream_feedback_delta llama_kv_stream_feedback_delta_make(

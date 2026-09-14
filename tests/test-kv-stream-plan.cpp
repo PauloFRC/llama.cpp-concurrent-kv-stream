@@ -605,23 +605,31 @@ int main() {
 
     t.test("cumulative CUDA feedback becomes one bounded evaluation delta", [](testing & t) {
         const auto delta = llama_kv_stream_feedback_delta_make(
-            { 145, 17 }, { 120, 12 });
+            { 145, 17, 30, 50 }, { 120, 12, 10, 20 });
         t.assert_true("feedback delta is valid", delta.valid);
         t.assert_true("feedback contains a new evaluation", delta.has_evaluation);
         t.assert_equal(uint64_t(25), delta.deadline_samples);
         t.assert_equal(uint64_t(5), delta.deadline_misses);
+        t.assert_equal(uint64_t(20), delta.skipped_pages);
+        t.assert_equal(uint64_t(30), delta.resident_pages_attended);
         t.assert_true("deadline ratio is exact",
             std::abs(delta.deadline_miss_ratio - 0.20) < 1e-12);
 
         const auto unchanged = llama_kv_stream_feedback_delta_make(
-            { 145, 17 }, { 145, 17 });
+            { 145, 17, 30, 50 }, { 145, 17, 30, 50 });
         t.assert_true("unchanged counters are valid", unchanged.valid);
         t.assert_true("unchanged counters do not invent an evaluation",
             !unchanged.has_evaluation);
+        t.assert_equal(uint64_t(0), unchanged.skipped_pages);
+        t.assert_equal(uint64_t(0), unchanged.resident_pages_attended);
 
         const auto reset = llama_kv_stream_feedback_delta_make(
             { 3, 1 }, { 145, 17 });
         t.assert_true("counter reset is rejected", !reset.valid);
+
+        const auto skipped_reset = llama_kv_stream_feedback_delta_make(
+            { 145, 17, 5, 20 }, { 145, 17, 10, 20 });
+        t.assert_true("skipped pages counter reset is rejected", !skipped_reset.valid);
 
         const auto impossible = llama_kv_stream_feedback_delta_make(
             { 150, 30 }, { 145, 17 });

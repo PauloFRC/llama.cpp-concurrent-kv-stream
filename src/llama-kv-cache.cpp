@@ -1424,17 +1424,11 @@ bool llama_kv_cache::kv_stream_adapt(uint32_t active_tokens, uint32_t query_toke
     }
 
     const auto delta = llama_kv_stream_feedback_delta_make(
-        { deadline_samples, deadline_misses },
-        { owner.previous_deadline_samples, owner.previous_deadline_misses });
+        { deadline_samples, deadline_misses, skipped_pages, resident_pages_attended },
+        { owner.previous_deadline_samples, owner.previous_deadline_misses,
+          owner.previous_skipped_pages, owner.previous_resident_pages_attended });
     owner.previous_deadline_samples = deadline_samples;
     owner.previous_deadline_misses = deadline_misses;
-
-    const uint64_t delta_skipped_pages =
-        skipped_pages >= owner.previous_skipped_pages ?
-            skipped_pages - owner.previous_skipped_pages : skipped_pages;
-    const uint64_t delta_resident_pages_attended =
-        resident_pages_attended >= owner.previous_resident_pages_attended ?
-            resident_pages_attended - owner.previous_resident_pages_attended : resident_pages_attended;
     owner.previous_skipped_pages = skipped_pages;
     owner.previous_resident_pages_attended = resident_pages_attended;
 
@@ -1453,8 +1447,8 @@ bool llama_kv_cache::kv_stream_adapt(uint32_t active_tokens, uint32_t query_toke
             (unsigned long long) delta.deadline_samples,
             (unsigned long long) delta.deadline_misses,
             100.0*copy_busy_ratio, peak_occupancy,
-            (unsigned long long) delta_skipped_pages,
-            (unsigned long long) delta_resident_pages_attended);
+            (unsigned long long) delta.skipped_pages,
+            (unsigned long long) delta.resident_pages_attended);
     }
 
     if (ring_slots != 0 && owner.minimum_ring_slots == 0) {

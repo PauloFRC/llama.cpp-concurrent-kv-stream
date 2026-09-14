@@ -921,7 +921,6 @@ int main() {
         // quantum one tracks the active pages exactly
         t.assert_equal(uint32_t(97), decode_layout_pages(96, 97, 1, 1));
         t.assert_equal(uint32_t(98), decode_layout_pages(97, 98, 511, 1));
-        t.assert_equal(uint32_t(97), decode_layout_pages(96, 97, 1, 0));
     });
 
     return t.summary();

@@ -1440,14 +1440,9 @@ bool llama_kv_cache::kv_stream_adapt(uint32_t active_tokens, uint32_t query_toke
 
     const uint32_t active_pages = (active_tokens + page_tokens - 1) / page_tokens;
 
-    uint32_t quantum = 16;
-    if (const char * env = getenv("LLAMA_KV_STREAM_LAYOUT_QUANTUM_PAGES")) {
-        quantum = std::max<uint32_t>(1, std::atoi(env));
-    }
-
     const uint32_t decode_layout_pages = llama_kv_stream_decode_layout_pages(
         owner.decode_layout_pages, active_pages, resident_pages,
-        query_tokens, MAX_DECODE_QUERY_TOKENS, quantum);
+        query_tokens, MAX_DECODE_QUERY_TOKENS, 16);
 
     const bool entering_decode_layout =
         decode_layout_pages != 0 && decode_layout_pages != owner.decode_layout_pages;

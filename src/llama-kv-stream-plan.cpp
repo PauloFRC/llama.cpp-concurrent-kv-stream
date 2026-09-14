@@ -522,10 +522,6 @@ uint32_t llama_kv_stream_decode_layout_pages(
     if (previous_layout_pages == 0 && query_tokens > max_decode_query_tokens) {
         return 0;
     }
-    const uint32_t quantum = std::max<uint32_t>(1, quantum_pages);
-    if (active_pages_per_layer > std::numeric_limits<uint32_t>::max() - quantum) {
-        return active_pages_per_layer;
-    }
-    return (active_pages_per_layer + quantum - 1) / quantum * quantum;
+    return (active_pages_per_layer + quantum_pages - 1) / quantum_pages * quantum_pages;
 }
 

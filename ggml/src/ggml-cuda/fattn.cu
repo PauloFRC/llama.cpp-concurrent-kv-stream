@@ -1924,7 +1924,7 @@ void ggml_cuda_flash_attn_ext_streamed(
                     ++resident_cache->stats.resident_hits;
                     desc.upload = resident_cache->precise_dirty_tracking[resident_layer] ?
                         resident_cache->dirty[resident_index] :
-                        (dst->src[0]->ne[1] > 1 || chunk == nchunks - 1);
+                        (dst->src[0]->ne[1] > KV_STREAM_MAX_DECODE_QUERY_TOKENS || chunk == nchunks - 1);
                     desc.resident_refresh = desc.upload;
                 } else {
                     ++resident_cache->stats.resident_misses;

@@ -2214,7 +2214,7 @@ int main() {
 
         const std::vector<float> actual = run_attention(
             backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime),
-            n_kv, n_batch, 2, update_rows, true, GGML_TYPE_I64, false, nullptr, false, false, 0, scattered_rows);
+            n_kv, n_batch, 2, update_rows, true, GGML_TYPE_I64, false, runtime, false, false, 0, scattered_rows);
         const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
         ggml_backend_cuda_kv_stream_runtime_free(runtime);
 

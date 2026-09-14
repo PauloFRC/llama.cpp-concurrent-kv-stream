@@ -223,12 +223,14 @@ class BenchmarkKvStreamTest(unittest.TestCase):
 
     def test_trace_parser_marks_only_pages_beyond_resident_partition(self) -> None:
         log = (
-            "I kv_stream_adapt: active 65536, resident 256, ring 32, "
-            "samples 1, misses 0, copy busy 0.0%, peak 1\n"
-            "W kv_stream_adapt: adaptive KV partition: resident pages/layer "
+            "0.01.000.000 W kv_stream_adapt: active 65536, resident 256, ring 32, layout 256, "
+            "samples 1, misses 0, copy busy 0.0%, peak 1, skipped 0, resident attended 0\n"
+            "0.01.001.000 W kv_stream_adapt: adaptive KV partition: resident pages/layer "
             "256 -> 248, ring slots 32 -> 160, miss 50.0%, copy busy 25.0%\n"
-            "I kv_stream_adapt: active 65792, resident 248, ring 160, "
-            "samples 2, misses 1, copy busy 25.0%, peak 10\n"
+            "0.01.002.000 W kv_stream_adapt: active 65792, resident 248, ring 160, layout 248, "
+            "samples 2, misses 1, copy busy 25.0%, peak 10, skipped 4, resident attended 8\n"
+            "0.01.003.000 W kv_stream_adapt: active 66048, resident 248, ring 160, "
+            "samples 3, misses 1, copy busy 25.0%, peak 10\n"
         )
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "server.log"
@@ -236,7 +238,7 @@ class BenchmarkKvStreamTest(unittest.TestCase):
             parsed = BENCHMARK.parse_kv_stream_trace(path)
         self.assertTrue(parsed["streaming_active"])
         self.assertEqual(parsed["stream_first_active_tokens"], 65792)
-        self.assertEqual(parsed["stream_trace_samples"], 2)
+        self.assertEqual(parsed["stream_trace_samples"], 3)
         self.assertEqual(parsed["stream_repartitions"], 1)
         self.assertEqual(parsed["stream_max_ring_slots"], 160)
 

@@ -129,7 +129,7 @@ def run_prompt_cache(binary: Path, model: Path, port: int, output: Path):
 
 RESTORE_RUNS = re.compile(rb"state_read_data: restoring (\d+) cells in (\d+) runs")
 CELL_PAGE = re.compile(rb"^([.0-9M]{256}) \*$", re.MULTILINE)
-TRACE_LINE = re.compile(rb"kv_stream_adapt: active (\d+), resident \d+, ring \d+, samples \d+, misses \d+, "
+TRACE_LINE = re.compile(rb"kv_stream_adapt: active (\d+), resident \d+, ring \d+, (?:layout \d+, )?samples \d+, misses \d+, "
                         rb"copy busy ([0-9.]+)%, peak \d+, skipped (\d+), resident attended (\d+)")
 CACHE_EVICT = re.compile(rb"removing oldest entry|exceeds cache size limit")
 

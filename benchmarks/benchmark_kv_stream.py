@@ -32,6 +32,7 @@ UVM_ENV_NAMES = (
 
 KV_STREAM_TRACE_RE = re.compile(
     r"kv_stream_adapt: active (\d+), resident (\d+), ring (\d+), "
+    r"(?:layout \d+, )?"
     r"samples (\d+), misses (\d+), copy busy ([0-9.]+)%, peak (\d+)"
 )
 

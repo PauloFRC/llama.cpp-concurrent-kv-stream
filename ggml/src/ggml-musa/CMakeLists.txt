@@ -64,6 +64,8 @@ if (MUSAToolkit_FOUND)
         set_property(SOURCE ${SOURCE} PROPERTY COMPILE_FLAGS ${COMPILE_FLAGS})
     endforeach()
 
+    list(APPEND GGML_SOURCES_MUSA "../ggml-cuda/kv-stream-cpu-attn.cpp")
+
     ggml_add_backend_library(ggml-musa
                              ${GGML_HEADERS_MUSA}
                              ${GGML_SOURCES_MUSA}

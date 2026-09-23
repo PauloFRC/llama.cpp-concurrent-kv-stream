@@ -7,7 +7,9 @@
 #include <cmath>
 #include <cstring>
 
-#if defined(GGML_CUDA_KV_STREAM_CPU_ATTN_AVX512)
+// __builtin_cpu_supports("f16c") needs GCC 11 or clang 18
+#if defined(GGML_CUDA_KV_STREAM_CPU_ATTN_AVX512) && \
+    ((defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 11) || (defined(__clang__) && __clang_major__ >= 18))
 
 #define GGML_COMMON_DECL_CPP
 #include "ggml-common.h"
@@ -124,14 +126,9 @@ inline void dequant_q4_0_row(const block_q4_0 * blocks, float * out) {
 } // namespace
 
 bool ggml_cuda_kv_stream_cpu_attn_supported() {
-#if (defined(__GNUC__) && !defined(__clang__) && (__GNUC__ > 9 || (__GNUC__ == 9 && __GNUC_MINOR__ >= 1))) || \
-    (defined(__clang__) && __clang_major__ >= 12)
     return __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512dq") &&
         __builtin_cpu_supports("avx512vnni") && __builtin_cpu_supports("f16c") &&
         __builtin_cpu_supports("fma");
-#else
-    return false;
-#endif
 }
 
 void ggml_cuda_kv_stream_cpu_attn_init(float * out, float * out_meta, int nrows) {

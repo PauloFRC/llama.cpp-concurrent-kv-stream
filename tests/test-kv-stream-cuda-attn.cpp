@@ -1,3 +1,4 @@
+#include "common.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
@@ -1959,6 +1960,78 @@ int main() {
         }
         const float max_abs = max_abs_error(expected, actual);
         t.assert_true("chunk-pipelined logits remain equivalent", max_abs <= 3e-4f);
+    });
+
+    t.test("cpu pages leave streamed attention and keep the page partition", [](testing & t) {
+        constexpr int64_t n_kv = 41*256;
+        constexpr int64_t n_batch = 1;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        const size_t page_bytes = query_page_bytes(backend.get(), GGML_TYPE_Q8_0, GGML_TYPE_Q4_0);
+        ggml_backend_cuda_kv_stream_params params{};
+        params.device               = 0;
+        params.stage_bytes          = page_bytes;
+        params.stage_slots          = 40;
+        params.pool_bytes           = 41*page_bytes;
+        params.resident_layer_count = 1;
+        params.page_tokens          = PAGE_TOKENS;
+        params.decode_span_pages    = 32;
+
+        struct test_case {
+            const char * name;
+            const char * cpu_pages_env;
+            bool last_page_live;
+            int64_t hidden_begin;
+            int64_t hidden_end;
+            uint64_t cpu_pages;
+            uint64_t streamed_pages;
+            uint64_t skipped_pages;
+        };
+        const test_case cases[] = {
+            { "cpu tail",            "8",  true,  32, 40,  8, 32, 0 },
+            { "whole streamed set",  "64", false,  1, 41, 39,  0, 1 },
+        };
+        for (const auto & tc : cases) {
+            const attention_inputs inputs = make_inputs(n_kv, n_batch, n_kv);
+            attention_inputs hidden = inputs;
+            for (int64_t token = tc.hidden_begin*PAGE_TOKENS; token < tc.hidden_end*PAGE_TOKENS; ++token) {
+                hidden.mask[token] = ggml_fp32_to_fp16(-INFINITY);
+            }
+            const std::vector<float> expected = run_attention(
+                backend.get(), hidden, ggml_backend_get_default_buffer_type(backend.get()),
+                n_kv, n_batch);
+
+            auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+            if (!t.assert_true("cpu split runtime initializes", runtime != nullptr)) {
+                return;
+            }
+            std::vector<uint8_t> live(41, 1);
+            live[40] = tc.last_page_live;
+            t.assert_true("live pages accepted",
+                ggml_backend_cuda_kv_stream_set_live_pages(runtime, live.data(), live.size()));
+            common_set_env("GGML_CUDA_KV_STREAM_CPU_PAGES", tc.cpu_pages_env);
+            const std::vector<float> actual = run_attention(
+                backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime),
+                n_kv, n_batch);
+            common_set_env("GGML_CUDA_KV_STREAM_CPU_PAGES", "");
+            const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
+            ggml_backend_cuda_kv_stream_runtime_free(runtime);
+
+            t.assert_equal(tc.cpu_pages, stats.cpu_pages);
+            t.assert_equal(tc.streamed_pages, stats.streamed_pages);
+            t.assert_equal(tc.skipped_pages, stats.skipped_pages);
+            t.assert_equal(uint64_t(41), stats.resident_pages_attended + stats.skipped_pages +
+                stats.streamed_pages_attended + stats.cpu_pages);
+            if (!t.assert_equal(expected.size(), actual.size())) {
+                return;
+            }
+            const float max_abs = max_abs_error(expected, actual);
+            std::fprintf(stderr, "%s: max_abs=%g\n", tc.name, max_abs);
+            t.assert_true(std::string(tc.name) + ": gpu output excludes cpu pages", is_finite(actual) && max_abs <= 1e-6f);
+        }
     });
 
     t.test("layer identity survives a prefill ubatch split across graphs", [](testing & t) {

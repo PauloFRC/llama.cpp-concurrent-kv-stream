@@ -987,6 +987,26 @@ static __global__ void kv_stream_normalize_chunk_results(
     dst[row*D + tid] = accumulator[row*D + tid]/accumulator_meta[row].y;
 }
 
+// TODO: dummy placeholder for validation, remove/refactor once pool writes real cpu results
+template<int D>
+static __global__ void kv_stream_empty_cpu_result(
+        float * parts,
+        float2 * meta,
+        int nrows) {
+    ggml_cuda_pdl_lc();
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    if (row >= nrows || tid >= D) {
+        return;
+    }
+    ggml_cuda_pdl_sync();
+
+    parts[row*D + tid] = 0.0f;
+    if (tid == 0) {
+        meta[row] = make_float2(-INFINITY, 0.0f);
+    }
+}
+
 #ifdef GGML_CUDA_FA_ALL_QUANTS
 using kv_stream_native_partial_fn = void (*)(
     ggml_backend_cuda_context &, ggml_tensor *, float *, float2 *, int);
@@ -1633,6 +1653,8 @@ void ggml_cuda_kv_stream_graph_begin(ggml_cuda_kv_stream_transfer_ring * ring) {
     ring->graph_copy_batch_greedy = ring->span_tuner.use_greedy_batch();
     ring->graph_copy_batch_pages = ring->graph_copy_batch_greedy ?
         ring->active_slots : KV_STREAM_COPY_BATCH_PAGES;
+    const char * cpu_pages_env = getenv("GGML_CUDA_KV_STREAM_CPU_PAGES");
+    ring->cpu_pages_per_layer = cpu_pages_env == nullptr ? 0 : uint32_t(strtoul(cpu_pages_env, nullptr, 10));
     ring->graph_layer_count = 0;
     ring->current_layer = KV_STREAM_NO_LAYER;
     ring->next_request = 0;
@@ -1859,6 +1881,7 @@ void ggml_cuda_flash_attn_ext_streamed(
         bool resident_refresh = false;
         bool streamed = false;
         bool skipped = false;
+        bool cpu = false;
         uint32_t slot = 0;
         size_t request_index = KV_STREAM_NO_REQUEST;
     };
@@ -1871,6 +1894,7 @@ void ggml_cuda_flash_attn_ext_streamed(
         0 : resident_cache->layer_pages[resident_layer];
     const bool graph_planned = kv_stream_graph_layer_begin(
         transfer_ring, K->data, ctx.stream());
+    std::vector<chunk_descriptor> chunks(nchunks);
     const std::vector<uint32_t> * cpu_pages = graph_planned ?
         kv_stream_graph_cpu_pages(transfer_ring, K->data) : nullptr;
     if (cpu_pages != nullptr) {
@@ -1878,11 +1902,11 @@ void ggml_cuda_flash_attn_ext_streamed(
         for (const uint32_t page : *cpu_pages) {
             GGML_ASSERT(ggml_cuda_kv_stream_page_immutable(
                 page, uint32_t(nchunks), resident_cache->mutable_pages, resident_cache->all_pages_mutable));
+            chunks[page].cpu = true;
         }
         transfer_ring->cpu_pages += cpu_pages->size();
     }
 
-    std::vector<chunk_descriptor> chunks(nchunks);
     std::vector<size_t> streamed_chunks;
     streamed_chunks.reserve(nchunks);
 
@@ -1957,6 +1981,8 @@ void ggml_cuda_flash_attn_ext_streamed(
                     ++resident_cache->stats.resident_misses;
                     resident_cache->loaded[resident_index] = 1;
                 }
+            } else if (desc.cpu) {
+                continue;
             } else if (!kv_stream_page_live(transfer_ring, page, uint32_t(nchunks))) {
                 desc.skipped = true;
                 ++transfer_ring->skipped_pages;
@@ -2006,7 +2032,8 @@ void ggml_cuda_flash_attn_ext_streamed(
     ggml_cuda_pool_alloc<float2> meta(pool);
     ggml_cuda_pool_alloc<float> accumulator(pool);
     ggml_cuda_pool_alloc<float2> accumulator_meta(pool);
-    const bool needs_partial_reduction = convert_to_f16 || (!streamed_chunks.empty() && nchunks > 1);
+    const bool needs_partial_reduction = convert_to_f16 || cpu_pages != nullptr ||
+        (!streamed_chunks.empty() && nchunks > 1);
     if (needs_partial_reduction) {
         parts.alloc(size_t(partial_count)*workspace_elements);
         meta.alloc(size_t(partial_count)*workspace_rows);
@@ -2093,7 +2120,7 @@ void ggml_cuda_flash_attn_ext_streamed(
     size_t stream_index = 0;
     for (int chunk = 0; chunk < nchunks; ++chunk) {
         auto & desc = chunks[chunk];
-        if (desc.skipped) {
+        if (desc.skipped || desc.cpu) {
             continue;
         }
         uint32_t streamed_span_pages = 0;
@@ -2285,7 +2312,7 @@ void ggml_cuda_flash_attn_ext_streamed(
 
         // Preserve normal CUDA flash attention when the active cache is fully resident or fits in one streamed page.
         // This avoids a partial reduction and keeps logits identical to a non-streamed cache.
-        if (!convert_to_f16 && (streamed_chunks.empty() || nchunks == 1)) {
+        if (!convert_to_f16 && cpu_pages == nullptr && (streamed_chunks.empty() || nchunks == 1)) {
             ggml_cuda_flash_attn_ext(ctx, &staged_dst);
             if (desc.streamed) {
                 if (graph_planned) {
@@ -2382,11 +2409,20 @@ void ggml_cuda_flash_attn_ext_streamed(
             chunk += int(streamed_span_pages) - 1;
         }
     }
-    GGML_ASSERT(!first_chunk);
-
     const dim3 blocks(nrows, 1, 1);
     const dim3 threads(GGML_CUDA_KV_STREAM_HEAD_DIM, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params(blocks, threads, 0, ctx.stream());
+    if (cpu_pages != nullptr) {
+        GGML_ASSERT(size_t(nrows) <= workspace_rows);
+        ggml_cuda_kernel_launch(kv_stream_empty_cpu_result<GGML_CUDA_KV_STREAM_HEAD_DIM>, launch_params,
+            parts.ptr, meta.ptr, nrows);
+        ggml_cuda_kernel_launch(kv_stream_accumulate_chunk_results<GGML_CUDA_KV_STREAM_HEAD_DIM>, launch_params,
+            parts.ptr, meta.ptr, accumulator.ptr, accumulator_meta.ptr, nrows, first_chunk, 1);
+        CUDA_CHECK(cudaGetLastError());
+        first_chunk = false;
+    }
+    GGML_ASSERT(!first_chunk);
+
     ggml_cuda_kernel_launch(kv_stream_normalize_chunk_results<GGML_CUDA_KV_STREAM_HEAD_DIM>, launch_params,
         accumulator.ptr, accumulator_meta.ptr, static_cast<float *>(dst->data), nrows);
     CUDA_CHECK(cudaGetLastError());

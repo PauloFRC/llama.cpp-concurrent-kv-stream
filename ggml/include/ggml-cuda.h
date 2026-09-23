@@ -124,6 +124,11 @@ GGML_BACKEND_API bool ggml_backend_cuda_kv_stream_set_live_pages(
     ggml_backend_cuda_kv_stream_runtime_t runtime,
     const uint8_t * live_pages,
     size_t count);
+GGML_BACKEND_API bool ggml_backend_cuda_kv_stream_set_cpu_split(
+    ggml_backend_cuda_kv_stream_runtime_t runtime,
+    uint32_t n_threads,
+    uint32_t n_head,
+    uint32_t context_pages);
 GGML_BACKEND_API struct ggml_backend_cuda_kv_stream_stats ggml_backend_cuda_kv_stream_get_stats(
     ggml_backend_cuda_kv_stream_runtime_t runtime);
 GGML_BACKEND_API bool ggml_backend_cuda_kv_stream_stage_upload(

@@ -12,6 +12,7 @@ inline bool ggml_cuda_kv_stream_cpu_split_supported(const ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
 
     float max_bias = 0.0f;
     float logit_softcap = 0.0f;
@@ -19,8 +20,10 @@ inline bool ggml_cuda_kv_stream_cpu_split_supported(const ggml_tensor * dst) {
     memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
 
     return K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0 &&
+        Q->type == GGML_TYPE_F32 && ggml_nbytes(Q) == size_t(ggml_nelements(Q))*sizeof(float) &&
         Q->ne[0] == GGML_CUDA_KV_STREAM_HEAD_DIM && V->ne[0] == GGML_CUDA_KV_STREAM_HEAD_DIM &&
         Q->ne[1] <= GGML_CUDA_KV_STREAM_MAX_DECODE_QUERY_TOKENS && Q->ne[3] == 1 &&
+        mask != nullptr && mask->ne[2] == 1 &&
         max_bias == 0.0f && logit_softcap == 0.0f;
 }
 

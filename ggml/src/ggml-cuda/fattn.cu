@@ -5,6 +5,7 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
+#include "kv-stream-cpu-pages.h"
 #include "kv-stream-geometry.h"
 #include "kv-stream-span-tuner.h"
 
@@ -222,6 +223,8 @@ struct ggml_cuda_kv_stream_transfer_ring {
     std::vector<kv_stream_graph_request> graph_requests;
     std::unordered_map<const void *, uint32_t> graph_layer_by_k;
     std::unordered_map<const void *, std::vector<size_t>> graph_request_by_k_page;
+    std::unordered_map<const void *, std::vector<uint32_t>> graph_cpu_pages_by_k;
+    uint32_t cpu_pages_per_layer = 0;
 
     uint64_t asynchronous_page_uploads = 0;
     uint64_t host_to_device_copy_commands = 0;
@@ -229,6 +232,7 @@ struct ggml_cuda_kv_stream_transfer_ring {
     uint64_t stage_slot_reuses = 0;
     uint64_t skipped_pages = 0;
     uint64_t cross_layer_prefetches = 0;
+    uint64_t cpu_pages = 0;
     uint32_t current_occupancy = 0;
     uint32_t ring_peak_occupancy = 0;
     uint32_t current_ring_peak_occupancy = 0;
@@ -436,6 +440,7 @@ ggml_cuda_kv_stream_transfer_stats ggml_cuda_kv_stream_transfer_ring_get_stats(
         ring->deadline_counters_host[0],
         ring->deadline_counters_host[1],
         ring->ring_peak_occupancy,
+        ring->cpu_pages,
     };
 }
 
@@ -876,14 +881,6 @@ static uint32_t kv_stream_resident_layer(
         ++cache->next_layer;
     }
     return it->second;
-}
-
-static bool kv_stream_page_mutable(
-        const ggml_cuda_kv_stream_resident_cache * cache,
-        uint32_t page) {
-    return cache->all_pages_mutable ||
-        std::find(cache->mutable_pages.begin(), cache->mutable_pages.end(), page) !=
-            cache->mutable_pages.end();
 }
 
 namespace {
@@ -1589,6 +1586,13 @@ static size_t kv_stream_graph_request_index(
     return it->second[page];
 }
 
+static const std::vector<uint32_t> * kv_stream_graph_cpu_pages(
+        const ggml_cuda_kv_stream_transfer_ring * ring,
+        const void * k_key) {
+    const auto it = ring->graph_cpu_pages_by_k.find(k_key);
+    return it == ring->graph_cpu_pages_by_k.end() ? nullptr : &it->second;
+}
+
 static bool kv_stream_page_live(
         const ggml_cuda_kv_stream_transfer_ring * ring,
         uint32_t page,
@@ -1636,6 +1640,7 @@ void ggml_cuda_kv_stream_graph_begin(ggml_cuda_kv_stream_transfer_ring * ring) {
     ring->graph_requests.clear();
     ring->graph_layer_by_k.clear();
     ring->graph_request_by_k_page.clear();
+    ring->graph_cpu_pages_by_k.clear();
     ring->current_occupancy = 0;
     if (timing_available) {
         ring->current_ring_peak_occupancy = 0;
@@ -1707,11 +1712,16 @@ bool ggml_cuda_kv_stream_graph_add_attention(
     ring->graph_layer_by_k[K->data] = layer;
     auto & page_requests = ring->graph_request_by_k_page[K->data];
     page_requests.assign(nchunks, KV_STREAM_NO_REQUEST);
+    const uint32_t n_cpu = ggml_cuda_kv_stream_cpu_split_supported(dst) ? ring->cpu_pages_per_layer : 0;
+    std::vector<uint32_t> cpu_pages = ggml_cuda_kv_stream_select_cpu_pages(
+        uint32_t(nchunks), resident_cache->layer_pages[resident_layer], ring->live_pages,
+        resident_cache->mutable_pages, resident_cache->all_pages_mutable, n_cpu);
 
     for (int chunk = 0; chunk < nchunks; ++chunk) {
         const uint32_t page = uint32_t(chunk);
         if (page < resident_cache->layer_pages[resident_layer] ||
-                !kv_stream_page_live(ring, page, uint32_t(nchunks))) {
+                !kv_stream_page_live(ring, page, uint32_t(nchunks)) ||
+                std::binary_search(cpu_pages.begin(), cpu_pages.end(), page)) {
             continue;
         }
         const int64_t token_begin = chunk*block_tokens;
@@ -1737,13 +1747,16 @@ bool ggml_cuda_kv_stream_graph_add_attention(
         request.v_head_bytes = v_row_bytes*token_count;
         request.v_bytes = request.v_head_bytes*V->ne[2];
         request.layer = layer;
-        request.mutable_tail = chunk == nchunks - 1 ||
-            kv_stream_page_mutable(resident_cache, page);
+        request.mutable_tail = !ggml_cuda_kv_stream_page_immutable(
+            page, uint32_t(nchunks), resident_cache->mutable_pages, resident_cache->all_pages_mutable);
         request.eligible = !request.mutable_tail;
         GGML_ASSERT(request.v_offset + request.v_bytes == ring->page_bytes);
 
         page_requests[page] = ring->graph_requests.size();
         ring->graph_requests.push_back(request);
+    }
+    if (!cpu_pages.empty()) {
+        ring->graph_cpu_pages_by_k[K->data] = std::move(cpu_pages);
     }
     return true;
 }
@@ -1858,6 +1871,16 @@ void ggml_cuda_flash_attn_ext_streamed(
         0 : resident_cache->layer_pages[resident_layer];
     const bool graph_planned = kv_stream_graph_layer_begin(
         transfer_ring, K->data, ctx.stream());
+    const std::vector<uint32_t> * cpu_pages = graph_planned ?
+        kv_stream_graph_cpu_pages(transfer_ring, K->data) : nullptr;
+    if (cpu_pages != nullptr) {
+        GGML_ASSERT(resident_cache == transfer_ring->graph_resident_cache);
+        for (const uint32_t page : *cpu_pages) {
+            GGML_ASSERT(ggml_cuda_kv_stream_page_immutable(
+                page, uint32_t(nchunks), resident_cache->mutable_pages, resident_cache->all_pages_mutable));
+        }
+        transfer_ring->cpu_pages += cpu_pages->size();
+    }
 
     std::vector<chunk_descriptor> chunks(nchunks);
     std::vector<size_t> streamed_chunks;

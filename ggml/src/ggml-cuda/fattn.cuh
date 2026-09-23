@@ -31,6 +31,7 @@ struct ggml_cuda_kv_stream_transfer_stats {
     uint64_t deadline_samples = 0;
     uint64_t deadline_misses = 0;
     uint32_t ring_peak_occupancy = 0;
+    uint64_t cpu_pages = 0;
 };
 
 ggml_cuda_kv_stream_resident_cache * ggml_cuda_kv_stream_resident_cache_new(

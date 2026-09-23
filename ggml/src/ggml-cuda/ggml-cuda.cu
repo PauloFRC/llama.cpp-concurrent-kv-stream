@@ -1813,6 +1813,7 @@ ggml_backend_cuda_kv_stream_stats ggml_backend_cuda_kv_stream_get_stats(
         transfer_stats.ring_peak_occupancy,
         runtime->staged_set_rows,
         runtime->staged_set_rows_bytes,
+        transfer_stats.cpu_pages,
     };
 }
 

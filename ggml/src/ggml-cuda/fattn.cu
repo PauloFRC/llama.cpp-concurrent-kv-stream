@@ -5,6 +5,7 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
+#include "kv-stream-geometry.h"
 #include "kv-stream-span-tuner.h"
 
 #include <algorithm>
@@ -448,6 +449,7 @@ struct ggml_cuda_kv_stream_resident_cache {
     uint32_t resident_pages_per_layer = 0;
     uint32_t decode_active_pages = 0;
     uint32_t next_layer = 0;
+    bool relearn_layers = true;
     std::vector<uint32_t> layer_pages;
     std::vector<size_t> layer_offsets;
     std::unordered_map<const void *, uint32_t> layer_by_k;
@@ -550,7 +552,7 @@ ggml_cuda_kv_stream_resident_cache * ggml_cuda_kv_stream_resident_cache_new(
         uint32_t layer_count, uint32_t page_tokens) {
     if (pool_data == nullptr || scratch_bytes == 0 || scratch_bytes >= pool_bytes ||
             page_bytes == 0 || scratch_bytes%page_bytes != 0 ||
-            layer_count == 0 || page_tokens != 256) {
+            layer_count == 0 || page_tokens != GGML_CUDA_KV_STREAM_PAGE_TOKENS) {
         return nullptr;
     }
 
@@ -743,6 +745,7 @@ bool ggml_cuda_kv_stream_resident_cache_mark_dirty_rows(
 
     cache->mutable_pages.clear();
     cache->all_pages_mutable = false;
+    cache->relearn_layers = true;
     if (count == 0) {
         cache->dirty_rows.clear();
     } else {
@@ -885,10 +888,8 @@ static bool kv_stream_page_mutable(
 
 namespace {
 
-constexpr int KV_STREAM_HEAD_DIM = 256;
 constexpr int KV_STREAM_MAX_PARTS_PER_CHUNK = 16;
 constexpr int KV_STREAM_QUERY_WORKSPACE_TOKENS = 256;
-constexpr int64_t KV_STREAM_MAX_DECODE_QUERY_TOKENS = 32;
 
 static int kv_stream_parts_per_chunk() {
     static const int parts = []() {
@@ -998,25 +999,25 @@ static kv_stream_native_partial_fn kv_stream_resolve_native_partial_for_v(ggml_t
     switch (type_v) {
         case GGML_TYPE_F16:
             return &ggml_cuda_flash_attn_ext_vec_partial_case<
-                KV_STREAM_HEAD_DIM, type_K, GGML_TYPE_F16>;
+                GGML_CUDA_KV_STREAM_HEAD_DIM, type_K, GGML_TYPE_F16>;
         case GGML_TYPE_Q4_0:
             return &ggml_cuda_flash_attn_ext_vec_partial_case<
-                KV_STREAM_HEAD_DIM, type_K, GGML_TYPE_Q4_0>;
+                GGML_CUDA_KV_STREAM_HEAD_DIM, type_K, GGML_TYPE_Q4_0>;
         case GGML_TYPE_Q4_1:
             return &ggml_cuda_flash_attn_ext_vec_partial_case<
-                KV_STREAM_HEAD_DIM, type_K, GGML_TYPE_Q4_1>;
+                GGML_CUDA_KV_STREAM_HEAD_DIM, type_K, GGML_TYPE_Q4_1>;
         case GGML_TYPE_Q5_0:
             return &ggml_cuda_flash_attn_ext_vec_partial_case<
-                KV_STREAM_HEAD_DIM, type_K, GGML_TYPE_Q5_0>;
+                GGML_CUDA_KV_STREAM_HEAD_DIM, type_K, GGML_TYPE_Q5_0>;
         case GGML_TYPE_Q5_1:
             return &ggml_cuda_flash_attn_ext_vec_partial_case<
-                KV_STREAM_HEAD_DIM, type_K, GGML_TYPE_Q5_1>;
+                GGML_CUDA_KV_STREAM_HEAD_DIM, type_K, GGML_TYPE_Q5_1>;
         case GGML_TYPE_Q8_0:
             return &ggml_cuda_flash_attn_ext_vec_partial_case<
-                KV_STREAM_HEAD_DIM, type_K, GGML_TYPE_Q8_0>;
+                GGML_CUDA_KV_STREAM_HEAD_DIM, type_K, GGML_TYPE_Q8_0>;
         case GGML_TYPE_BF16:
             return &ggml_cuda_flash_attn_ext_vec_partial_case<
-                KV_STREAM_HEAD_DIM, type_K, GGML_TYPE_BF16>;
+                GGML_CUDA_KV_STREAM_HEAD_DIM, type_K, GGML_TYPE_BF16>;
         default:
             return nullptr;
     }
@@ -1255,7 +1256,7 @@ bool ggml_cuda_flash_attn_ext_streamed_supported(const ggml_tensor * dst, size_t
     return Q != nullptr && K != nullptr && V != nullptr &&
         Q->type == GGML_TYPE_F32 &&
         ggml_backend_cuda_kv_stream_get_attention_mode(K->type, V->type) != GGML_BACKEND_CUDA_KV_STREAM_ATTENTION_UNSUPPORTED &&
-        Q->ne[0] == KV_STREAM_HEAD_DIM && V->ne[0] == KV_STREAM_HEAD_DIM &&
+        Q->ne[0] == GGML_CUDA_KV_STREAM_HEAD_DIM && V->ne[0] == GGML_CUDA_KV_STREAM_HEAD_DIM &&
         Q->ne[1] >= 1 && Q->ne[3] == 1 && K->ne[3] == 1 && V->ne[3] == 1 &&
         K->ne[1] == V->ne[1] && K->ne[2] == V->ne[2] &&
         K->ne[1] % FATTN_KQ_STRIDE == 0 &&
@@ -1660,16 +1661,19 @@ bool ggml_cuda_kv_stream_graph_add_attention(
     if (ring->graph_resident_cache != nullptr && ring->graph_resident_cache != resident_cache) {
         return false;
     }
-    const bool decode_shaped = dst->src[0]->ne[1] <= KV_STREAM_MAX_DECODE_QUERY_TOKENS;
+    const bool decode_shaped = dst->src[0]->ne[1] <= GGML_CUDA_KV_STREAM_MAX_DECODE_QUERY_TOKENS;
     ring->graph_decode = ring->graph_decode && decode_shaped;
     if (!decode_shaped) {
         // Graphs are rebuilt across warmup, prompt chunks, and slot reuse.
-        // Relearn pointer-to-layer identity once per prefill graph while the
+        // Relearn pointer-to-layer identity once per prefill ubatch while the
         // resident page contents are refreshed by the local multi-token path.
         if (ring->graph_resident_cache == nullptr) {
-            resident_cache->layer_by_k.clear();
-            resident_cache->layer_by_data.clear();
-            resident_cache->next_layer = 0;
+            if (resident_cache->relearn_layers) {
+                resident_cache->layer_by_k.clear();
+                resident_cache->layer_by_data.clear();
+                resident_cache->next_layer = 0;
+                resident_cache->relearn_layers = false;
+            }
             ring->graph_resident_cache = resident_cache;
         }
         const uint32_t resident_layer = kv_stream_resident_layer(resident_cache, K->data);
@@ -1819,7 +1823,7 @@ void ggml_cuda_flash_attn_ext_streamed(
         resident_cache->page_tokens : kv_stream_block_tokens(dst, stage_bytes);
     const int nchunks = (K->ne[1] + block_tokens - 1)/block_tokens;
     const int nrows = ggml_nrows(dst);
-    const uint32_t maximum_streamed_span_pages = Q->ne[1] <= KV_STREAM_MAX_DECODE_QUERY_TOKENS ?
+    const uint32_t maximum_streamed_span_pages = Q->ne[1] <= GGML_CUDA_KV_STREAM_MAX_DECODE_QUERY_TOKENS ?
         transfer_ring->graph_decode_span_pages : UINT32_MAX;
 
     struct chunk_descriptor {
@@ -1924,7 +1928,7 @@ void ggml_cuda_flash_attn_ext_streamed(
                     ++resident_cache->stats.resident_hits;
                     desc.upload = resident_cache->precise_dirty_tracking[resident_layer] ?
                         resident_cache->dirty[resident_index] :
-                        (dst->src[0]->ne[1] > KV_STREAM_MAX_DECODE_QUERY_TOKENS || chunk == nchunks - 1);
+                        (dst->src[0]->ne[1] > GGML_CUDA_KV_STREAM_MAX_DECODE_QUERY_TOKENS || chunk == nchunks - 1);
                     desc.resident_refresh = desc.upload;
                 } else {
                     ++resident_cache->stats.resident_misses;
@@ -1961,7 +1965,8 @@ void ggml_cuda_flash_attn_ext_streamed(
         }
     }
     const bool use_mma_prefill = !convert_to_f16 &&
-        Q->ne[1] > KV_STREAM_MAX_DECODE_QUERY_TOKENS && Q->ne[0] == 256 && V->ne[0] == 256 &&
+        Q->ne[1] > GGML_CUDA_KV_STREAM_MAX_DECODE_QUERY_TOKENS &&
+        Q->ne[0] == GGML_CUDA_KV_STREAM_HEAD_DIM && V->ne[0] == GGML_CUDA_KV_STREAM_HEAD_DIM &&
         mask != nullptr && Q->ne[2] % K->ne[2] == 0 && Q->ne[2]/K->ne[2] <= 8 &&
         ggml_cuda_get_best_fattn_kernel(ctx.device, dst) == BEST_FATTN_KERNEL_MMA_F16;
     const int partial_count = use_mma_prefill ? 1 : kv_stream_parts_per_chunk();
@@ -2297,15 +2302,16 @@ void ggml_cuda_flash_attn_ext_streamed(
             query_dst.src[3] = query_mask_ptr;
 
             if (use_mma_prefill) {
-                ggml_cuda_flash_attn_ext_mma_f16_partial_case<256, 256, 8, 8>(
-                    ctx, &query_dst, parts.ptr, meta.ptr);
+                ggml_cuda_flash_attn_ext_mma_f16_partial_case<
+                    GGML_CUDA_KV_STREAM_HEAD_DIM, GGML_CUDA_KV_STREAM_HEAD_DIM, 8, 8>(
+                        ctx, &query_dst, parts.ptr, meta.ptr);
                 if (resident_cache != nullptr) {
                     ++resident_cache->stats.mma_prefill_attention_spans;
                 }
             } else {
                 if (convert_to_f16) {
                     ggml_cuda_flash_attn_ext_vec_partial_case<
-                        KV_STREAM_HEAD_DIM, GGML_TYPE_F16, GGML_TYPE_F16>(
+                        GGML_CUDA_KV_STREAM_HEAD_DIM, GGML_TYPE_F16, GGML_TYPE_F16>(
                             ctx, &query_dst, parts.ptr, meta.ptr, partial_count);
                 } else {
 #ifdef GGML_CUDA_FA_ALL_QUANTS
@@ -2320,10 +2326,10 @@ void ggml_cuda_flash_attn_ext_streamed(
             const int tile_nrows = int(query_count*rows_per_query);
             const size_t row_offset = size_t(query_begin*rows_per_query);
             const dim3 blocks(tile_nrows, 1, 1);
-            const dim3 threads(KV_STREAM_HEAD_DIM, 1, 1);
+            const dim3 threads(GGML_CUDA_KV_STREAM_HEAD_DIM, 1, 1);
             const ggml_cuda_kernel_launch_params launch_params(blocks, threads, 0, ctx.stream());
             ggml_cuda_kernel_launch(
-                kv_stream_accumulate_chunk_results<KV_STREAM_HEAD_DIM>, launch_params,
+                kv_stream_accumulate_chunk_results<GGML_CUDA_KV_STREAM_HEAD_DIM>, launch_params,
                 parts.ptr, meta.ptr, accumulator.ptr + row_offset*dst->ne[0],
                 accumulator_meta.ptr + row_offset, tile_nrows, first_chunk, partial_count);
             CUDA_CHECK(cudaGetLastError());
@@ -2356,9 +2362,9 @@ void ggml_cuda_flash_attn_ext_streamed(
     GGML_ASSERT(!first_chunk);
 
     const dim3 blocks(nrows, 1, 1);
-    const dim3 threads(KV_STREAM_HEAD_DIM, 1, 1);
+    const dim3 threads(GGML_CUDA_KV_STREAM_HEAD_DIM, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params(blocks, threads, 0, ctx.stream());
-    ggml_cuda_kernel_launch(kv_stream_normalize_chunk_results<KV_STREAM_HEAD_DIM>, launch_params,
+    ggml_cuda_kernel_launch(kv_stream_normalize_chunk_results<GGML_CUDA_KV_STREAM_HEAD_DIM>, launch_params,
         accumulator.ptr, accumulator_meta.ptr, static_cast<float *>(dst->data), nrows);
     CUDA_CHECK(cudaGetLastError());
 }

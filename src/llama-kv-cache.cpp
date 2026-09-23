@@ -1553,6 +1553,7 @@ ggml_backend_buffer_type_t llama_kv_cache::kv_stream_init_runtime(
     using decode_layout_fn_t = kv_stream_runtime_owner::decode_layout_fn_t;
     using mark_dirty_rows_fn_t = kv_stream_runtime_owner::mark_dirty_rows_fn_t;
     using set_live_pages_fn_t = kv_stream_runtime_owner::set_live_pages_fn_t;
+    using cpu_attn_supported_fn_t = kv_stream_runtime_owner::cpu_attn_supported_fn_t;
 
     auto * type_pair_supported_fn = (type_pair_supported_fn_t) ggml_backend_reg_get_proc_address(
         reg, "ggml_backend_cuda_kv_stream_type_pair_supported");
@@ -1580,6 +1581,9 @@ ggml_backend_buffer_type_t llama_kv_cache::kv_stream_init_runtime(
         reg, "ggml_backend_cuda_kv_stream_mark_dirty_rows");
     auto * set_live_pages_fn = (set_live_pages_fn_t) ggml_backend_reg_get_proc_address(
         reg, "ggml_backend_cuda_kv_stream_set_live_pages");
+    // TODO: reject --kv-stream-cpu-threads here once the CPU share reaches fattn
+    auto * cpu_attn_supported_fn = (cpu_attn_supported_fn_t) ggml_backend_reg_get_proc_address(
+        reg, "ggml_backend_cuda_kv_stream_cpu_attn_supported");
 
     if (type_pair_supported_fn == nullptr || page_bytes_fn == nullptr ||
             workspace_bytes_fn == nullptr || runtime_new_fn == nullptr ||
@@ -1622,6 +1626,7 @@ ggml_backend_buffer_type_t llama_kv_cache::kv_stream_init_runtime(
     kv_stream_runtime.decode_layout_fn = decode_layout_fn;
     kv_stream_runtime.mark_dirty_rows_fn = mark_dirty_rows_fn;
     kv_stream_runtime.set_live_pages_fn = set_live_pages_fn;
+    kv_stream_runtime.cpu_attn_supported_fn = cpu_attn_supported_fn;
     kv_stream_runtime.layer_count = layer_count;
     if (kv_stream_runtime.runtime == nullptr) {
         throw std::runtime_error("failed to create CUDA block KV streaming runtime");

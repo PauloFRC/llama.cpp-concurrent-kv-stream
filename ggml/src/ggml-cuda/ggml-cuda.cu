@@ -1785,6 +1785,17 @@ bool ggml_backend_cuda_kv_stream_set_live_pages(
     return true;
 }
 
+bool ggml_backend_cuda_kv_stream_set_cpu_split(
+        ggml_backend_cuda_kv_stream_runtime_t runtime,
+        uint32_t n_threads, uint32_t n_head, uint32_t context_pages) {
+    if (runtime == nullptr) {
+        return false;
+    }
+    ggml_cuda_set_device(runtime->device);
+    return ggml_cuda_kv_stream_transfer_ring_set_cpu_split(
+        runtime->transfer_ring, n_threads, n_head, context_pages);
+}
+
 ggml_backend_cuda_kv_stream_stats ggml_backend_cuda_kv_stream_get_stats(
         ggml_backend_cuda_kv_stream_runtime_t runtime) {
     if (runtime == nullptr) {
@@ -6656,6 +6667,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
         return (void *) +[](void * runtime, const uint8_t * live_pages, size_t count) -> bool {
             return ggml_backend_cuda_kv_stream_set_live_pages(
                 static_cast<ggml_backend_cuda_kv_stream_runtime_t>(runtime), live_pages, count);
+        };
+    }
+    if (strcmp(name, "ggml_backend_cuda_kv_stream_set_cpu_split") == 0) {
+        return (void *) +[](void * runtime, uint32_t n_threads, uint32_t n_head, uint32_t context_pages) -> bool {
+            return ggml_backend_cuda_kv_stream_set_cpu_split(
+                static_cast<ggml_backend_cuda_kv_stream_runtime_t>(runtime), n_threads, n_head, context_pages);
         };
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {

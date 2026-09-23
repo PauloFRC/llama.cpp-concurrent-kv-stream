@@ -709,13 +709,22 @@ int main() {
     });
 
     t.test("cpu split scope is q8_0 K, q4_0 V decode at head dim 256", [](testing & t) {
-        ggml_init_params params{ggml_tensor_overhead()*32, nullptr, true};
+        ggml_init_params params{ggml_tensor_overhead()*128, nullptr, true};
         ggml_context_ptr ctx(ggml_init(params));
-        auto attention = [&](int64_t head_dim, int64_t n_tokens, int64_t n_seq, ggml_type type_k, ggml_type type_v) {
-            ggml_tensor * q = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, head_dim, n_tokens, N_Q_HEAD, n_seq);
+        auto attention = [&](int64_t head_dim, int64_t n_tokens, int64_t n_seq, ggml_type type_k, ggml_type type_v,
+                int64_t mask_heads = 1, bool with_mask = true, int64_t q_token_stride = 1) {
+            // Q as llama builds it: [head_dim, n_head, n_tokens] permuted, a token stride above 1 leaves gaps
+            const size_t token_bytes = head_dim*N_Q_HEAD*sizeof(float);
+            ggml_tensor * q = ggml_view_4d(ctx.get(),
+                ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, head_dim, N_Q_HEAD, n_tokens*q_token_stride, n_seq),
+                head_dim, N_Q_HEAD, n_tokens, n_seq, head_dim*sizeof(float),
+                token_bytes*q_token_stride, token_bytes*n_tokens*q_token_stride, 0);
+            q = ggml_permute(ctx.get(), q, 0, 2, 1, 3);
             ggml_tensor * k = ggml_new_tensor_4d(ctx.get(), type_k, head_dim, 512, N_KV_HEAD, n_seq);
             ggml_tensor * v = ggml_new_tensor_4d(ctx.get(), type_v, head_dim, 512, N_KV_HEAD, n_seq);
-            return *ggml_flash_attn_ext(ctx.get(), q, k, v, nullptr, 0.0625f, 0.0f, 0.0f);
+            ggml_tensor * mask = with_mask ?
+                ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F16, 512, n_tokens, mask_heads, n_seq) : nullptr;
+            return *ggml_flash_attn_ext(ctx.get(), q, k, v, mask, 0.0625f, 0.0f, 0.0f);
         };
         constexpr int64_t n_decode = GGML_CUDA_KV_STREAM_MAX_DECODE_QUERY_TOKENS;
 
@@ -738,6 +747,13 @@ int main() {
         ggml_tensor softcap = decode;
         ggml_set_op_params_f32(&softcap, 2, 30.0f);
         t.assert_true("not a logit_softcap", !ggml_cuda_kv_stream_cpu_split_supported(&softcap));
+
+        ggml_tensor no_mask = attention(HEAD_DIM, 1, 1, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 1, false);
+        t.assert_true("not without a mask", !ggml_cuda_kv_stream_cpu_split_supported(&no_mask));
+        ggml_tensor head_mask = attention(HEAD_DIM, 1, 1, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, N_KV_HEAD);
+        t.assert_true("not a per-head mask", !ggml_cuda_kv_stream_cpu_split_supported(&head_mask));
+        ggml_tensor gapped_q = attention(HEAD_DIM, 3, 1, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 1, true, 3);
+        t.assert_true("not a Q with gaps between tokens", !ggml_cuda_kv_stream_cpu_split_supported(&gapped_q));
     });
 
     t.test("cpu attention kernel matches the scalar reference", [](testing & t) {
@@ -1962,7 +1978,58 @@ int main() {
         t.assert_true("chunk-pipelined logits remain equivalent", max_abs <= 3e-4f);
     });
 
+    t.test("cpu pages need the cpu split scratch", [](testing & t) {
+        constexpr int64_t n_kv = 41*256;
+        constexpr int64_t n_batch = 1;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        const size_t page_bytes = query_page_bytes(backend.get(), GGML_TYPE_Q8_0, GGML_TYPE_Q4_0);
+        ggml_backend_cuda_kv_stream_params params{};
+        params.device               = 0;
+        params.stage_bytes          = page_bytes;
+        params.stage_slots          = 40;
+        params.pool_bytes           = 41*page_bytes;
+        params.resident_layer_count = 1;
+        params.page_tokens          = PAGE_TOKENS;
+        params.decode_span_pages    = 32;
+        auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+        if (!t.assert_true("runtime initializes", runtime != nullptr)) {
+            return;
+        }
+
+        t.assert_true("a null runtime is rejected", !ggml_backend_cuda_kv_stream_set_cpu_split(nullptr, 1, N_Q_HEAD, 41));
+        t.assert_true("zero threads are rejected", !ggml_backend_cuda_kv_stream_set_cpu_split(runtime, 0, N_Q_HEAD, 41));
+        t.assert_true("zero heads are rejected", !ggml_backend_cuda_kv_stream_set_cpu_split(runtime, 1, 0, 41));
+        t.assert_true("zero context pages are rejected", !ggml_backend_cuda_kv_stream_set_cpu_split(runtime, 1, N_Q_HEAD, 0));
+
+        const attention_inputs inputs = make_inputs(n_kv, n_batch, n_kv);
+        const std::vector<float> expected = run_attention(
+            backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()),
+            n_kv, n_batch);
+        common_set_env("GGML_CUDA_KV_STREAM_CPU_PAGES", "8");
+        const std::vector<float> actual = run_attention(
+            backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime),
+            n_kv, n_batch);
+        common_set_env("GGML_CUDA_KV_STREAM_CPU_PAGES", "");
+        const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
+        ggml_backend_cuda_kv_stream_runtime_free(runtime);
+
+        t.assert_equal(uint64_t(0), stats.cpu_pages);
+        t.assert_equal(uint64_t(40), stats.streamed_pages);
+        if (!t.assert_equal(expected.size(), actual.size())) {
+            return;
+        }
+        t.assert_true("every page stays on the GPU", max_abs_error(expected, actual) <= 1e-6f);
+    });
+
     t.test("cpu pages leave streamed attention and keep the page partition", [](testing & t) {
+        if (!ggml_cuda_kv_stream_cpu_attn_supported()) {
+            t.skip("CPU attention needs AVX-512 F, DQ, VNNI, F16C and FMA");
+            return;
+        }
         constexpr int64_t n_kv = 41*256;
         constexpr int64_t n_batch = 1;
         ggml_backend_ptr backend(ggml_backend_cuda_init(0));
@@ -2008,6 +2075,8 @@ int main() {
             if (!t.assert_true("cpu split runtime initializes", runtime != nullptr)) {
                 return;
             }
+            t.assert_true("cpu split scratch allocates",
+                ggml_backend_cuda_kv_stream_set_cpu_split(runtime, 1, N_Q_HEAD, 41));
             std::vector<uint8_t> live(41, 1);
             live[40] = tc.last_page_live;
             t.assert_true("live pages accepted",
@@ -2032,6 +2101,47 @@ int main() {
             std::fprintf(stderr, "%s: max_abs=%g\n", tc.name, max_abs);
             t.assert_true(std::string(tc.name) + ": gpu output excludes cpu pages", is_finite(actual) && max_abs <= 1e-6f);
         }
+    });
+
+    t.test("cpu pages stay with the layers of the first mask", [](testing & t) {
+        if (!ggml_cuda_kv_stream_cpu_attn_supported()) {
+            t.skip("CPU attention needs AVX-512 F, DQ, VNNI, F16C and FMA");
+            return;
+        }
+        constexpr int64_t n_kv = 8*256;
+        constexpr int64_t n_batch = 1;
+        constexpr int repeats = 2;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        const size_t page_bytes = query_page_bytes(backend.get(), GGML_TYPE_Q8_0, GGML_TYPE_Q4_0);
+        ggml_backend_cuda_kv_stream_params params{};
+        params.device               = 0;
+        params.stage_bytes          = page_bytes;
+        params.stage_slots          = 8;
+        params.pool_bytes           = 11*page_bytes;
+        params.resident_layer_count = 3;
+        params.page_tokens          = PAGE_TOKENS;
+        auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+        if (!t.assert_true("runtime initializes", runtime != nullptr)) {
+            return;
+        }
+        t.assert_true("cpu split scratch allocates", ggml_backend_cuda_kv_stream_set_cpu_split(runtime, 1, N_Q_HEAD, 8));
+
+        // run_attention_layers gives every layer its own mask tensor
+        const std::vector<attention_inputs> inputs(3, make_inputs(n_kv, n_batch, n_kv));
+        common_set_env("GGML_CUDA_KV_STREAM_CPU_PAGES", "2");
+        run_attention_layers(
+            backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime), n_kv, n_batch, repeats);
+        common_set_env("GGML_CUDA_KV_STREAM_CPU_PAGES", "");
+        const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
+        ggml_backend_cuda_kv_stream_runtime_free(runtime);
+
+        t.assert_equal(uint64_t(2*repeats), stats.cpu_pages);
+        t.assert_equal(uint64_t(8*3*repeats), stats.resident_pages_attended + stats.skipped_pages +
+            stats.streamed_pages_attended + stats.cpu_pages);
     });
 
     t.test("layer identity survives a prefill ubatch split across graphs", [](testing & t) {

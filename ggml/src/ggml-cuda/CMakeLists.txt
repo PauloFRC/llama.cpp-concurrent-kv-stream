@@ -103,6 +103,13 @@ if (CUDAToolkit_FOUND)
     list(APPEND GGML_HEADERS_CUDA "../../include/ggml-cuda.h")
 
     file(GLOB   GGML_SOURCES_CUDA "*.cu")
+    list(APPEND GGML_SOURCES_CUDA kv-stream-cpu-attn.cpp)
+    if (CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$" AND NOT MSVC)
+        # requires AVX-512
+        set_source_files_properties(kv-stream-cpu-attn.cpp PROPERTIES
+            COMPILE_OPTIONS "-mavx512f;-mavx512dq;-mavx512vnni;-mf16c;-mfma"
+            COMPILE_DEFINITIONS GGML_CUDA_KV_STREAM_CPU_ATTN_AVX512)
+    endif()
     file(GLOB   SRCS "template-instances/fattn-tile*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/fattn-mma*.cu")

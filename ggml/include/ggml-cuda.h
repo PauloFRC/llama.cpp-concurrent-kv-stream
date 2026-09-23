@@ -91,6 +91,7 @@ struct ggml_backend_cuda_kv_stream_stats {
     uint32_t ring_peak_occupancy;
     uint64_t staged_set_rows;
     uint64_t staged_set_rows_bytes;
+    uint64_t cpu_pages;
 };
 
 GGML_BACKEND_API ggml_backend_cuda_kv_stream_runtime_t ggml_backend_cuda_kv_stream_runtime_new(

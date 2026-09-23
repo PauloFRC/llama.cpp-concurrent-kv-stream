@@ -5,6 +5,7 @@
 #include "../ggml/src/ggml-impl.h"
 #include "../ggml/src/ggml-cuda/kv-stream-span-tuner.h"
 #include "../ggml/src/ggml-cuda/kv-stream-cpu-attn.h"
+#include "../ggml/src/ggml-cuda/kv-stream-cpu-pages.h"
 #include "../ggml/src/ggml-cuda/kv-stream-geometry.h"
 #include "ggml.h"
 #include "testing.h"
@@ -684,6 +685,58 @@ int main() {
 
         tuner.observe(1.0, /* streamed = */ true, /* greedy = */ true);
         t.assert_true("selection remains stable until layout reset", !tuner.use_greedy_batch());
+    });
+
+    t.test("cpu page selection takes the highest immutable streamed pages", [](testing & t) {
+        using pages = std::vector<uint32_t>;
+        const std::vector<uint8_t> all_live;
+        const pages no_mutable;
+
+        t.assert_true("the last page stays on the GPU",
+            ggml_cuda_kv_stream_select_cpu_pages(8, 2, all_live, no_mutable, false, 1) == pages{6});
+        t.assert_true("a one-page layer gets no CPU pages",
+            ggml_cuda_kv_stream_select_cpu_pages(1, 0, all_live, no_mutable, false, 4).empty());
+
+        std::vector<uint8_t> live(10, 1);
+        live[5] = 0;
+        t.assert_true("an oversized request clamps to non-resident, live, immutable pages",
+            ggml_cuda_kv_stream_select_cpu_pages(10, 3, live, pages{7}, false, 100) == pages{3, 4, 6, 8});
+        t.assert_true("a restore step gets no CPU pages",
+            ggml_cuda_kv_stream_select_cpu_pages(10, 3, all_live, no_mutable, true, 5).empty());
+        t.assert_true("an interior mutable page is passed over",
+            ggml_cuda_kv_stream_select_cpu_pages(10, 2, all_live, pages{7}, false, 2) == pages{6, 8});
+    });
+
+    t.test("cpu split scope is q8_0 K, q4_0 V decode at head dim 256", [](testing & t) {
+        ggml_init_params params{ggml_tensor_overhead()*32, nullptr, true};
+        ggml_context_ptr ctx(ggml_init(params));
+        auto attention = [&](int64_t head_dim, int64_t n_tokens, int64_t n_seq, ggml_type type_k, ggml_type type_v) {
+            ggml_tensor * q = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, head_dim, n_tokens, N_Q_HEAD, n_seq);
+            ggml_tensor * k = ggml_new_tensor_4d(ctx.get(), type_k, head_dim, 512, N_KV_HEAD, n_seq);
+            ggml_tensor * v = ggml_new_tensor_4d(ctx.get(), type_v, head_dim, 512, N_KV_HEAD, n_seq);
+            return *ggml_flash_attn_ext(ctx.get(), q, k, v, nullptr, 0.0625f, 0.0f, 0.0f);
+        };
+        constexpr int64_t n_decode = GGML_CUDA_KV_STREAM_MAX_DECODE_QUERY_TOKENS;
+
+        ggml_tensor decode = attention(HEAD_DIM, n_decode, 1, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0);
+        t.assert_true("the widest decode batch", ggml_cuda_kv_stream_cpu_split_supported(&decode));
+        ggml_tensor prefill = attention(HEAD_DIM, n_decode + 1, 1, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0);
+        t.assert_true("not prefill", !ggml_cuda_kv_stream_cpu_split_supported(&prefill));
+        ggml_tensor f16_k = attention(HEAD_DIM, 1, 1, GGML_TYPE_F16, GGML_TYPE_Q4_0);
+        t.assert_true("not an f16 K", !ggml_cuda_kv_stream_cpu_split_supported(&f16_k));
+        ggml_tensor q8_v = attention(HEAD_DIM, 1, 1, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
+        t.assert_true("not a q8_0 V", !ggml_cuda_kv_stream_cpu_split_supported(&q8_v));
+        ggml_tensor small_head = attention(128, 1, 1, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0);
+        t.assert_true("not head dim 128", !ggml_cuda_kv_stream_cpu_split_supported(&small_head));
+        ggml_tensor two_seq = attention(HEAD_DIM, 1, 2, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0);
+        t.assert_true("not ne[3] == 2", !ggml_cuda_kv_stream_cpu_split_supported(&two_seq));
+
+        ggml_tensor alibi = decode;
+        ggml_set_op_params_f32(&alibi, 1, 8.0f);
+        t.assert_true("not a max_bias", !ggml_cuda_kv_stream_cpu_split_supported(&alibi));
+        ggml_tensor softcap = decode;
+        ggml_set_op_params_f32(&softcap, 2, 30.0f);
+        t.assert_true("not a logit_softcap", !ggml_cuda_kv_stream_cpu_split_supported(&softcap));
     });
 
     t.test("cpu attention kernel matches the scalar reference", [](testing & t) {
@@ -1897,6 +1950,9 @@ int main() {
         t.assert_equal(uint64_t(2), stats.deadline_samples);
         t.assert_true("chunk deadline misses cannot exceed samples",
             stats.deadline_misses <= stats.deadline_samples);
+        t.assert_equal(uint64_t(0), stats.cpu_pages);
+        t.assert_equal(uint64_t(41), stats.resident_pages_attended + stats.skipped_pages +
+            stats.streamed_pages_attended + stats.cpu_pages);
 
         if (!t.assert_equal(expected.size(), actual.size())) {
             return;

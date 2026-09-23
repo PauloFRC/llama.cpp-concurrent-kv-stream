@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ggml-backend.h"
+
 #include <cstddef>
 #include <cstdint>
 
@@ -27,8 +29,8 @@ struct ggml_cuda_kv_stream_cpu_attn_params {
 };
 
 // only _supported() is safe to call anywhere, the rest abort or trap without AVX-512
-bool ggml_cuda_kv_stream_cpu_attn_supported();
-void ggml_cuda_kv_stream_cpu_attn_init(float * out, float * out_meta, int nrows);
-void ggml_cuda_kv_stream_cpu_attn(const ggml_cuda_kv_stream_cpu_attn_params & params);
-void ggml_cuda_kv_stream_cpu_attn_fold(
+GGML_BACKEND_API bool ggml_cuda_kv_stream_cpu_attn_supported();
+GGML_BACKEND_API void ggml_cuda_kv_stream_cpu_attn_init(float * out, float * out_meta, int nrows);
+GGML_BACKEND_API void ggml_cuda_kv_stream_cpu_attn(const ggml_cuda_kv_stream_cpu_attn_params & params);
+GGML_BACKEND_API void ggml_cuda_kv_stream_cpu_attn_fold(
     float * acc, float * acc_meta, const float * part, const float * part_meta, int nrows);

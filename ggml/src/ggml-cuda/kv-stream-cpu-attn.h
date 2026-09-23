@@ -1,9 +1,13 @@
 #pragma once
 
 #include "ggml-backend.h"
+#include "kv-stream-geometry.h"
 
 #include <cstddef>
 #include <cstdint>
+
+// wdata bytes per (token, head) row
+constexpr size_t GGML_CUDA_KV_STREAM_CPU_ATTN_ROW_WSIZE = 2*GGML_CUDA_KV_STREAM_HEAD_DIM;
 
 struct ggml_cuda_kv_stream_cpu_attn_params {
     const uint8_t * k = nullptr;
@@ -24,8 +28,10 @@ struct ggml_cuda_kv_stream_cpu_attn_params {
     int n_head_kv = 0;
     int n_tokens = 0;           // at most GGML_CUDA_KV_STREAM_MAX_DECODE_QUERY_TOKENS
     float scale = 0.0f;
-    float * out = nullptr;      // row token*n_head + head, head dim floats, not normalized
+    float * out = nullptr;      // row token*n_head + head
     float * out_meta = nullptr;
+    void * wdata = nullptr;     // 64 byte aligned
+    size_t wsize = 0;
 };
 
 // only _supported() is safe to call anywhere, the rest abort or trap without AVX-512

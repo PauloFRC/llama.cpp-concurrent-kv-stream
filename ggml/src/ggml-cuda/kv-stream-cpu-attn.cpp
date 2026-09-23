@@ -16,8 +16,6 @@
 
 #include <immintrin.h>
 
-#include <vector>
-
 namespace {
 
 constexpr int D          = GGML_CUDA_KV_STREAM_HEAD_DIM;
@@ -79,21 +77,25 @@ struct q_vec {
     __m512i qu[NP];
     __m512  dq[NP];
 };
+static_assert(sizeof(q_vec) == GGML_CUDA_KV_STREAM_CPU_ATTN_ROW_WSIZE, "wdata row size must match q_vec");
 
 inline void quantize_q(const float * x, q_vec & qv) {
-    alignas(64) int8_t qs[D];
-    float d[NB];
-    for (int b = 0; b < NB; ++b) {
-        float amax = 0.0f;
-        for (int i = 0; i < QK8_0; ++i) { amax = std::max(amax, std::fabs(x[b*QK8_0 + i])); }
-        d[b] = amax/127.0f;
-        const float id = d[b] != 0.0f ? 1.0f/d[b] : 0.0f;
-        for (int i = 0; i < QK8_0; ++i) { qs[b*QK8_0 + i] = int8_t(std::lrintf(x[b*QK8_0 + i]*id)); }
-    }
     const __m512i off = _mm512_set1_epi8(int8_t(0x80));
     for (int j = 0; j < NP; ++j) {
-        qv.qu[j] = _mm512_xor_si512(_mm512_load_si512((const __m512i *)(qs + 2*QK8_0*j)), off);
-        qv.dq[j] = lane_pair(d[2*j], d[2*j + 1]);
+        float d[2];
+        __m128i qs[4];
+        for (int h = 0; h < 2; ++h) {
+            const __m512 a = _mm512_loadu_ps(x + (2*j + h)*QK8_0);
+            const __m512 b = _mm512_loadu_ps(x + (2*j + h)*QK8_0 + 16);
+            d[h] = _mm512_reduce_max_ps(_mm512_max_ps(_mm512_abs_ps(a), _mm512_abs_ps(b)))/127.0f;
+            const __m512 id = _mm512_set1_ps(d[h] != 0.0f ? 1.0f/d[h] : 0.0f);
+            qs[2*h]     = _mm512_cvtepi32_epi8(_mm512_cvtps_epi32(_mm512_mul_ps(a, id)));
+            qs[2*h + 1] = _mm512_cvtepi32_epi8(_mm512_cvtps_epi32(_mm512_mul_ps(b, id)));
+        }
+        const __m512i q = _mm512_inserti64x4(
+            _mm512_castsi256_si512(_mm256_set_m128i(qs[1], qs[0])), _mm256_set_m128i(qs[3], qs[2]), 1);
+        qv.qu[j] = _mm512_xor_si512(q, off);
+        qv.dq[j] = lane_pair(d[0], d[1]);
     }
 }
 
@@ -173,10 +175,11 @@ void ggml_cuda_kv_stream_cpu_attn(const ggml_cuda_kv_stream_cpu_attn_params & p)
     GGML_ASSERT(p.n_head > 0 && p.n_head_kv > 0 && p.n_head%p.n_head_kv == 0);
     GGML_ASSERT(p.page_tokens > 0 && p.page_tokens%TILE == 0);
     GGML_ASSERT(p.k && p.v && p.q && p.out && p.out_meta && (p.n_pages == 0 || p.pages));
+    GGML_ASSERT(p.wdata && uintptr_t(p.wdata)%64 == 0 && p.wsize >= size_t(p.n_tokens)*p.n_head*sizeof(q_vec));
 
     const int group = p.n_head/p.n_head_kv;
 
-    std::vector<q_vec> qv(size_t(p.n_tokens)*p.n_head);
+    q_vec * qv = (q_vec *) p.wdata;
     for (int t = 0; t < p.n_tokens; ++t) {
         for (int h = 0; h < p.n_head; ++h) {
             quantize_q((const float *)((const uint8_t *) p.q + size_t(t)*p.q_token_stride + size_t(h)*p.q_head_stride),
@@ -253,6 +256,10 @@ void ggml_cuda_kv_stream_cpu_attn(const ggml_cuda_kv_stream_cpu_attn_params & p)
 }
 
 #else
+
+#if defined(__GNUC__)
+#pragma GCC diagnostic ignored "-Wmissing-noreturn"
+#endif
 
 bool ggml_cuda_kv_stream_cpu_attn_supported() {
     return false;

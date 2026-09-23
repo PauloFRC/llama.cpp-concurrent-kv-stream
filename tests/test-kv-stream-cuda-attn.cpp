@@ -159,11 +159,18 @@ size_t query_conversion_bytes(ggml_backend_t backend, ggml_type type_k, ggml_typ
     return workspace_bytes;
 }
 
+struct alignas(64) cpu_attn_line { uint8_t bytes[64]; };
+
+std::vector<cpu_attn_line> cpu_attn_wdata(int n_tokens, int n_head) {
+    return std::vector<cpu_attn_line>((size_t(n_tokens)*n_head*GGML_CUDA_KV_STREAM_CPU_ATTN_ROW_WSIZE + 63)/64);
+}
+
 struct cpu_attn_case {
     attention_inputs inputs;
     std::vector<uint32_t> pages;
     std::vector<uint16_t> mask;
     std::vector<float> out, out_ref, meta, meta_ref;
+    std::vector<cpu_attn_line> wdata;
     int64_t n_batch = 0;
     int64_t n_head = N_Q_HEAD;
     int64_t n_head_kv = N_KV_HEAD;
@@ -186,6 +193,7 @@ struct cpu_attn_case {
         out_ref = out;
         meta.assign(size_t(rows())*2, 0.0f);
         meta_ref = meta;
+        wdata = cpu_attn_wdata(int(n_batch), int(n_head));
     }
 
     // visible(token, slot, cell) -> bias or -inf
@@ -208,7 +216,7 @@ struct cpu_attn_case {
         mask_width = size_t(n_kv);
     }
 
-    ggml_cuda_kv_stream_cpu_attn_params make(float * o, float * m, size_t slot_begin, size_t slot_end) const {
+    ggml_cuda_kv_stream_cpu_attn_params make(float * o, float * m, size_t slot_begin, size_t slot_end) {
         ggml_cuda_kv_stream_cpu_attn_params p;
         p.k = inputs.k.data();
         p.k_token_stride = ggml_row_size(inputs.type_k, HEAD_DIM)*N_KV_HEAD;
@@ -230,6 +238,8 @@ struct cpu_attn_case {
         p.scale = 1.0f/16.0f;
         p.out = o;
         p.out_meta = m;
+        p.wdata = wdata.data();
+        p.wsize = wdata.size()*sizeof(cpu_attn_line);
         return p;
     }
 };
@@ -678,7 +688,7 @@ int main() {
 
     t.test("cpu attention kernel matches the scalar reference", [](testing & t) {
         if (!ggml_cuda_kv_stream_cpu_attn_supported()) {
-            t.skip("CPU attention needs AVX-512 F, DQ and VNNI");
+            t.skip("CPU attention needs AVX-512 F, DQ, VNNI, F16C and FMA");
             return;
         }
         constexpr int64_t n_kv = 4*PAGE_TOKENS;
@@ -743,6 +753,7 @@ int main() {
         }
         std::mt19937 rng(20240914);
         auto pick = [&](uint32_t n) { return rng()%n; };
+        std::vector<cpu_attn_line> wdata = cpu_attn_wdata(GGML_CUDA_KV_STREAM_MAX_DECODE_QUERY_TOKENS, 4*8);
 
         for (int iter = 0; iter < 64; ++iter) {
             const int n_head_kv = 1 + int(pick(4));
@@ -789,6 +800,7 @@ int main() {
             p.mask = mask.data(); p.mask_token_stride = width*sizeof(uint16_t);
             p.pages = pages.data(); p.n_pages = n_pages; p.page_tokens = page_tokens;
             p.n_head = n_head; p.n_head_kv = n_head_kv; p.n_tokens = n_tokens; p.scale = scale;
+            p.wdata = wdata.data(); p.wsize = wdata.size()*sizeof(cpu_attn_line);
 
             const int rows = n_tokens*n_head;
             std::vector<float> out(size_t(rows)*HEAD_DIM), meta(size_t(rows)*2);
@@ -856,7 +868,7 @@ int main() {
 
     t.test("cpu attention kernel agrees with CUDA attention", [](testing & t) {
         if (!ggml_cuda_kv_stream_cpu_attn_supported()) {
-            t.skip("CPU attention needs AVX-512 F, DQ, VNNI and F16C");
+            t.skip("CPU attention needs AVX-512 F, DQ, VNNI, F16C and FMA");
             return;
         }
         ggml_backend_ptr backend(ggml_backend_cuda_init(0));

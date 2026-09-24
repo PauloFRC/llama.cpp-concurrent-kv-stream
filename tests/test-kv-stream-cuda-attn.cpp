@@ -22,8 +22,14 @@
 #include <cfloat>
 #include <mutex>
 #include <random>
+#include <string>
 #include <thread>
+#include <utility>
 #include <vector>
+
+#if defined(__linux__)
+#include <sched.h>
+#endif
 
 namespace {
 
@@ -48,6 +54,32 @@ bool is_finite(const std::vector<float> & values) {
     }
     return true;
 }
+
+struct log_capture {
+    std::string tag;
+    std::mutex mutex;
+    std::vector<std::string> lines;
+
+    explicit log_capture(std::string tag) : tag(std::move(tag)) {
+        ggml_log_set([](ggml_log_level, const char * text, void * user) {
+            auto * self = static_cast<log_capture *>(user);
+            std::fputs(text, stderr);
+            std::lock_guard<std::mutex> lock(self->mutex);
+            if (std::strstr(text, self->tag.c_str()) != nullptr) {
+                self->lines.emplace_back(text);
+            }
+        }, this);
+    }
+
+    ~log_capture() {
+        ggml_log_set(nullptr, nullptr);
+    }
+
+    std::vector<std::string> snapshot() {
+        std::lock_guard<std::mutex> lock(mutex);
+        return lines;
+    }
+};
 
 struct attention_inputs {
     ggml_type type_k = GGML_TYPE_Q8_0;
@@ -100,6 +132,18 @@ attention_inputs make_inputs(
         }
     }
     return result;
+}
+
+std::vector<attention_inputs> make_layer_inputs(int layers, int64_t n_kv, int64_t n_batch) {
+    std::vector<attention_inputs> inputs;
+    inputs.reserve(layers);
+    for (int layer = 0; layer < layers; ++layer) {
+        inputs.push_back(make_inputs(n_kv, n_batch, n_kv, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 0.5f*float(layer)));
+        for (float & x : inputs.back().q) {
+            x *= 1.0f + 0.5f*float(layer);
+        }
+    }
+    return inputs;
 }
 
 attention_inputs make_f16_reference(const attention_inputs & inputs, int64_t n_kv) {
@@ -164,6 +208,80 @@ size_t query_conversion_bytes(ggml_backend_t backend, ggml_type type_k, ggml_typ
     GGML_ASSERT(workspace_fn != nullptr && workspace_fn(
         type_k, type_v, HEAD_DIM, HEAD_DIM, N_KV_HEAD, PAGE_TOKENS, &workspace_bytes));
     return workspace_bytes;
+}
+
+ggml_backend_cuda_kv_stream_params make_stream_params(
+        ggml_backend_t backend,
+        size_t stage_slots,
+        size_t pool_pages,
+        int resident_layers,
+        int decode_span_pages = 0) {
+    const size_t page_bytes = query_page_bytes(backend, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0);
+    ggml_backend_cuda_kv_stream_params params{};
+    params.device               = 0;
+    params.stage_bytes          = page_bytes;
+    params.stage_slots          = stage_slots;
+    params.pool_bytes           = pool_pages*page_bytes;
+    params.resident_layer_count = resident_layers;
+    params.page_tokens          = PAGE_TOKENS;
+    params.decode_span_pages    = decode_span_pages;
+    return params;
+}
+
+struct kv_stream_runtime_deleter {
+    void operator()(ggml_backend_cuda_kv_stream_runtime_t runtime) const {
+        ggml_backend_cuda_kv_stream_runtime_free(runtime);
+    }
+};
+
+using kv_stream_runtime_ptr = std::unique_ptr<ggml_backend_cuda_kv_stream_runtime, kv_stream_runtime_deleter>;
+
+kv_stream_runtime_ptr make_runtime(const ggml_backend_cuda_kv_stream_params & params) {
+    return kv_stream_runtime_ptr(ggml_backend_cuda_kv_stream_runtime_new(params));
+}
+
+struct scoped_env {
+    std::vector<std::string> keys;
+
+    scoped_env(std::initializer_list<std::pair<const char *, std::string>> vars) {
+        for (const auto & [key, value] : vars) {
+            keys.emplace_back(key);
+            common_set_env(key, value.c_str());
+        }
+    }
+
+    ~scoped_env() {
+        for (const auto & key : keys) {
+            common_set_env(key.c_str(), "");
+        }
+    }
+
+    scoped_env(const scoped_env &) = delete;
+    scoped_env & operator=(const scoped_env &) = delete;
+};
+
+bool stats_equal_except_timing(const ggml_backend_cuda_kv_stream_stats & a, const ggml_backend_cuda_kv_stream_stats & b) {
+    return a.resident_hits == b.resident_hits &&
+           a.resident_misses == b.resident_misses &&
+           a.streamed_pages == b.streamed_pages &&
+           a.host_to_device_bytes == b.host_to_device_bytes &&
+           a.resident_attention_spans == b.resident_attention_spans &&
+           a.resident_pages_attended == b.resident_pages_attended &&
+           a.streamed_attention_spans == b.streamed_attention_spans &&
+           a.streamed_pages_attended == b.streamed_pages_attended &&
+           a.mma_prefill_attention_spans == b.mma_prefill_attention_spans &&
+           a.asynchronous_page_uploads == b.asynchronous_page_uploads &&
+           a.host_to_device_copy_commands == b.host_to_device_copy_commands &&
+           a.compute_stream_waits == b.compute_stream_waits &&
+           a.stage_slot_reuses == b.stage_slot_reuses &&
+           a.skipped_pages == b.skipped_pages &&
+           a.cross_layer_prefetches == b.cross_layer_prefetches &&
+           a.deadline_samples == b.deadline_samples &&
+           a.ring_peak_occupancy == b.ring_peak_occupancy &&
+           a.staged_set_rows == b.staged_set_rows &&
+           a.staged_set_rows_bytes == b.staged_set_rows_bytes &&
+           a.cpu_pages == b.cpu_pages &&
+           a.cpu_jobs == b.cpu_jobs;
 }
 
 struct alignas(64) cpu_attn_line { uint8_t bytes[64]; };
@@ -978,6 +1096,7 @@ int main() {
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
         t.assert_true("armed jobs wait for release", !pool.idle() && ran({}) && done.load() == 0);
+        t.assert_equal(depth, pool.queued());
 
         std::atomic<uint32_t> released{0};
         std::thread releaser([&] {
@@ -995,7 +1114,7 @@ int main() {
         releaser.join();
         t.assert_true("wait returns after release, with the flag at the job", waited);
         t.assert_true("released jobs run in arm order", ran({100, 101, 102, 103}));
-        t.assert_true("pool is idle after the last job", pool.idle());
+        t.assert_true("pool is idle after the last job", pool.idle() && pool.queued() == 0);
 
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -1015,6 +1134,48 @@ int main() {
             pool.wait(last);
         }
         t.assert_true("bursts run every job once per thread", ran(ids) && done.load() == last && pool.idle());
+    });
+
+    t.test("cpu pool pins each thread to its listed cpu", [](testing & t) {
+#if defined(__linux__)
+        cpu_set_t allowed;
+        CPU_ZERO(&allowed);
+        if (!t.assert_true("affinity query works", sched_getaffinity(0, sizeof(allowed), &allowed) == 0)) {
+            return;
+        }
+        std::vector<int> cpus;
+        for (int cpu = 0; cpu < CPU_SETSIZE && cpus.size() < 2; ++cpu) {
+            if (CPU_ISSET(cpu, &allowed)) {
+                cpus.push_back(cpu);
+            }
+        }
+        if (cpus.size() < 2) {
+            t.skip("needs two allowed CPUs");
+            return;
+        }
+        struct job {};
+        constexpr int n_threads = 3;
+        std::mutex mutex;
+        std::vector<std::pair<int, int>> seen;
+        ggml_cuda_kv_stream_cpu_pool<job> pool(n_threads, 2, [&](const job &, int thread, int) {
+            std::lock_guard<std::mutex> lock(mutex);
+            seen.emplace_back(thread, sched_getcpu());
+        }, nullptr, cpus);
+        uint32_t last = 0;
+        for (int i = 0; i < 8; ++i) {
+            last = pool.arm({});
+            pool.release();
+            pool.wait(last);
+        }
+        std::lock_guard<std::mutex> lock(mutex);
+        bool pinned = seen.size() == size_t(8*n_threads);
+        for (const auto & [thread, cpu] : seen) {
+            pinned = pinned && cpu == cpus[thread % cpus.size()];
+        }
+        t.assert_true("every run lands on the thread's cpu, cycling through the list", pinned);
+#else
+        t.skip("CPU pinning needs Linux");
+#endif
     });
 
     t.test("cpu attention kernel agrees with CUDA attention", [](testing & t) {
@@ -2067,36 +2228,29 @@ int main() {
             return;
         }
 
-        const size_t page_bytes = query_page_bytes(backend.get(), GGML_TYPE_Q8_0, GGML_TYPE_Q4_0);
-        ggml_backend_cuda_kv_stream_params params{};
-        params.device               = 0;
-        params.stage_bytes          = page_bytes;
-        params.stage_slots          = 40;
-        params.pool_bytes           = 41*page_bytes;
-        params.resident_layer_count = 1;
-        params.page_tokens          = PAGE_TOKENS;
-        params.decode_span_pages    = 32;
-        auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+        const auto params = make_stream_params(backend.get(), 40, 41, 1, 32);
+        auto runtime = make_runtime(params);
         if (!t.assert_true("runtime initializes", runtime != nullptr)) {
             return;
         }
 
         t.assert_true("a null runtime is rejected", !ggml_backend_cuda_kv_stream_set_cpu_split(nullptr, 1, N_Q_HEAD, 41));
-        t.assert_true("zero threads are rejected", !ggml_backend_cuda_kv_stream_set_cpu_split(runtime, 0, N_Q_HEAD, 41));
-        t.assert_true("zero heads are rejected", !ggml_backend_cuda_kv_stream_set_cpu_split(runtime, 1, 0, 41));
-        t.assert_true("zero context pages are rejected", !ggml_backend_cuda_kv_stream_set_cpu_split(runtime, 1, N_Q_HEAD, 0));
+        t.assert_true("zero threads are rejected", !ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 0, N_Q_HEAD, 41));
+        t.assert_true("zero heads are rejected", !ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 1, 0, 41));
+        t.assert_true("zero context pages are rejected", !ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 1, N_Q_HEAD, 0));
 
         const attention_inputs inputs = make_inputs(n_kv, n_batch, n_kv);
         const std::vector<float> expected = run_attention(
             backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()),
             n_kv, n_batch);
-        common_set_env("GGML_CUDA_KV_STREAM_CPU_PAGES", "8");
-        const std::vector<float> actual = run_attention(
-            backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime),
-            n_kv, n_batch);
-        common_set_env("GGML_CUDA_KV_STREAM_CPU_PAGES", "");
-        const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
-        ggml_backend_cuda_kv_stream_runtime_free(runtime);
+        std::vector<float> actual;
+        {
+            scoped_env env{{"GGML_CUDA_KV_STREAM_CPU_PAGES", "8"}};
+            actual = run_attention(
+                backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime.get()),
+                n_kv, n_batch);
+        }
+        const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime.get());
 
         t.assert_equal(uint64_t(0), stats.cpu_pages);
         t.assert_equal(uint64_t(0), stats.cpu_jobs);
@@ -2105,6 +2259,52 @@ int main() {
             return;
         }
         t.assert_true("every page stays on the GPU", max_abs_error(expected, actual) <= 1e-6f);
+    });
+
+    t.test("a cpu list outside the process affinity mask warns and runs unpinned", [](testing & t) {
+#if defined(__linux__)
+        if (!ggml_cuda_kv_stream_cpu_attn_supported()) {
+            t.skip("CPU attention needs AVX-512 F, DQ, VNNI, F16C and FMA");
+            return;
+        }
+        cpu_set_t allowed;
+        CPU_ZERO(&allowed);
+        if (!t.assert_true("affinity query works", sched_getaffinity(0, sizeof(allowed), &allowed) == 0)) {
+            return;
+        }
+        int outside = -1;
+        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+            if (!CPU_ISSET(cpu, &allowed)) {
+                outside = cpu;
+                break;
+            }
+        }
+        if (outside < 0) {
+            t.skip("every cpu is allowed");
+            return;
+        }
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+        const auto params = make_stream_params(backend.get(), 40, 41, 1, 32);
+        auto runtime = make_runtime(params);
+        if (!t.assert_true("runtime initializes", runtime != nullptr)) {
+            return;
+        }
+        bool allocated = false;
+        bool warned = false;
+        {
+            scoped_env env{{"GGML_CUDA_KV_STREAM_CPU_CPUS", std::to_string(outside)}};
+            log_capture log("outside the process affinity mask");
+            allocated = ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 2, N_Q_HEAD, 41);
+            warned = !log.snapshot().empty();
+        }
+        t.assert_true("the split is created anyway", allocated);
+        t.assert_true("one warning names the affinity mask", warned);
+#else
+        t.skip("CPU pinning needs Linux");
+#endif
     });
 
     t.test("cpu pages leave streamed attention and keep the page partition", [](testing & t) {
@@ -2119,15 +2319,7 @@ int main() {
             return;
         }
 
-        const size_t page_bytes = query_page_bytes(backend.get(), GGML_TYPE_Q8_0, GGML_TYPE_Q4_0);
-        ggml_backend_cuda_kv_stream_params params{};
-        params.device               = 0;
-        params.stage_bytes          = page_bytes;
-        params.stage_slots          = 40;
-        params.pool_bytes           = 41*page_bytes;
-        params.resident_layer_count = 1;
-        params.page_tokens          = PAGE_TOKENS;
-        params.decode_span_pages    = 32;
+        const auto params = make_stream_params(backend.get(), 40, 41, 1, 32);
 
         struct test_case {
             const char * name;
@@ -2143,37 +2335,42 @@ int main() {
             { "cpu tail",            "8",  true,  32, 40,  8, 32, 0 },
             { "whole streamed set",  "64", false,  1, 41, 39,  0, 1 },
         };
-        for (const char * join : {"stream", "block"}) {
-            for (const auto & tc : cases) {
-                const std::string name = std::string(tc.name) + ", " + join + " join";
-                const attention_inputs inputs = make_inputs(n_kv, n_batch, n_kv);
-                attention_inputs hidden = inputs;
-                for (int64_t token = tc.hidden_begin*PAGE_TOKENS; token < tc.hidden_end*PAGE_TOKENS; ++token) {
-                    hidden.mask[token] = ggml_fp32_to_fp16(-INFINITY);
-                }
-                const std::vector<float> expected = run_attention(
-                    backend.get(), hidden, ggml_backend_get_default_buffer_type(backend.get()),
-                    n_kv, n_batch);
+        for (const auto & tc : cases) {
+            const attention_inputs inputs = make_inputs(n_kv, n_batch, n_kv);
+            attention_inputs hidden = inputs;
+            for (int64_t token = tc.hidden_begin*PAGE_TOKENS; token < tc.hidden_end*PAGE_TOKENS; ++token) {
+                hidden.mask[token] = ggml_fp32_to_fp16(-INFINITY);
+            }
+            const std::vector<float> expected = run_attention(
+                backend.get(), hidden, ggml_backend_get_default_buffer_type(backend.get()),
+                n_kv, n_batch);
 
-                auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+            for (const char * join : {"stream", "block"}) {
+                const std::string name = std::string(tc.name) + ", " + join + " join";
+                auto runtime = make_runtime(params);
                 if (!t.assert_true("cpu split runtime initializes", runtime != nullptr)) {
                     return;
                 }
                 t.assert_true("cpu split scratch allocates",
-                    ggml_backend_cuda_kv_stream_set_cpu_split(runtime, 1, N_Q_HEAD, 41));
+                    ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 1, N_Q_HEAD, 41));
                 std::vector<uint8_t> live(41, 1);
                 live[40] = tc.last_page_live;
                 t.assert_true("live pages accepted",
-                    ggml_backend_cuda_kv_stream_set_live_pages(runtime, live.data(), live.size()));
-                common_set_env("GGML_CUDA_KV_STREAM_CPU_PAGES", tc.cpu_pages_env);
-                common_set_env("GGML_CUDA_KV_STREAM_CPU_JOIN", join);
-                const std::vector<float> actual = run_attention(
-                    backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime),
-                    n_kv, n_batch);
-                common_set_env("GGML_CUDA_KV_STREAM_CPU_PAGES", "");
-                common_set_env("GGML_CUDA_KV_STREAM_CPU_JOIN", "");
-                const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
-                ggml_backend_cuda_kv_stream_runtime_free(runtime);
+                    ggml_backend_cuda_kv_stream_set_live_pages(runtime.get(), live.data(), live.size()));
+
+                std::vector<float> actual;
+                {
+                    scoped_env env{
+                        {"GGML_CUDA_KV_STREAM_CPU_PAGES", tc.cpu_pages_env},
+                        {"GGML_CUDA_KV_STREAM_CPU_JOIN", join},
+                        // TODO: compare with full attention once Task D drops the spin body
+                        {"GGML_CUDA_KV_STREAM_CPU_BODY", "spin"},
+                    };
+                    actual = run_attention(
+                        backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime.get()),
+                        n_kv, n_batch);
+                }
+                const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime.get());
 
                 t.assert_equal(tc.cpu_pages, stats.cpu_pages);
                 t.assert_equal(uint64_t(1), stats.cpu_jobs);
@@ -2204,28 +2401,21 @@ int main() {
             return;
         }
 
-        const size_t page_bytes = query_page_bytes(backend.get(), GGML_TYPE_Q8_0, GGML_TYPE_Q4_0);
-        ggml_backend_cuda_kv_stream_params params{};
-        params.device               = 0;
-        params.stage_bytes          = page_bytes;
-        params.stage_slots          = 8;
-        params.pool_bytes           = 11*page_bytes;
-        params.resident_layer_count = 3;
-        params.page_tokens          = PAGE_TOKENS;
-        auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+        const auto params = make_stream_params(backend.get(), 8, 11, 3, 0);
+        auto runtime = make_runtime(params);
         if (!t.assert_true("runtime initializes", runtime != nullptr)) {
             return;
         }
-        t.assert_true("cpu split scratch allocates", ggml_backend_cuda_kv_stream_set_cpu_split(runtime, 1, N_Q_HEAD, 8));
+        t.assert_true("cpu split scratch allocates", ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 1, N_Q_HEAD, 8));
 
         // run_attention_layers gives every layer its own mask tensor
         const std::vector<attention_inputs> inputs(3, make_inputs(n_kv, n_batch, n_kv));
-        common_set_env("GGML_CUDA_KV_STREAM_CPU_PAGES", "2");
-        run_attention_layers(
-            backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime), n_kv, n_batch, repeats);
-        common_set_env("GGML_CUDA_KV_STREAM_CPU_PAGES", "");
-        const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
-        ggml_backend_cuda_kv_stream_runtime_free(runtime);
+        {
+            scoped_env env{{"GGML_CUDA_KV_STREAM_CPU_PAGES", "2"}};
+            run_attention_layers(
+                backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime.get()), n_kv, n_batch, repeats);
+        }
+        const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime.get());
 
         t.assert_equal(uint64_t(2*repeats), stats.cpu_pages);
         t.assert_equal(uint64_t(repeats), stats.cpu_jobs);
@@ -2247,22 +2437,8 @@ int main() {
             return;
         }
 
-        const size_t page_bytes = query_page_bytes(backend.get(), GGML_TYPE_Q8_0, GGML_TYPE_Q4_0);
-        ggml_backend_cuda_kv_stream_params params{};
-        params.device               = 0;
-        params.stage_bytes          = page_bytes;
-        params.stage_slots          = 8;
-        params.pool_bytes           = 11*page_bytes;
-        params.resident_layer_count = layers;
-        params.page_tokens          = PAGE_TOKENS;
-
-        std::vector<attention_inputs> inputs;
-        for (int layer = 0; layer < layers; ++layer) {
-            inputs.push_back(make_inputs(n_kv, n_batch, n_kv, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 0.5f*float(layer)));
-            for (float & x : inputs.back().q) {
-                x *= 1.0f + 0.5f*float(layer);
-            }
-        }
+        const auto params = make_stream_params(backend.get(), 8, 11, layers, 0);
+        const auto inputs = make_layer_inputs(layers, n_kv, n_batch);
         std::vector<attention_inputs> hidden = inputs;
         for (int64_t token = 5*PAGE_TOKENS; token < 7*PAGE_TOKENS; ++token) {
             hidden[0].mask[token] = ggml_fp32_to_fp16(-INFINITY);
@@ -2272,20 +2448,24 @@ int main() {
             1, 1, GGML_TYPE_I32, nullptr, 0, nullptr, false, true);
 
         for (const char * join : {"stream", "block"}) {
-            auto runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+            auto runtime = make_runtime(params);
             if (!t.assert_true("runtime initializes", runtime != nullptr)) {
                 return;
             }
-            t.assert_true("cpu split scratch allocates", ggml_backend_cuda_kv_stream_set_cpu_split(runtime, 2, N_Q_HEAD, 8));
-            common_set_env("GGML_CUDA_KV_STREAM_CPU_PAGES", "2");
-            common_set_env("GGML_CUDA_KV_STREAM_CPU_JOIN", join);
-            const std::vector<float> actual = run_attention_layers(
-                backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime), n_kv, n_batch,
-                repeats, 1, GGML_TYPE_I32, nullptr, 0, nullptr, false, true);
-            common_set_env("GGML_CUDA_KV_STREAM_CPU_PAGES", "");
-            common_set_env("GGML_CUDA_KV_STREAM_CPU_JOIN", "");
-            const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
-            ggml_backend_cuda_kv_stream_runtime_free(runtime);
+            t.assert_true("cpu split scratch allocates", ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 2, N_Q_HEAD, 8));
+            std::vector<float> actual;
+            {
+                scoped_env env{
+                    {"GGML_CUDA_KV_STREAM_CPU_PAGES", "2"},
+                    {"GGML_CUDA_KV_STREAM_CPU_JOIN", join},
+                    // TODO: compare with full attention once Task D drops the spin body
+                    {"GGML_CUDA_KV_STREAM_CPU_BODY", "spin"},
+                };
+                actual = run_attention_layers(
+                    backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime.get()), n_kv, n_batch,
+                    repeats, 1, GGML_TYPE_I32, nullptr, 0, nullptr, false, true);
+            }
+            const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime.get());
 
             const std::string name = std::string(join) + " join";
             t.assert_equal(uint64_t(2*layers*repeats), stats.cpu_pages);
@@ -2298,6 +2478,348 @@ int main() {
             const float max_abs = max_abs_error(expected, actual);
             std::fprintf(stderr, "%s: max_abs=%g\n", name.c_str(), max_abs);
             t.assert_true(name + ": every layer drops its cpu pages", is_finite(actual) && max_abs <= 1e-6f);
+        }
+    });
+
+    t.test("cpu kernel body folds every worker's pages into the part", [](testing & t) {
+        if (!ggml_cuda_kv_stream_cpu_attn_supported()) {
+            t.skip("CPU attention needs AVX-512 F, DQ, VNNI, F16C and FMA");
+            return;
+        }
+        constexpr int64_t n_kv = 41*256;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        const auto params = make_stream_params(backend.get(), 40, 41, 1, 32);
+
+        struct test_case {
+            const char * name;
+            const char * cpu_pages_env;
+            bool last_page_live;
+            uint64_t cpu_pages;
+        };
+        const test_case cases[] = {
+            { "cpu tail",           "8",  true,   8 },
+            { "whole streamed set", "64", false, 39 },
+        };
+        for (const int64_t n_batch : {1, 3}) {
+            const attention_inputs inputs = make_inputs(n_kv, n_batch, n_kv);
+            for (const auto & tc : cases) {
+                attention_inputs reference = inputs;
+                if (!tc.last_page_live) {
+                    for (int64_t batch = 0; batch < n_batch; ++batch) {
+                        for (int64_t token = 40*PAGE_TOKENS; token < n_kv; ++token) {
+                            reference.mask[batch*n_kv + token] = ggml_fp32_to_fp16(-INFINITY);
+                        }
+                    }
+                }
+                const std::vector<float> expected = run_attention(
+                    backend.get(), reference, ggml_backend_get_default_buffer_type(backend.get()),
+                    n_kv, n_batch);
+                for (const char * join : {"stream", "block"}) {
+                    for (const char * part : {"mapped", "copy"}) {
+                        const std::string name = std::string(tc.name) + ", " + std::to_string(n_batch) +
+                            " tokens, " + join + " join, " + part + " part";
+                        auto runtime = make_runtime(params);
+                        if (!t.assert_true("runtime initializes", runtime != nullptr)) {
+                            return;
+                        }
+                        t.assert_true("cpu split scratch allocates",
+                            ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 4, N_Q_HEAD, 41));
+                        std::vector<uint8_t> live(41, 1);
+                        live[40] = tc.last_page_live;
+                        t.assert_true("live pages accepted",
+                            ggml_backend_cuda_kv_stream_set_live_pages(runtime.get(), live.data(), live.size()));
+                        std::vector<float> actual;
+                        {
+                            scoped_env env{
+                                {"GGML_CUDA_KV_STREAM_CPU_PAGES", tc.cpu_pages_env},
+                                {"GGML_CUDA_KV_STREAM_CPU_JOIN", join},
+                                {"GGML_CUDA_KV_STREAM_CPU_PART", part},
+                            };
+                            actual = run_attention(
+                                backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime.get()),
+                                n_kv, n_batch);
+                        }
+                        const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime.get());
+
+                        t.assert_equal(tc.cpu_pages, stats.cpu_pages);
+                        if (!t.assert_equal(expected.size(), actual.size())) {
+                            return;
+                        }
+                        const float max_abs = max_abs_error(expected, actual);
+                        std::fprintf(stderr, "%s: max_abs=%g\n", name.c_str(), max_abs);
+                        t.assert_true(name + ": cpu pages are attended on the cpu",
+                            is_finite(actual) && max_abs <= 1e-5f);
+                    }
+                }
+            }
+        }
+    });
+
+    t.test("cpu kernel body keeps each layer's job apart across graphs", [](testing & t) {
+        if (!ggml_cuda_kv_stream_cpu_attn_supported()) {
+            t.skip("CPU attention needs AVX-512 F, DQ, VNNI, F16C and FMA");
+            return;
+        }
+        constexpr int64_t n_kv = 8*256;
+        constexpr int64_t n_batch = 1;
+        constexpr int layers = 3;
+        constexpr int repeats = 2;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        const auto params = make_stream_params(backend.get(), 8, 11, layers, 0);
+        const auto inputs = make_layer_inputs(layers, n_kv, n_batch);
+        const std::vector<float> expected = run_attention_layers(
+            backend.get(), inputs, ggml_backend_get_default_buffer_type(backend.get()), n_kv, n_batch,
+            1, 1, GGML_TYPE_I32, nullptr, 0, nullptr, false, true);
+
+        for (const char * join : {"stream", "block"}) {
+            auto runtime = make_runtime(params);
+            if (!t.assert_true("runtime initializes", runtime != nullptr)) {
+                return;
+            }
+            t.assert_true("cpu split scratch allocates", ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 3, N_Q_HEAD, 8));
+            std::vector<float> actual;
+            {
+                scoped_env env{
+                    {"GGML_CUDA_KV_STREAM_CPU_PAGES", "4"},
+                    {"GGML_CUDA_KV_STREAM_CPU_JOIN", join},
+                };
+                actual = run_attention_layers(
+                    backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime.get()), n_kv, n_batch,
+                    repeats, 1, GGML_TYPE_I32, nullptr, 0, nullptr, false, true);
+            }
+            const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime.get());
+
+            const std::string name = std::string(join) + " join";
+            t.assert_equal(uint64_t(4*layers*repeats), stats.cpu_pages);
+            t.assert_equal(uint64_t(layers*repeats), stats.cpu_jobs);
+            if (!t.assert_equal(expected.size(), actual.size())) {
+                return;
+            }
+            const float max_abs = max_abs_error(expected, actual);
+            std::fprintf(stderr, "%s: max_abs=%g\n", name.c_str(), max_abs);
+            t.assert_true(name + ": every layer attends its own cpu pages", is_finite(actual) && max_abs <= 1e-5f);
+        }
+    });
+
+    // TODO: drop the absolute page count case with the skeleton knobs
+    t.test("cpu share takes a rounded fraction of each layer's streamed pages, read per graph", [](testing & t) {
+        if (!ggml_cuda_kv_stream_cpu_attn_supported()) {
+            t.skip("CPU attention needs AVX-512 F, DQ, VNNI, F16C and FMA");
+            return;
+        }
+        constexpr int64_t n_kv = 41*256;
+        constexpr int64_t n_batch = 1;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        const auto params = make_stream_params(backend.get(), 40, 41, 1, 32);
+        auto runtime = make_runtime(params);
+        if (!t.assert_true("runtime initializes", runtime != nullptr)) {
+            return;
+        }
+        t.assert_true("cpu split scratch allocates", ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 2, N_Q_HEAD, 41));
+
+        struct step {
+            const char * share;
+            const char * pages;
+            uint64_t cpu_pages;
+        };
+        // 40 streamed pages, the last one included
+        const step steps[] = {
+            { "0.5",  "",           20 },
+            { "1",    "",           39 },
+            { "0.26", "",           10 },
+            { "0.5",  "3",           3 },
+            { "",     "-1",          0 },
+            { "",     "5000000000",  0 },
+            { "",     "12x",         0 },
+            { "0.5x", "",            0 },
+            { "",     "",            0 },
+        };
+        const attention_inputs inputs = make_inputs(n_kv, n_batch, n_kv);
+        uint64_t previous = 0;
+        for (const auto & s : steps) {
+            scoped_env env{
+                {"GGML_CUDA_KV_STREAM_CPU_SHARE", s.share},
+                {"GGML_CUDA_KV_STREAM_CPU_PAGES", s.pages},
+            };
+            run_attention(backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime.get()), n_kv, n_batch);
+            const uint64_t cpu_pages = ggml_backend_cuda_kv_stream_get_stats(runtime.get()).cpu_pages;
+            t.assert_equal(s.cpu_pages, cpu_pages - previous);
+            previous = cpu_pages;
+        }
+    });
+
+    t.test("a zero or unset cpu share leaves every counter and the output unchanged", [](testing & t) {
+        if (!ggml_cuda_kv_stream_cpu_attn_supported()) {
+            t.skip("CPU attention needs AVX-512 F, DQ, VNNI, F16C and FMA");
+            return;
+        }
+        constexpr int64_t n_kv = 41*256;
+        constexpr int64_t n_batch = 1;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        const auto params = make_stream_params(backend.get(), 40, 41, 1, 32);
+
+        struct run {
+            const char * name;
+            bool split;
+            const char * share;
+        };
+        const run runs[] = {
+            { "no split",    false, ""  },
+            { "share unset", true,  ""  },
+            { "share 0",     true,  "0" },
+        };
+        const attention_inputs inputs = make_inputs(n_kv, n_batch, n_kv);
+        std::vector<float> baseline;
+        ggml_backend_cuda_kv_stream_stats base{};
+        for (const auto & r : runs) {
+            auto runtime = make_runtime(params);
+            if (!t.assert_true("runtime initializes", runtime != nullptr)) {
+                return;
+            }
+            if (r.split) {
+                t.assert_true("cpu split scratch allocates",
+                    ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 2, N_Q_HEAD, 41));
+            }
+            std::vector<float> actual;
+            {
+                scoped_env env{{"GGML_CUDA_KV_STREAM_CPU_SHARE", r.share}};
+                actual = run_attention(
+                    backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime.get()), n_kv, n_batch);
+            }
+            const auto s = ggml_backend_cuda_kv_stream_get_stats(runtime.get());
+
+            t.assert_true(std::string(r.name) + ": deadline misses stay within samples",
+                s.deadline_misses <= s.deadline_samples);
+            if (baseline.empty()) {
+                baseline = actual;
+                base = s;
+                continue;
+            }
+            // deadline misses follow GPU timing
+            t.assert_true(std::string(r.name) + ": every counter matches no split",
+                stats_equal_except_timing(s, base));
+            t.assert_true(std::string(r.name) + ": output is bit-identical to no split",
+                actual.size() == baseline.size() &&
+                std::memcmp(actual.data(), baseline.data(), actual.size()*sizeof(float)) == 0);
+        }
+        t.assert_equal(uint64_t(0), base.cpu_pages);
+    });
+
+    // TODO: remove with the Task B skeleton counters
+    t.test("cpu split counters report each job, the queue and the layout per graph", [](testing & t) {
+        if (!ggml_cuda_kv_stream_cpu_attn_supported()) {
+            t.skip("CPU attention needs AVX-512 F, DQ, VNNI, F16C and FMA");
+            return;
+        }
+        constexpr int64_t n_kv = 8*256;
+        constexpr int64_t n_batch = 1;
+        constexpr int layers = 3;
+        constexpr int repeats = 3;
+        constexpr double spin_us = 20000.0;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        const auto params = make_stream_params(backend.get(), 8, 11, layers, 0);
+
+        // of the cpu pages, 5 and 6, the shared mask leaves only page 6 unbiased
+        std::vector<attention_inputs> inputs(layers, make_inputs(n_kv, n_batch, n_kv));
+        for (int64_t token = 6*PAGE_TOKENS; token < 7*PAGE_TOKENS; ++token) {
+            inputs[0].mask[token] = ggml_fp32_to_fp16(0.0f);
+        }
+        char bcpu[32];
+        std::snprintf(bcpu, sizeof(bcpu), "%.9g", 2.0*double(params.stage_bytes)/(spin_us*1e3));
+
+        for (const char * join : {"stream", "block"}) {
+            auto runtime = make_runtime(params);
+            if (!t.assert_true("runtime initializes", runtime != nullptr)) {
+                return;
+            }
+            t.assert_true("cpu split scratch allocates", ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 2, N_Q_HEAD, 8));
+            std::vector<std::string> lines;
+            {
+                scoped_env env{
+                    {"GGML_CUDA_KV_STREAM_CPU_PAGES", "2"},
+                    {"GGML_CUDA_KV_STREAM_CPU_JOIN", join},
+                    {"GGML_CUDA_KV_STREAM_CPU_BODY", "spin"},
+                    {"GGML_CUDA_KV_STREAM_CPU_BCPU", bcpu},
+                };
+                log_capture log("cpu ");
+                run_attention_layers(
+                    backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime.get()), n_kv, n_batch,
+                    repeats, 1, GGML_TYPE_I32, nullptr, 0, nullptr, false, true);
+                lines = log.snapshot();
+            }
+
+            const std::string name = std::string(join) + " join";
+            size_t jobs = 0;
+            bool jobs_ok = true;
+            std::vector<unsigned> max_queued;
+            bool graphs_ok = true;
+            std::vector<std::string> layouts;
+            for (const std::string & line : lines) {
+                unsigned job, layer, pages, queued, mask_zero;
+                double release, start, kernel_first, kernel_last, done, busy, spin;
+                unsigned graph_jobs, graph_pages, graph_queued, ring;
+                double begin_wait;
+                char layout[256];
+                if (const char * p = std::strstr(line.c_str(), "cpu job ")) {
+                    ++jobs;
+                    jobs_ok = jobs_ok && std::sscanf(p,
+                        "cpu job %u: layer %u, pages %u, queued %u, release %lf, start %lf, kernel first %lf, "
+                        "kernel last %lf, done %lf us after arm, busy %lf us, spin %lf us, mask-zero pages %u",
+                        &job, &layer, &pages, &queued, &release, &start, &kernel_first, &kernel_last, &done,
+                        &busy, &spin, &mask_zero) == 12 &&
+                        pages == 2 && mask_zero == 1 && layer < unsigned(layers) &&
+                        release >= 0.0 && start >= release && kernel_first >= start &&
+                        kernel_last >= kernel_first && done >= kernel_last &&
+                        std::fabs(spin - spin_us) < 1.0 && busy >= spin - 0.1;
+                } else if (const char * p = std::strstr(line.c_str(), "cpu graph: ")) {
+                    graphs_ok = graphs_ok && std::sscanf(p,
+                        "cpu graph: jobs %u, pages %u, max queued %u, begin wait %lf us",
+                        &graph_jobs, &graph_pages, &graph_queued, &begin_wait) == 4 &&
+                        graph_jobs == unsigned(layers) && graph_pages == unsigned(2*layers) && begin_wait == 0.0;
+                    max_queued.push_back(graph_queued);
+                } else if (const char * p = std::strstr(line.c_str(), "cpu layout: ")) {
+                    if (std::sscanf(p, "cpu layout: ring %u, pages/resident/gpu/cpu per streaming layer:%255[^\n]",
+                            &ring, layout) == 2 && ring == 8) {
+                        layouts.emplace_back(layout);
+                    } else {
+                        layouts.emplace_back("unparsed");
+                    }
+                }
+            }
+            // a graph reports during the next one
+            t.assert_equal(size_t(layers*(repeats - 1)), jobs);
+            t.assert_true(name + ": each job is ordered, holds its spin and counts the zero mask pages", jobs_ok);
+            t.assert_true(name + ": each graph counts its jobs and never waits at begin",
+                graphs_ok && max_queued.size() == size_t(repeats - 1));
+            t.assert_true(name + ": the layout prints once",
+                layouts == std::vector<std::string>{" 8/1/5/2 8/1/5/2 8/1/5/2"});
+            if (std::string(join) == "block") {
+                t.assert_true(name + ": the submit thread waits for each job before the next", !max_queued.empty() &&
+                    std::all_of(max_queued.begin(), max_queued.end(), [](unsigned q) { return q == 1; }));
+            } else {
+                t.assert_true(name + ": the submit thread queues every layer's job",
+                    !max_queued.empty() && max_queued.back() == unsigned(layers));
+            }
         }
     });
 

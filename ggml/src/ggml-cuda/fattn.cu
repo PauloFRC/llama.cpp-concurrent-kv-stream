@@ -12,14 +12,23 @@
 #include "kv-stream-span-tuner.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <new>
+#include <string>
 #include <unordered_map>
 #include <vector>
+
+#if defined(__linux__)
+#include <sched.h>
+#endif
 
 // Best FlashAttention kernel for a specific GPU:
 enum best_fattn_kernel {
@@ -190,16 +199,78 @@ struct kv_stream_graph_request {
     bool deadline_sample = false;
 };
 
+struct kv_stream_layer_plan {
+    uint32_t layer = 0;
+    std::vector<size_t> request_by_page;
+    std::vector<size_t> mutable_requests;
+    std::vector<uint32_t> cpu_pages;
+};
+
+// TODO: Task B skeleton knobs; Task D keeps one body, join and part path, Task F sets the default share
+struct kv_stream_cpu_knobs {
+    uint32_t pages_per_layer = 0;
+    float share = 0.0f;
+    bool join_blocking = false;
+    bool spin = false;
+    double dram_bandwidth_gbps = 0.0;
+    bool copy_part_to_device = false;
+};
+
+struct kv_stream_cpu_job_record;
+
 struct kv_stream_cpu_job {
     ggml_cuda_kv_stream_cpu_attn_params params;
     std::vector<uint32_t> pages;
+    mutable bool result_initialized = false;
+    // TODO: skeleton fields, removed with the spin body and the counters
+    bool spin = false;
+    int64_t spin_ns = 0;
+    kv_stream_cpu_job_record * record = nullptr;
 };
 
 using kv_stream_cpu_pool = ggml_cuda_kv_stream_cpu_pool<kv_stream_cpu_job>;
 
-// TODO: job bodies, the part stays empty until then
-static void kv_stream_cpu_job_run(const kv_stream_cpu_job & job, int thread, int n_threads) {
-    GGML_UNUSED_VARS(job, thread, n_threads);
+// TODO: Task B skeleton counters; drop them once Task D has re-measured the fixed cost
+struct kv_stream_cpu_job_record {
+    kv_stream_cpu_pool * pool = nullptr;
+    uint32_t layer = 0;
+    uint32_t pages = 0;
+    uint32_t queued = 0;
+    int64_t spin_ns = 0;
+    int64_t arm_ns = 0;
+    int64_t release_ns = 0;
+    std::vector<int64_t> start_ns;
+    std::vector<int64_t> kernel_ns;
+    std::vector<int64_t> end_ns;
+    std::vector<uint32_t> mask_zero;
+};
+
+struct alignas(64) kv_stream_cpu_line {
+    uint8_t bytes[64];
+};
+static_assert(GGML_CUDA_KV_STREAM_CPU_ATTN_ROW_WSIZE % sizeof(kv_stream_cpu_line) == 0,
+    "row workspace size must be a multiple of cache line size");
+
+struct kv_stream_cpu_worker {
+    std::vector<float> part;
+    std::vector<float> part_meta;
+    std::vector<kv_stream_cpu_line> q_workspace;
+
+    void run(const ggml_cuda_kv_stream_cpu_attn_params & geom, const uint32_t * pages, uint32_t n_pages) {
+        ggml_cuda_kv_stream_cpu_attn_params p = geom;
+        p.pages = pages;
+        p.n_pages = n_pages;
+        p.out = part.data();
+        p.out_meta = part_meta.data();
+        p.wdata = q_workspace.data();
+        p.wsize = q_workspace.size()*sizeof(kv_stream_cpu_line);
+        ggml_cuda_kv_stream_cpu_attn(p);
+    }
+};
+
+static int64_t kv_stream_now_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
 static bool kv_stream_wait_value(cudaStream_t stream, uint32_t * flag_device, uint32_t value) {
@@ -212,34 +283,207 @@ static bool kv_stream_wait_value(cudaStream_t stream, uint32_t * flag_device, ui
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && !defined(GGML_CUDA_NO_VMM)
 }
 
+// TODO: Task B skeleton counters; Task D deletes this struct, the job's record pointer and their callers
+struct kv_stream_cpu_diag {
+    std::vector<kv_stream_cpu_job_record> records;
+    uint32_t graph_jobs = 0;
+    uint32_t layout_ring = 0;
+    std::vector<std::array<uint32_t, 4>> layout;
+    std::vector<std::array<uint32_t, 4>> printed_layout;
+    std::vector<std::string> report;
+};
+
+struct kv_stream_cpu_graph {
+    kv_stream_cpu_knobs knobs;
+    const ggml_tensor * mask = nullptr;
+    uint32_t mask_page_begin = UINT32_MAX;
+    uint32_t mask_page_end = 0;
+    bool mask_copied = false;
+    int64_t mask_rows = 0;
+};
+
 struct kv_stream_cpu_split {
-    size_t rows = 0;
+    // set once, by set_cpu_split
+    size_t max_rows = 0;
     uint32_t context_pages = 0;
-    cudaStream_t stream = nullptr;
+    cudaStream_t side_stream = nullptr;
     float * q = nullptr;
     uint16_t * mask = nullptr;
-    float * part = nullptr;
-    float * part_meta = nullptr;
-    float * part_device = nullptr;
-    float2 * part_meta_device = nullptr;
+    float * result = nullptr;
+    float * result_meta = nullptr;
+    float * result_device = nullptr;
+    float2 * result_meta_device = nullptr;
     std::atomic<uint32_t> * done = nullptr;
     uint32_t * done_device = nullptr;
-    bool stream_join = false;
+    bool supports_stream_join = false;
+    // execution
+    std::vector<kv_stream_cpu_worker> workers;
+    std::mutex fold_mutex;
     std::unique_ptr<kv_stream_cpu_pool> pool;
+    // per graph
+    kv_stream_cpu_graph graph;
+    // TODO: Task B skeleton counters
+    kv_stream_cpu_diag diag;
 
     ~kv_stream_cpu_split() {
         CUDA_CHECK(cudaDeviceSynchronize());
         pool.reset();
-        if (stream != nullptr) {
-            CUDA_CHECK(cudaStreamDestroy(stream));
+        if (side_stream != nullptr) {
+            CUDA_CHECK(cudaStreamDestroy(side_stream));
         }
         CUDA_CHECK(cudaFreeHost(q));
         CUDA_CHECK(cudaFreeHost(mask));
-        CUDA_CHECK(cudaFreeHost(part));
-        CUDA_CHECK(cudaFreeHost(part_meta));
+        CUDA_CHECK(cudaFreeHost(result));
+        CUDA_CHECK(cudaFreeHost(result_meta));
         CUDA_CHECK(cudaFreeHost(done));
     }
 };
+
+// TODO: O-D2's count of cpu pages every token sees unbiased, removed with the skeleton counters
+static uint32_t kv_stream_cpu_mask_zero_pages(
+        const ggml_cuda_kv_stream_cpu_attn_params & p, const uint32_t * pages, uint32_t n_pages) {
+    uint32_t zero = 0;
+    for (uint32_t i = 0; i < n_pages; ++i) {
+        bool all = true;
+        for (int t = 0; t < p.n_tokens && all; ++t) {
+            const uint16_t * row = (const uint16_t *)((const uint8_t *) p.mask + size_t(t)*p.mask_token_stride) +
+                size_t(pages[i])*p.page_tokens;
+            all = std::all_of(row, row + p.page_tokens, [](uint16_t v) { return (v & 0x7fff) == 0; });
+        }
+        zero += all;
+    }
+    return zero;
+}
+
+static void kv_stream_cpu_job_run(kv_stream_cpu_split & split, const kv_stream_cpu_job & job, int thread, int n_threads) {
+    kv_stream_cpu_job_record & record = *job.record;
+    const int rows = job.params.n_tokens*job.params.n_head;
+    const uint32_t n_pages = uint32_t(job.pages.size());
+    const uint32_t begin = uint32_t(uint64_t(n_pages)*thread/n_threads);
+    const uint32_t end = uint32_t(uint64_t(n_pages)*(thread + 1)/n_threads);
+    // the diagnostic scan stays out of busy
+    record.mask_zero[thread] = kv_stream_cpu_mask_zero_pages(job.params, job.pages.data() + begin, end - begin);
+    record.start_ns[thread] = kv_stream_now_ns();
+
+    // TODO: the spin body goes with the skeleton
+    if (job.spin) {
+        if (thread == 0) {
+            ggml_cuda_kv_stream_cpu_attn_init(split.result, split.result_meta, rows);
+        }
+        const int64_t deadline = record.start_ns[thread] + job.spin_ns;
+        while (kv_stream_now_ns() < deadline) {
+        }
+        record.kernel_ns[thread] = record.end_ns[thread] = kv_stream_now_ns();
+        return;
+    }
+
+    kv_stream_cpu_worker & worker = split.workers[thread];
+    ggml_cuda_kv_stream_cpu_attn_init(worker.part.data(), worker.part_meta.data(), rows);
+    if (end > begin) {
+        worker.run(job.params, job.pages.data() + begin, end - begin);
+    }
+    record.kernel_ns[thread] = kv_stream_now_ns();
+    // TODO: Task D5 chooses the fold strategy
+    {
+        std::lock_guard<std::mutex> lock(split.fold_mutex);
+        if (!job.result_initialized) {
+            job.result_initialized = true;
+            ggml_cuda_kv_stream_cpu_attn_init(split.result, split.result_meta, rows);
+        }
+        ggml_cuda_kv_stream_cpu_attn_fold(
+            split.result, split.result_meta, worker.part.data(), worker.part_meta.data(), rows);
+    }
+    record.end_ns[thread] = kv_stream_now_ns();
+}
+
+// TODO: env-only pinning until Task F settles O-C1
+// "2-7" or "1,3,5-7"; empty on a parse error
+static std::vector<int> kv_stream_cpu_parse_cpus(const char * text) {
+    std::vector<int> cpus;
+    const char * p = text;
+    while (*p != '\0') {
+        char * end = nullptr;
+        const long first = strtol(p, &end, 10);
+        long last = first;
+        if (end != p && *end == '-') {
+            p = end + 1;
+            last = strtol(p, &end, 10);
+        }
+        // 1024 is CPU_SETSIZE on glibc
+        if (end == p || first < 0 || last < first || last >= 1024 || (*end != ',' && *end != '\0')) {
+            return {};
+        }
+        for (long cpu = first; cpu <= last; ++cpu) {
+            cpus.push_back(int(cpu));
+        }
+        p = *end == ',' ? end + 1 : end;
+    }
+    return cpus;
+}
+
+static std::vector<int> kv_stream_cpu_env_cpus() {
+    const char * text = getenv("GGML_CUDA_KV_STREAM_CPU_CPUS");
+    if (text == nullptr || *text == '\0') {
+        return {};
+    }
+    std::vector<int> cpus = kv_stream_cpu_parse_cpus(text);
+    if (cpus.empty()) {
+        GGML_LOG_WARN("%s: ignoring GGML_CUDA_KV_STREAM_CPU_CPUS=%s, expected a list like 2-7 or 1,3,5-7\n",
+            __func__, text);
+        return {};
+    }
+#if defined(__linux__)
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
+        GGML_LOG_WARN("%s: cannot read the process affinity, the split pool runs unpinned\n", __func__);
+        return {};
+    }
+    for (const int cpu : cpus) {
+        if (cpu >= CPU_SETSIZE || !CPU_ISSET(cpu, &allowed)) {
+            GGML_LOG_WARN("%s: cpu %d of GGML_CUDA_KV_STREAM_CPU_CPUS=%s is outside the process affinity mask, "
+                "the split pool runs unpinned\n", __func__, cpu, text);
+            return {};
+        }
+    }
+    return cpus;
+#else
+    GGML_LOG_WARN("%s: ignoring GGML_CUDA_KV_STREAM_CPU_CPUS=%s, CPU pinning needs Linux\n", __func__, text);
+    return {};
+#endif
+}
+
+static bool kv_stream_cpu_env_number(const char * name, double & value) {
+    const char * text = getenv(name);
+    if (text == nullptr || *text == '\0') {
+        return false;
+    }
+    char * end = nullptr;
+    value = strtod(text, &end);
+    return *end == '\0';
+}
+
+static kv_stream_cpu_knobs kv_stream_cpu_read_knobs(bool stream_join) {
+    const auto env = [](const char * name) {
+        const char * value = getenv(name);
+        return value == nullptr ? "" : value;
+    };
+    kv_stream_cpu_knobs knobs;
+    double value = 0.0;
+    if (kv_stream_cpu_env_number("GGML_CUDA_KV_STREAM_CPU_PAGES", value) && value >= 0.0 && value <= double(UINT32_MAX)) {
+        knobs.pages_per_layer = uint32_t(value);
+    }
+    if (kv_stream_cpu_env_number("GGML_CUDA_KV_STREAM_CPU_SHARE", value) && value > 0.0) {
+        knobs.share = std::min(float(value), 1.0f);
+    }
+    knobs.join_blocking = !stream_join || strcmp(env("GGML_CUDA_KV_STREAM_CPU_JOIN"), "block") == 0;
+    knobs.spin = strcmp(env("GGML_CUDA_KV_STREAM_CPU_BODY"), "spin") == 0;
+    if (kv_stream_cpu_env_number("GGML_CUDA_KV_STREAM_CPU_BCPU", value) && value > 0.0) {
+        knobs.dram_bandwidth_gbps = value;
+    }
+    knobs.copy_part_to_device = strcmp(env("GGML_CUDA_KV_STREAM_CPU_PART"), "copy") == 0;
+    return knobs;
+}
 
 } // namespace
 
@@ -278,16 +522,8 @@ struct ggml_cuda_kv_stream_transfer_ring {
     size_t next_request = 0;
     ggml_cuda_kv_stream_resident_cache * graph_resident_cache = nullptr;
     std::vector<kv_stream_graph_request> graph_requests;
-    std::unordered_map<const void *, uint32_t> graph_layer_by_k;
-    std::unordered_map<const void *, std::vector<size_t>> graph_request_by_k_page;
-    std::unordered_map<const void *, std::vector<uint32_t>> graph_cpu_pages_by_k;
-    uint32_t cpu_pages_per_layer = 0;
+    std::unordered_map<const void *, kv_stream_layer_plan> graph_plans;
     std::unique_ptr<kv_stream_cpu_split> cpu_split;
-    const ggml_tensor * graph_cpu_mask = nullptr;
-    uint32_t graph_cpu_mask_begin = UINT32_MAX;
-    uint32_t graph_cpu_mask_end = 0;
-    int64_t graph_cpu_mask_rows = 0;
-    bool graph_cpu_join_blocking = false;
 
     uint64_t asynchronous_page_uploads = 0;
     uint64_t host_to_device_copy_commands = 0;
@@ -476,30 +712,50 @@ bool ggml_cuda_kv_stream_transfer_ring_set_cpu_split(
         "the GPU reads the job flag as a plain uint32_t");
 
     auto split = std::make_unique<kv_stream_cpu_split>();
-    split->rows = rows;
+    split->max_rows = rows;
     split->context_pages = context_pages;
-    if (cudaStreamCreateWithFlags(&split->stream, cudaStreamNonBlocking) != cudaSuccess ||
+    if (cudaStreamCreateWithFlags(&split->side_stream, cudaStreamNonBlocking) != cudaSuccess ||
         cudaHostAlloc(reinterpret_cast<void **>(&split->q), row_bytes, cudaHostAllocDefault) != cudaSuccess ||
         cudaHostAlloc(reinterpret_cast<void **>(&split->mask), mask_bytes, cudaHostAllocDefault) != cudaSuccess ||
-        cudaHostAlloc(reinterpret_cast<void **>(&split->part), row_bytes, cudaHostAllocMapped) != cudaSuccess ||
-        cudaHostAlloc(reinterpret_cast<void **>(&split->part_meta), meta_bytes, cudaHostAllocMapped) != cudaSuccess ||
+        cudaHostAlloc(reinterpret_cast<void **>(&split->result), row_bytes, cudaHostAllocMapped) != cudaSuccess ||
+        cudaHostAlloc(reinterpret_cast<void **>(&split->result_meta), meta_bytes, cudaHostAllocMapped) != cudaSuccess ||
         cudaHostAlloc(reinterpret_cast<void **>(&split->done), sizeof(uint32_t), cudaHostAllocMapped) != cudaSuccess ||
-        cudaHostGetDevicePointer(reinterpret_cast<void **>(&split->part_device), split->part, 0) != cudaSuccess ||
-        cudaHostGetDevicePointer(reinterpret_cast<void **>(&split->part_meta_device), split->part_meta, 0) != cudaSuccess ||
+        cudaHostGetDevicePointer(reinterpret_cast<void **>(&split->result_device), split->result, 0) != cudaSuccess ||
+        cudaHostGetDevicePointer(reinterpret_cast<void **>(&split->result_meta_device), split->result_meta, 0) != cudaSuccess ||
         cudaHostGetDevicePointer(reinterpret_cast<void **>(&split->done_device), split->done, 0) != cudaSuccess) {
         const cudaError_t error = cudaGetLastError();
         GGML_LOG_WARN("%s: allocating %.2f MiB of pinned CPU split scratch failed, streamed pages stay on the GPU: %s\n",
             __func__, (2*row_bytes + mask_bytes + meta_bytes)/1024.0/1024.0, cudaGetErrorString(error));
         return false;
     }
+    // never reset
     new (split->done) std::atomic<uint32_t>(0);
-    split->stream_join = kv_stream_wait_value(split->stream, split->done_device, 0);
-    if (!split->stream_join) {
+    split->supports_stream_join = kv_stream_wait_value(split->side_stream, split->done_device, 0);
+    if (!split->supports_stream_join) {
         GGML_LOG_WARN("%s: this build or device cannot wait on a host flag, CPU split jobs join on the submit thread\n",
             __func__);
     }
-    ggml_cuda_kv_stream_cpu_attn_init(split->part, split->part_meta, int(rows));
-    split->pool = std::make_unique<kv_stream_cpu_pool>(int(n_threads), n_layers, kv_stream_cpu_job_run, split->done);
+    ggml_cuda_kv_stream_cpu_attn_init(split->result, split->result_meta, int(rows));
+    split->workers.resize(n_threads);
+    for (kv_stream_cpu_worker & worker : split->workers) {
+        worker.part.resize(rows*GGML_CUDA_KV_STREAM_HEAD_DIM);
+        worker.part_meta.resize(rows*2);
+        worker.q_workspace.resize(rows*GGML_CUDA_KV_STREAM_CPU_ATTN_ROW_WSIZE/sizeof(kv_stream_cpu_line));
+    }
+    const std::vector<int> cpus = kv_stream_cpu_env_cpus();
+    kv_stream_cpu_split * body_split = split.get();
+    split->pool = std::make_unique<kv_stream_cpu_pool>(int(n_threads), n_layers,
+        [body_split](const kv_stream_cpu_job & job, int thread, int n) {
+            kv_stream_cpu_job_run(*body_split, job, thread, n);
+        }, split->done, cpus);
+    split->diag.records.resize(n_layers);
+    for (kv_stream_cpu_job_record & record : split->diag.records) {
+        record.pool = split->pool.get();
+        record.start_ns.resize(n_threads);
+        record.kernel_ns.resize(n_threads);
+        record.end_ns.resize(n_threads);
+        record.mask_zero.resize(n_threads);
+    }
     ring->cpu_split = std::move(split);
     return true;
 }
@@ -1663,50 +1919,34 @@ static void kv_stream_graph_fill_free_slots(ggml_cuda_kv_stream_transfer_ring * 
     }
 }
 
-static bool kv_stream_graph_layer_begin(
+static const kv_stream_layer_plan * kv_stream_graph_layer_begin(
         ggml_cuda_kv_stream_transfer_ring * ring,
         const void * k_key,
         cudaStream_t compute_stream) {
     if (!ring->graph_active) {
-        return false;
+        return nullptr;
     }
-    const auto layer_it = ring->graph_layer_by_k.find(k_key);
-    if (layer_it == ring->graph_layer_by_k.end()) {
-        return false;
+    const auto layer_it = ring->graph_plans.find(k_key);
+    if (layer_it == ring->graph_plans.end()) {
+        return nullptr;
     }
+    const kv_stream_layer_plan & plan = layer_it->second;
 
-    ring->current_layer = layer_it->second;
+    ring->current_layer = plan.layer;
     CUDA_CHECK(cudaEventRecord(ring->producer_ready, compute_stream));
     CUDA_CHECK(cudaStreamWaitEvent(ring->copy_stream, ring->producer_ready, 0));
-    for (auto & request : ring->graph_requests) {
-        if (request.layer == ring->current_layer && request.mutable_tail) {
-            request.eligible = true;
-        }
+    for (const size_t request : plan.mutable_requests) {
+        ring->graph_requests[request].eligible = true;
     }
     kv_stream_graph_fill_free_slots(ring);
-    return true;
+    return &plan;
 }
 
-static size_t kv_stream_graph_request_index(
-        const ggml_cuda_kv_stream_transfer_ring * ring,
-        const void * k_key,
-        uint32_t page) {
-    const auto it = ring->graph_request_by_k_page.find(k_key);
-    if (it == ring->graph_request_by_k_page.end() || page >= it->second.size()) {
-        return KV_STREAM_NO_REQUEST;
-    }
-    return it->second[page];
-}
-
-static const std::vector<uint32_t> * kv_stream_graph_cpu_pages(
-        const ggml_cuda_kv_stream_transfer_ring * ring,
-        const void * k_key) {
-    const auto it = ring->graph_cpu_pages_by_k.find(k_key);
-    return it == ring->graph_cpu_pages_by_k.end() ? nullptr : &it->second;
-}
-
-static void kv_stream_cpu_split_release(void * pool) {
-    static_cast<kv_stream_cpu_pool *>(pool)->release();
+// TODO: back to taking the pool once the skeleton counters go
+static void kv_stream_cpu_split_release(void * data) {
+    auto * record = static_cast<kv_stream_cpu_job_record *>(data);
+    record->release_ns = kv_stream_now_ns();
+    record->pool->release();
 }
 
 static uint32_t kv_stream_cpu_split_dispatch(
@@ -1718,7 +1958,7 @@ static uint32_t kv_stream_cpu_split_dispatch(
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
-    const kv_stream_cpu_split & split = *ring->cpu_split;
+    kv_stream_cpu_split & split = *ring->cpu_split;
 #ifdef USE_CUDA_GRAPH
     cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
     CUDA_CHECK(cudaStreamIsCapturing(compute_stream, &capture_status));
@@ -1726,22 +1966,24 @@ static uint32_t kv_stream_cpu_split_dispatch(
 #else
     GGML_UNUSED(compute_stream);
 #endif // USE_CUDA_GRAPH
-    GGML_ASSERT(ggml_nbytes(Q) <= split.rows*GGML_CUDA_KV_STREAM_HEAD_DIM*sizeof(float));
+    GGML_ASSERT(ggml_nbytes(Q) <= split.max_rows*GGML_CUDA_KV_STREAM_HEAD_DIM*sizeof(float));
 
-    CUDA_CHECK(cudaStreamWaitEvent(split.stream, ring->producer_ready, 0));
-    if (ring->graph_cpu_mask_rows == 0) {
-        GGML_ASSERT(ring->graph_cpu_mask_end <= split.context_pages && mask->ne[1] >= Q->ne[1]);
+    CUDA_CHECK(cudaStreamWaitEvent(split.side_stream, ring->producer_ready, 0));
+    if (!split.graph.mask_copied) {
+        GGML_ASSERT(split.graph.mask_page_end <= split.context_pages && mask->ne[1] >= Q->ne[1] &&
+            int64_t(split.graph.mask_page_end)*GGML_CUDA_KV_STREAM_PAGE_TOKENS <= mask->ne[0]);
         const size_t page_bytes = GGML_CUDA_KV_STREAM_PAGE_TOKENS*sizeof(uint16_t);
-        const size_t offset = size_t(ring->graph_cpu_mask_begin)*page_bytes;
+        const size_t offset = size_t(split.graph.mask_page_begin)*page_bytes;
         CUDA_CHECK(cudaMemcpy2DAsync(
             reinterpret_cast<char *>(split.mask) + offset, size_t(split.context_pages)*page_bytes,
             static_cast<const char *>(mask->data) + offset, mask->nb[1],
-            size_t(ring->graph_cpu_mask_end - ring->graph_cpu_mask_begin)*page_bytes, Q->ne[1],
-            cudaMemcpyDeviceToHost, split.stream));
-        ring->graph_cpu_mask_rows = Q->ne[1];
+            size_t(split.graph.mask_page_end - split.graph.mask_page_begin)*page_bytes, Q->ne[1],
+            cudaMemcpyDeviceToHost, split.side_stream));
+        split.graph.mask_copied = true;
+        split.graph.mask_rows = Q->ne[1];
     }
-    GGML_ASSERT(Q->ne[1] <= ring->graph_cpu_mask_rows);
-    CUDA_CHECK(cudaMemcpyAsync(split.q, Q->data, ggml_nbytes(Q), cudaMemcpyDeviceToHost, split.stream));
+    GGML_ASSERT(Q->ne[1] <= split.graph.mask_rows);
+    CUDA_CHECK(cudaMemcpyAsync(split.q, Q->data, ggml_nbytes(Q), cudaMemcpyDeviceToHost, split.side_stream));
 
     kv_stream_cpu_job job;
     ggml_cuda_kv_stream_cpu_attn_params & p = job.params;
@@ -1761,14 +2003,26 @@ static uint32_t kv_stream_cpu_split_dispatch(
     p.n_head_kv = int(K->ne[2]);
     p.n_tokens = int(Q->ne[1]);
     memcpy(&p.scale, (const float *) dst->op_params + 0, sizeof(float));
-    p.out = split.part;
-    p.out_meta = split.part_meta;
     job.pages = pages;
 
+    // TODO: Task B skeleton body and counters
+    GGML_ASSERT(split.diag.graph_jobs < split.diag.records.size());
+    kv_stream_cpu_job_record & record = split.diag.records[split.diag.graph_jobs++];
+    const kv_stream_cpu_knobs & knobs = split.graph.knobs;
+    job.spin = knobs.spin;
+    // GB/s is bytes per ns
+    job.spin_ns = knobs.spin && knobs.dram_bandwidth_gbps > 0.0 ? int64_t(double(pages.size()*ring->page_bytes)/knobs.dram_bandwidth_gbps) : 0;
+    job.record = &record;
+    record.layer = ring->current_layer;
+    record.pages = uint32_t(pages.size());
+    record.spin_ns = job.spin_ns;
+    record.arm_ns = kv_stream_now_ns();
+
     const uint32_t id = split.pool->arm(std::move(job));
+    record.queued = split.pool->queued();
     ++ring->cpu_jobs;
     // after the copies, so no worker reads Q or the mask before they land
-    CUDA_CHECK(cudaLaunchHostFunc(split.stream, kv_stream_cpu_split_release, split.pool.get()));
+    CUDA_CHECK(cudaLaunchHostFunc(split.side_stream, kv_stream_cpu_split_release, &record));
     return id;
 }
 
@@ -1777,10 +2031,11 @@ static void kv_stream_cpu_split_join(
         uint32_t job,
         cudaStream_t compute_stream) {
     const kv_stream_cpu_split & split = *ring->cpu_split;
-    if (ring->graph_cpu_join_blocking) {
+    if (split.graph.knobs.join_blocking) {
         split.pool->wait(job);
         return;
     }
+    // the wait is also what orders the folded result before the accumulate
     const bool queued = kv_stream_wait_value(compute_stream, split.done_device, job);
     GGML_ASSERT(queued);
 }
@@ -1813,6 +2068,56 @@ static void kv_stream_graph_release(
     --ring->current_occupancy;
 }
 
+// TODO: Task B skeleton counters; graph_end logs them while the GPU runs
+static void kv_stream_cpu_split_report(kv_stream_cpu_split & split, int64_t begin_wait_ns) {
+    char line[512];
+    if (!split.diag.layout.empty() && split.diag.layout != split.diag.printed_layout) {
+        snprintf(line, sizeof(line), "cpu layout: ring %u, pages/resident/gpu/cpu per streaming layer:",
+            split.diag.layout_ring);
+        std::string text = line;
+        for (const auto & layer : split.diag.layout) {
+            text += " " + std::to_string(layer[0]) + "/" + std::to_string(layer[1]) + "/" +
+                std::to_string(layer[2]) + "/" + std::to_string(layer[3]);
+        }
+        split.diag.report.push_back(text + "\n");
+        split.diag.printed_layout = split.diag.layout;
+    }
+    split.diag.layout.clear();
+    if (split.diag.graph_jobs == 0 && begin_wait_ns == 0) {
+        return;
+    }
+
+    uint32_t pages = 0;
+    uint32_t max_queued = 0;
+    for (uint32_t job = 0; job < split.diag.graph_jobs; ++job) {
+        const kv_stream_cpu_job_record & record = split.diag.records[job];
+        const auto after_arm = [&](int64_t ns) { return double(ns - record.arm_ns)/1e3; };
+        int64_t busy_ns = 0;
+        uint32_t mask_zero = 0;
+        for (size_t thread = 0; thread < record.end_ns.size(); ++thread) {
+            busy_ns = std::max(busy_ns, record.end_ns[thread] - record.start_ns[thread]);
+            mask_zero += record.mask_zero[thread];
+        }
+        snprintf(line, sizeof(line), "cpu job %u: layer %u, pages %u, queued %u, release %.1f, start %.1f, "
+            "kernel first %.1f, kernel last %.1f, done %.1f us after arm, busy %.1f us, spin %.1f us, mask-zero pages %u\n",
+            job, record.layer, record.pages, record.queued, after_arm(record.release_ns),
+            after_arm(*std::min_element(record.start_ns.begin(), record.start_ns.end())),
+            after_arm(*std::min_element(record.kernel_ns.begin(), record.kernel_ns.end())),
+            after_arm(*std::max_element(record.kernel_ns.begin(), record.kernel_ns.end())),
+            after_arm(*std::max_element(record.end_ns.begin(), record.end_ns.end())),
+            busy_ns/1e3, record.spin_ns/1e3, mask_zero);
+        split.diag.report.emplace_back(line);
+        pages += record.pages;
+        max_queued = std::max(max_queued, record.queued);
+    }
+    const kv_stream_cpu_knobs & knobs = split.graph.knobs;
+    snprintf(line, sizeof(line), "cpu graph: jobs %u, pages %u, max queued %u, begin wait %.1f us, body %s, join %s, "
+        "part %s\n", split.diag.graph_jobs, pages, max_queued, begin_wait_ns/1e3, knobs.spin ? "spin" : "kernel",
+        knobs.join_blocking ? "block" : "stream", knobs.copy_part_to_device ? "copy" : "mapped");
+    split.diag.report.emplace_back(line);
+    split.diag.graph_jobs = 0;
+}
+
 } // namespace
 
 void ggml_cuda_kv_stream_graph_begin(ggml_cuda_kv_stream_transfer_ring * ring) {
@@ -1825,26 +2130,21 @@ void ggml_cuda_kv_stream_graph_begin(ggml_cuda_kv_stream_transfer_ring * ring) {
     ring->graph_copy_batch_greedy = ring->span_tuner.use_greedy_batch();
     ring->graph_copy_batch_pages = ring->graph_copy_batch_greedy ?
         ring->active_slots : KV_STREAM_COPY_BATCH_PAGES;
-    const char * cpu_pages_env = getenv("GGML_CUDA_KV_STREAM_CPU_PAGES");
-    ring->cpu_pages_per_layer = cpu_pages_env == nullptr ? 0 : uint32_t(strtoul(cpu_pages_env, nullptr, 10));
     if (ring->cpu_split != nullptr) {
-        ring->cpu_split->pool->wait_idle();
-        const char * join_env = getenv("GGML_CUDA_KV_STREAM_CPU_JOIN");
-        ring->graph_cpu_join_blocking = !ring->cpu_split->stream_join ||
-            (join_env != nullptr && strcmp(join_env, "block") == 0);
+        kv_stream_cpu_split & split = *ring->cpu_split;
+        const int64_t wait_begin = kv_stream_now_ns();
+        const bool idle = split.pool->idle();
+        split.pool->wait_idle();
+        kv_stream_cpu_split_report(split, idle ? 0 : kv_stream_now_ns() - wait_begin);
+        split.graph = {};
+        split.graph.knobs = kv_stream_cpu_read_knobs(split.supports_stream_join);
     }
     ring->graph_layer_count = 0;
     ring->current_layer = KV_STREAM_NO_LAYER;
     ring->next_request = 0;
     ring->graph_resident_cache = nullptr;
     ring->graph_requests.clear();
-    ring->graph_layer_by_k.clear();
-    ring->graph_request_by_k_page.clear();
-    ring->graph_cpu_pages_by_k.clear();
-    ring->graph_cpu_mask = nullptr;
-    ring->graph_cpu_mask_begin = UINT32_MAX;
-    ring->graph_cpu_mask_end = 0;
-    ring->graph_cpu_mask_rows = 0;
+    ring->graph_plans.clear();
     ring->current_occupancy = 0;
     if (timing_available) {
         ring->current_ring_peak_occupancy = 0;
@@ -1909,27 +2209,37 @@ bool ggml_cuda_kv_stream_graph_add_attention(
 
     const int64_t block_tokens = resident_cache->page_tokens;
     const int nchunks = int((K->ne[1] + block_tokens - 1)/block_tokens);
-    if (uint32_t(nchunks) <= resident_cache->layer_pages[resident_layer]) {
+    const uint32_t resident_pages = resident_cache->layer_pages[resident_layer];
+    if (uint32_t(nchunks) <= resident_pages) {
         return true;
     }
-    GGML_ASSERT(ring->graph_layer_by_k.find(K->data) == ring->graph_layer_by_k.end());
-    const uint32_t layer = ring->graph_layer_count++;
-    ring->graph_layer_by_k[K->data] = layer;
-    auto & page_requests = ring->graph_request_by_k_page[K->data];
-    page_requests.assign(nchunks, KV_STREAM_NO_REQUEST);
+    GGML_ASSERT(ring->graph_plans.find(K->data) == ring->graph_plans.end());
+    kv_stream_layer_plan & plan = ring->graph_plans[K->data];
+    plan.layer = ring->graph_layer_count++;
+    plan.request_by_page.assign(nchunks, KV_STREAM_NO_REQUEST);
     // the mask crosses to the host once per graph
     const ggml_tensor * mask = dst->src[3];
-    const bool cpu_split = ring->cpu_split != nullptr && ggml_cuda_kv_stream_cpu_split_supported(dst) &&
-        (ring->graph_cpu_mask == nullptr ||
-            (mask->data == ring->graph_cpu_mask->data && mask->nb[1] == ring->graph_cpu_mask->nb[1]));
-    const uint32_t n_cpu = cpu_split ? ring->cpu_pages_per_layer : 0;
+    kv_stream_cpu_graph * cpu_graph = ring->cpu_split == nullptr ? nullptr : &ring->cpu_split->graph;
+    uint32_t n_cpu = 0;
+    if (cpu_graph != nullptr && ggml_cuda_kv_stream_cpu_split_supported(dst) && (cpu_graph->mask == nullptr ||
+            (mask->data == cpu_graph->mask->data && mask->nb[1] == cpu_graph->mask->nb[1]))) {
+        // TODO: Task F sets the default share; the absolute page count goes with the skeleton knobs
+        n_cpu = cpu_graph->knobs.pages_per_layer;
+        if (n_cpu == 0 && cpu_graph->knobs.share > 0.0f) {
+            uint32_t streamed = 0;
+            for (uint32_t page = resident_pages; page < uint32_t(nchunks); ++page) {
+                streamed += kv_stream_page_live(ring, page, uint32_t(nchunks));
+            }
+            n_cpu = uint32_t(std::lround(cpu_graph->knobs.share*float(streamed)));
+        }
+    }
     std::vector<uint32_t> cpu_pages = ggml_cuda_kv_stream_select_cpu_pages(
-        uint32_t(nchunks), resident_cache->layer_pages[resident_layer], ring->live_pages,
+        uint32_t(nchunks), resident_pages, ring->live_pages,
         resident_cache->mutable_pages, resident_cache->all_pages_mutable, n_cpu);
 
     for (int chunk = 0; chunk < nchunks; ++chunk) {
         const uint32_t page = uint32_t(chunk);
-        if (page < resident_cache->layer_pages[resident_layer] ||
+        if (page < resident_pages ||
                 !kv_stream_page_live(ring, page, uint32_t(nchunks)) ||
                 std::binary_search(cpu_pages.begin(), cpu_pages.end(), page)) {
             continue;
@@ -1956,20 +2266,32 @@ bool ggml_cuda_kv_stream_graph_add_attention(
         request.v_offset = GGML_PAD(request.k_bytes, 128);
         request.v_head_bytes = v_row_bytes*token_count;
         request.v_bytes = request.v_head_bytes*V->ne[2];
-        request.layer = layer;
+        request.layer = plan.layer;
         request.mutable_tail = !ggml_cuda_kv_stream_page_immutable(
             page, uint32_t(nchunks), resident_cache->mutable_pages, resident_cache->all_pages_mutable);
         request.eligible = !request.mutable_tail;
         GGML_ASSERT(request.v_offset + request.v_bytes == ring->page_bytes);
 
-        page_requests[page] = ring->graph_requests.size();
+        plan.request_by_page[page] = ring->graph_requests.size();
+        if (request.mutable_tail) {
+            plan.mutable_requests.push_back(plan.request_by_page[page]);
+        }
         ring->graph_requests.push_back(request);
     }
+    // TODO: Task B skeleton layout counter
+    if (ring->cpu_split != nullptr) {
+        // gpu counts pages with a GPU request, not pages the GPU attended; non-live pages have neither
+        const auto gpu_pages = std::count_if(plan.request_by_page.begin(), plan.request_by_page.end(),
+            [](size_t request) { return request != KV_STREAM_NO_REQUEST; });
+        ring->cpu_split->diag.layout.push_back({
+            uint32_t(nchunks), resident_pages, uint32_t(gpu_pages), uint32_t(cpu_pages.size())});
+        ring->cpu_split->diag.layout_ring = ring->active_slots;
+    }
     if (!cpu_pages.empty()) {
-        ring->graph_cpu_mask = mask;
-        ring->graph_cpu_mask_begin = std::min(ring->graph_cpu_mask_begin, cpu_pages.front());
-        ring->graph_cpu_mask_end = std::max(ring->graph_cpu_mask_end, cpu_pages.back() + 1);
-        ring->graph_cpu_pages_by_k[K->data] = std::move(cpu_pages);
+        cpu_graph->mask = mask;
+        cpu_graph->mask_page_begin = std::min(cpu_graph->mask_page_begin, cpu_pages.front());
+        cpu_graph->mask_page_end = std::max(cpu_graph->mask_page_end, cpu_pages.back() + 1);
+        plan.cpu_pages = std::move(cpu_pages);
     }
     return true;
 }
@@ -1997,6 +2319,13 @@ void ggml_cuda_kv_stream_graph_end(
         CUDA_CHECK(cudaEventRecord(ring->eval_end, compute_stream));
         ring->timing_pending = true;
         ring->timing_current = false;
+    }
+    // TODO: Task B skeleton counters
+    if (ring->cpu_split != nullptr) {
+        for (const std::string & line : ring->cpu_split->diag.report) {
+            GGML_LOG_WARN("%s", line.c_str());
+        }
+        ring->cpu_split->diag.report.clear();
     }
 }
 
@@ -2083,21 +2412,22 @@ void ggml_cuda_flash_attn_ext_streamed(
     }
     const uint32_t resident_layer_pages = resident_cache == nullptr ?
         0 : resident_cache->layer_pages[resident_layer];
-    const bool graph_planned = kv_stream_graph_layer_begin(
+    const kv_stream_layer_plan * plan = kv_stream_graph_layer_begin(
         transfer_ring, K->data, ctx.stream());
+    const bool graph_planned = plan != nullptr;
+    GGML_ASSERT(plan == nullptr || size_t(nchunks) == plan->request_by_page.size());
     std::vector<chunk_descriptor> chunks(nchunks);
-    const std::vector<uint32_t> * cpu_pages = graph_planned ?
-        kv_stream_graph_cpu_pages(transfer_ring, K->data) : nullptr;
+    const bool has_cpu_pages = plan != nullptr && !plan->cpu_pages.empty();
     uint32_t cpu_job = 0;
-    if (cpu_pages != nullptr) {
+    if (has_cpu_pages) {
         GGML_ASSERT(resident_cache == transfer_ring->graph_resident_cache);
-        for (const uint32_t page : *cpu_pages) {
+        for (const uint32_t page : plan->cpu_pages) {
             GGML_ASSERT(ggml_cuda_kv_stream_page_immutable(
                 page, uint32_t(nchunks), resident_cache->mutable_pages, resident_cache->all_pages_mutable));
             chunks[page].cpu = true;
         }
-        transfer_ring->cpu_pages += cpu_pages->size();
-        cpu_job = kv_stream_cpu_split_dispatch(transfer_ring, dst, *cpu_pages, ctx.stream());
+        transfer_ring->cpu_pages += plan->cpu_pages.size();
+        cpu_job = kv_stream_cpu_split_dispatch(transfer_ring, dst, plan->cpu_pages, ctx.stream());
     }
 
     std::vector<size_t> streamed_chunks;
@@ -2149,6 +2479,8 @@ void ggml_cuda_flash_attn_ext_streamed(
 
             const uint32_t page = token_begin/resident_cache->page_tokens;
             if (page < resident_layer_pages) {
+                // the planner hands the CPU only non-resident pages
+                GGML_ASSERT(!desc.cpu);
                 if (page < resident_first || page > resident_last) {
                     desc.skipped = true;
                     ++transfer_ring->skipped_pages;
@@ -2193,8 +2525,7 @@ void ggml_cuda_flash_attn_ext_streamed(
         if (desc.streamed) {
             const size_t stream_index = streamed_chunks.size();
             if (graph_planned) {
-                desc.request_index = kv_stream_graph_request_index(
-                    transfer_ring, K->data, uint32_t(chunk));
+                desc.request_index = plan->request_by_page[chunk];
                 GGML_ASSERT(desc.request_index != KV_STREAM_NO_REQUEST);
             } else {
                 desc.slot = uint32_t(stream_index%transfer_ring->active_slots);
@@ -2225,7 +2556,7 @@ void ggml_cuda_flash_attn_ext_streamed(
     ggml_cuda_pool_alloc<float2> meta(pool);
     ggml_cuda_pool_alloc<float> accumulator(pool);
     ggml_cuda_pool_alloc<float2> accumulator_meta(pool);
-    const bool needs_partial_reduction = convert_to_f16 || cpu_pages != nullptr ||
+    const bool needs_partial_reduction = convert_to_f16 || has_cpu_pages ||
         (!streamed_chunks.empty() && nchunks > 1);
     if (needs_partial_reduction) {
         parts.alloc(size_t(partial_count)*workspace_elements);
@@ -2505,7 +2836,7 @@ void ggml_cuda_flash_attn_ext_streamed(
 
         // Preserve normal CUDA flash attention when the active cache is fully resident or fits in one streamed page.
         // This avoids a partial reduction and keeps logits identical to a non-streamed cache.
-        if (!convert_to_f16 && cpu_pages == nullptr && (streamed_chunks.empty() || nchunks == 1)) {
+        if (!convert_to_f16 && !has_cpu_pages && (streamed_chunks.empty() || nchunks == 1)) {
             ggml_cuda_flash_attn_ext(ctx, &staged_dst);
             if (desc.streamed) {
                 if (graph_planned) {
@@ -2605,12 +2936,24 @@ void ggml_cuda_flash_attn_ext_streamed(
     const dim3 blocks(nrows, 1, 1);
     const dim3 threads(GGML_CUDA_KV_STREAM_HEAD_DIM, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params(blocks, threads, 0, ctx.stream());
-    if (cpu_pages != nullptr) {
+    if (has_cpu_pages) {
         const kv_stream_cpu_split & split = *transfer_ring->cpu_split;
-        GGML_ASSERT(size_t(nrows) <= split.rows);
+        GGML_ASSERT(size_t(nrows) <= split.max_rows);
         kv_stream_cpu_split_join(transfer_ring, cpu_job, ctx.stream());
+        const float * cpu_result = split.result_device;
+        const float2 * cpu_result_meta = split.result_meta_device;
+        // TODO: Task D keeps one of the two part paths
+        if (split.graph.knobs.copy_part_to_device) {
+            GGML_ASSERT(size_t(nrows) <= workspace_rows);
+            CUDA_CHECK(cudaMemcpyAsync(parts.ptr, split.result, size_t(nrows)*GGML_CUDA_KV_STREAM_HEAD_DIM*sizeof(float),
+                cudaMemcpyHostToDevice, ctx.stream()));
+            CUDA_CHECK(cudaMemcpyAsync(meta.ptr, split.result_meta, size_t(nrows)*sizeof(float2),
+                cudaMemcpyHostToDevice, ctx.stream()));
+            cpu_result = parts.ptr;
+            cpu_result_meta = meta.ptr;
+        }
         ggml_cuda_kernel_launch(kv_stream_accumulate_chunk_results<GGML_CUDA_KV_STREAM_HEAD_DIM>, launch_params,
-            split.part_device, split.part_meta_device, accumulator.ptr, accumulator_meta.ptr, nrows, first_chunk, 1);
+            cpu_result, cpu_result_meta, accumulator.ptr, accumulator_meta.ptr, nrows, first_chunk, 1);
         CUDA_CHECK(cudaGetLastError());
         first_chunk = false;
     }

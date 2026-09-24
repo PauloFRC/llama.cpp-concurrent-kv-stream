@@ -168,10 +168,12 @@ llama_kv_cache::llama_kv_cache(
     ggml_backend_dev_t kv_stream_dev = nullptr;
     ggml_backend_buffer_type_t kv_stream_buft = nullptr;
     uint32_t kv_stream_layer_count = 0;
+    uint32_t kv_stream_n_head = 0;
     if (kv_stream_stage_bytes != 0) {
         for (uint32_t il = 0; il < n_layer; ++il) {
             if (hparams.has_kv(il) && (!filter || filter(il))) {
                 ++kv_stream_layer_count;
+                kv_stream_n_head = std::max(kv_stream_n_head, hparams.n_head(il));
             }
         }
     }
@@ -242,6 +244,7 @@ llama_kv_cache::llama_kv_cache(
                     kv_stream_buft = kv_stream_init_runtime(
                         dev, kv_stream_stage_bytes, kv_stream_layer_count, type_k, type_v, il);
                     kv_stream_dev = dev;
+                    kv_stream_init_cpu_split(dev, kv_stream_n_head, (kv_size + page_tokens - 1)/page_tokens);
                 }
 
                 buft = kv_stream_buft;
@@ -1638,6 +1641,35 @@ ggml_backend_buffer_type_t llama_kv_cache::kv_stream_init_runtime(
     }
 
     return buft;
+}
+
+// TODO: Task C's --kv-stream-cpu-threads replaces the skeleton gate and its thread count
+void llama_kv_cache::kv_stream_init_cpu_split(ggml_backend_dev_t dev, uint32_t n_head, uint32_t context_pages) {
+    const char * skeleton = getenv("GGML_CUDA_KV_STREAM_CPU_SKELETON");
+    if (skeleton == nullptr || strcmp(skeleton, "1") != 0) {
+        return;
+    }
+    if (kv_stream_runtime.cpu_attn_supported_fn == nullptr || !kv_stream_runtime.cpu_attn_supported_fn()) {
+        LLAMA_LOG_WARN("%s: the CPU split skeleton needs AVX-512 CPU attention, which this build or CPU lacks; it stays off\n",
+            __func__);
+        return;
+    }
+    const char * threads = getenv("GGML_CUDA_KV_STREAM_CPU_THREADS");
+    const long n_threads = threads == nullptr ? 0 : strtol(threads, nullptr, 10);
+    if (n_threads <= 0 || n_threads > 1024) {
+        LLAMA_LOG_WARN("%s: the CPU split skeleton needs GGML_CUDA_KV_STREAM_CPU_THREADS in 1..1024; it stays off\n",
+            __func__);
+        return;
+    }
+    using set_cpu_split_fn_t = bool (*)(void *, uint32_t, uint32_t, uint32_t);
+    auto * set_cpu_split_fn = (set_cpu_split_fn_t) ggml_backend_reg_get_proc_address(
+        ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_kv_stream_set_cpu_split");
+    if (set_cpu_split_fn == nullptr ||
+            !set_cpu_split_fn(kv_stream_runtime.runtime, uint32_t(n_threads), n_head, context_pages)) {
+        return;
+    }
+    LLAMA_LOG_WARN("%s: CPU split skeleton on, %ld threads: decode output is not validated, use it for Task B measurements only\n",
+        __func__, n_threads);
 }
 
 bool llama_kv_cache::get_has_shift() const {

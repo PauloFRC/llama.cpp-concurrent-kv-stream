@@ -383,6 +383,8 @@ private:
                      ggml_type type_v,
                       uint32_t il);
 
+    void kv_stream_init_cpu_split(ggml_backend_dev_t dev, uint32_t n_head, uint32_t context_pages);
+
     ggml_tensor * build_rope_shift(
             const llama_cparams & cparams,
                    ggml_context * ctx,

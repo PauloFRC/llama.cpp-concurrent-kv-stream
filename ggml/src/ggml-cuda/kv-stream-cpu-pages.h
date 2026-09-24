@@ -27,24 +27,41 @@ inline bool ggml_cuda_kv_stream_cpu_split_supported(const ggml_tensor * dst) {
         max_bias == 0.0f && logit_softcap == 0.0f;
 }
 
-inline bool ggml_cuda_kv_stream_page_immutable(
-        uint32_t page, uint32_t n_pages,
-        const std::vector<uint32_t> & mutable_pages, bool all_pages_mutable) {
-    return page + 1 < n_pages && !all_pages_mutable &&
-        std::find(mutable_pages.begin(), mutable_pages.end(), page) == mutable_pages.end();
-}
+struct ggml_cuda_kv_stream_page_state {
+    uint32_t n_pages;
+    uint32_t resident_pages;
+    const std::vector<uint8_t> & live_pages; // empty: every page is live
+    const std::vector<uint32_t> & mutable_pages;
+    bool all_pages_mutable;
+
+    ggml_cuda_kv_stream_page_state(
+            uint32_t n_pages, uint32_t resident_pages,
+            const std::vector<uint8_t> & live_pages,
+            const std::vector<uint32_t> & mutable_pages, bool all_pages_mutable) :
+        n_pages(n_pages), resident_pages(resident_pages), live_pages(live_pages),
+        mutable_pages(mutable_pages), all_pages_mutable(all_pages_mutable) {
+        GGML_ASSERT(live_pages.empty() || live_pages.size() == n_pages);
+        GGML_ASSERT(std::is_sorted(mutable_pages.begin(), mutable_pages.end()));
+    }
+
+    bool live(uint32_t page) const {
+        GGML_ASSERT(page < n_pages);
+        return live_pages.empty() || live_pages[page] != 0;
+    }
+
+    bool immutable(uint32_t page) const {
+        GGML_ASSERT(page < n_pages);
+        return page + 1 < n_pages && !all_pages_mutable &&
+            !std::binary_search(mutable_pages.begin(), mutable_pages.end(), page);
+    }
+};
 
 inline std::vector<uint32_t> ggml_cuda_kv_stream_select_cpu_pages(
-        uint32_t n_pages, uint32_t resident_pages,
-        const std::vector<uint8_t> & live_pages,
-        const std::vector<uint32_t> & mutable_pages, bool all_pages_mutable,
-        uint32_t n_cpu) {
-    GGML_ASSERT(live_pages.empty() || live_pages.size() == n_pages);
+        const ggml_cuda_kv_stream_page_state & state, uint32_t n_cpu) {
     std::vector<uint32_t> pages;
-    pages.reserve(std::min(n_cpu, n_pages));
-    for (uint32_t page = n_pages; page > resident_pages && pages.size() < n_cpu; --page) {
-        if ((live_pages.empty() || live_pages[page - 1] != 0) &&
-                ggml_cuda_kv_stream_page_immutable(page - 1, n_pages, mutable_pages, all_pages_mutable)) {
+    pages.reserve(std::min(n_cpu, state.n_pages));
+    for (uint32_t page = state.n_pages; page > state.resident_pages && pages.size() < n_cpu; --page) {
+        if (state.live(page - 1) && state.immutable(page - 1)) {
             pages.push_back(page - 1);
         }
     }

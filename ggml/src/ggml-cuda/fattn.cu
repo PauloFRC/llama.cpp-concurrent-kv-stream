@@ -172,23 +172,41 @@ constexpr uint32_t KV_STREAM_NO_LAYER = std::numeric_limits<uint32_t>::max();
 constexpr uint32_t KV_STREAM_COPY_BATCH_PAGES = 32;
 constexpr uint32_t KV_STREAM_DECODE_SPAN_PAGES = KV_STREAM_COPY_BATCH_PAGES;
 
-struct kv_stream_graph_request {
-    const char * k_data = nullptr;
-    const char * v_data = nullptr;
-    size_t k_nb1 = 0;
-    size_t k_nb2 = 0;
-    size_t v_nb1 = 0;
-    size_t v_nb2 = 0;
-    int64_t n_head_kv = 0;
+struct kv_stream_chunk_geometry {
     int64_t token_begin = 0;
     int64_t token_count = 0;
     size_t k_row_bytes = 0;
     size_t v_row_bytes = 0;
-    size_t k_head_bytes = 0;
-    size_t k_bytes = 0;
-    size_t v_offset = 0;
-    size_t v_head_bytes = 0;
-    size_t v_bytes = 0;
+    int64_t n_head_kv = 0;
+
+    kv_stream_chunk_geometry() = default;
+    kv_stream_chunk_geometry(const ggml_tensor * K, const ggml_tensor * V, int64_t token_begin, int64_t token_count) :
+        token_begin(token_begin), token_count(token_count),
+        k_row_bytes(ggml_row_size(K->type, K->ne[0])), v_row_bytes(ggml_row_size(V->type, V->ne[0])),
+        n_head_kv(K->ne[2]) {
+        GGML_ASSERT(V->ne[2] == n_head_kv);
+        GGML_ASSERT(K->nb[1] == k_token_stride() && K->nb[2] == k_row_bytes);
+        GGML_ASSERT(V->nb[1] == v_token_stride() && V->nb[2] == v_row_bytes);
+    }
+
+    size_t k_token_stride() const { return k_row_bytes*n_head_kv; }
+    size_t v_token_stride() const { return v_row_bytes*n_head_kv; }
+    size_t k_bytes() const { return k_token_stride()*token_count; }
+    size_t v_bytes() const { return v_token_stride()*token_count; }
+    size_t v_offset() const { return GGML_PAD(k_bytes(), 128); }
+    size_t page_bytes() const { return v_offset() + v_bytes(); }
+
+    bool follows(const kv_stream_chunk_geometry & previous) const {
+        return k_row_bytes == previous.k_row_bytes && v_row_bytes == previous.v_row_bytes &&
+            n_head_kv == previous.n_head_kv && token_count == previous.token_count &&
+            token_begin == previous.token_begin + previous.token_count;
+    }
+};
+
+struct kv_stream_graph_request {
+    const char * k_data = nullptr;
+    const char * v_data = nullptr;
+    kv_stream_chunk_geometry geometry;
     uint32_t layer = 0;
     uint32_t slot = 0;
     uint32_t ready_slot = 0;
@@ -1135,9 +1153,9 @@ bool ggml_cuda_kv_stream_resident_cache_mark_dirty_rows(
             return true;
         }
         const uint32_t page = uint32_t(uint64_t(rows[i])/cache->page_tokens);
-        if (std::find(cache->mutable_pages.begin(), cache->mutable_pages.end(), page) ==
-                cache->mutable_pages.end()) {
-            cache->mutable_pages.push_back(page);
+        const auto it = std::lower_bound(cache->mutable_pages.begin(), cache->mutable_pages.end(), page);
+        if (it == cache->mutable_pages.end() || *it != page) {
+            cache->mutable_pages.insert(it, page);
         }
         for (uint32_t layer = 0; layer < cache->layer_count; ++layer) {
             if (page < cache->layer_pages[layer]) {
@@ -1681,11 +1699,10 @@ static void kv_stream_graph_upload(
         ggml_cuda_kv_stream_transfer_ring * ring,
         kv_stream_graph_request & request,
         uint32_t slot) {
-    // Preserve the host cache's compact token-major layout. This makes each
-    // page one contiguous K transfer plus one contiguous V transfer.
-    char * k_stage = ring->pool_data + size_t(slot)*request.k_bytes;
+    const kv_stream_chunk_geometry & geometry = request.geometry;
+    char * k_stage = ring->pool_data + size_t(slot)*geometry.k_bytes();
     char * v_stage = ring->pool_data +
-        size_t(ring->active_slots)*request.k_bytes + size_t(slot)*request.v_bytes;
+        size_t(ring->active_slots)*geometry.k_bytes() + size_t(slot)*geometry.v_bytes();
     if (ring->slot_used[slot]) {
         CUDA_CHECK(cudaStreamWaitEvent(ring->copy_stream, ring->consumed[slot], 0));
         ++ring->stage_slot_reuses;
@@ -1697,16 +1714,12 @@ static void kv_stream_graph_upload(
     if (ring->timing_current && !ring->copy_sample_recorded) {
         CUDA_CHECK(cudaEventRecord(ring->copy_sample_start, ring->copy_stream));
     }
-    GGML_ASSERT(request.k_nb1 == request.k_row_bytes*request.n_head_kv);
-    GGML_ASSERT(request.k_nb2 == request.k_row_bytes);
-    GGML_ASSERT(request.v_nb1 == request.v_row_bytes*request.n_head_kv);
-    GGML_ASSERT(request.v_nb2 == request.v_row_bytes);
     CUDA_CHECK(cudaMemcpyAsync(
-        k_stage, request.k_data + request.token_begin*request.k_nb1,
-        request.k_bytes, cudaMemcpyHostToDevice, ring->copy_stream));
+        k_stage, request.k_data + geometry.token_begin*geometry.k_token_stride(),
+        geometry.k_bytes(), cudaMemcpyHostToDevice, ring->copy_stream));
     CUDA_CHECK(cudaMemcpyAsync(
-        v_stage, request.v_data + request.token_begin*request.v_nb1,
-        request.v_bytes, cudaMemcpyHostToDevice, ring->copy_stream));
+        v_stage, request.v_data + geometry.token_begin*geometry.v_token_stride(),
+        geometry.v_bytes(), cudaMemcpyHostToDevice, ring->copy_stream));
     ring->host_to_device_copy_commands += 2;
     if (request.deadline_sample) {
         CUDA_CHECK(cudaMemsetAsync(
@@ -1732,7 +1745,7 @@ static void kv_stream_graph_upload(
     ++ring->current_epoch_uploads;
     if (ring->graph_resident_cache != nullptr) {
         ring->graph_resident_cache->stats.host_to_device_bytes +=
-            request.k_bytes + request.v_bytes;
+            geometry.k_bytes() + geometry.v_bytes();
     }
     if (ring->current_layer != KV_STREAM_NO_LAYER && request.layer > ring->current_layer) {
         ++ring->cross_layer_prefetches;
@@ -1745,10 +1758,7 @@ static bool kv_stream_graph_request_follows(
     return request.eligible && !request.scheduled && !request.consumed &&
         request.layer == previous.layer &&
         request.k_data == previous.k_data && request.v_data == previous.v_data &&
-        request.k_nb1 == previous.k_nb1 && request.v_nb1 == previous.v_nb1 &&
-        request.k_bytes == previous.k_bytes && request.v_bytes == previous.v_bytes &&
-        request.token_count == previous.token_count &&
-        request.token_begin == previous.token_begin + previous.token_count;
+        request.geometry.follows(previous.geometry);
 }
 
 static void kv_stream_graph_upload_batch(
@@ -1779,19 +1789,16 @@ static void kv_stream_graph_upload_batch(
     if (ring->timing_current && !ring->copy_sample_recorded) {
         CUDA_CHECK(cudaEventRecord(ring->copy_sample_start, ring->copy_stream));
     }
-    GGML_ASSERT(first.k_nb1 == first.k_row_bytes*first.n_head_kv);
-    GGML_ASSERT(first.k_nb2 == first.k_row_bytes);
-    GGML_ASSERT(first.v_nb1 == first.v_row_bytes*first.n_head_kv);
-    GGML_ASSERT(first.v_nb2 == first.v_row_bytes);
-    char * k_stage = ring->pool_data + size_t(first_slot)*first.k_bytes;
+    const kv_stream_chunk_geometry & geometry = first.geometry;
+    char * k_stage = ring->pool_data + size_t(first_slot)*geometry.k_bytes();
     char * v_stage = ring->pool_data +
-        size_t(ring->active_slots)*first.k_bytes + size_t(first_slot)*first.v_bytes;
+        size_t(ring->active_slots)*geometry.k_bytes() + size_t(first_slot)*geometry.v_bytes();
     CUDA_CHECK(cudaMemcpyAsync(
-        k_stage, first.k_data + first.token_begin*first.k_nb1,
-        size_t(batch_pages)*first.k_bytes, cudaMemcpyHostToDevice, ring->copy_stream));
+        k_stage, first.k_data + geometry.token_begin*geometry.k_token_stride(),
+        size_t(batch_pages)*geometry.k_bytes(), cudaMemcpyHostToDevice, ring->copy_stream));
     CUDA_CHECK(cudaMemcpyAsync(
-        v_stage, first.v_data + first.token_begin*first.v_nb1,
-        size_t(batch_pages)*first.v_bytes, cudaMemcpyHostToDevice, ring->copy_stream));
+        v_stage, first.v_data + geometry.token_begin*geometry.v_token_stride(),
+        size_t(batch_pages)*geometry.v_bytes(), cudaMemcpyHostToDevice, ring->copy_stream));
     ring->host_to_device_copy_commands += 2;
 
     for (uint32_t page = 0; page < batch_pages; ++page) {
@@ -1822,7 +1829,7 @@ static void kv_stream_graph_upload_batch(
         ++ring->current_epoch_uploads;
         if (ring->graph_resident_cache != nullptr) {
             ring->graph_resident_cache->stats.host_to_device_bytes +=
-                request.k_bytes + request.v_bytes;
+                request.geometry.k_bytes() + request.geometry.v_bytes();
         }
         if (ring->current_layer != KV_STREAM_NO_LAYER && request.layer > ring->current_layer) {
             ++ring->cross_layer_prefetches;
@@ -2217,6 +2224,8 @@ bool ggml_cuda_kv_stream_graph_add_attention(
     kv_stream_layer_plan & plan = ring->graph_plans[K->data];
     plan.layer = ring->graph_layer_count++;
     plan.request_by_page.assign(nchunks, KV_STREAM_NO_REQUEST);
+    const ggml_cuda_kv_stream_page_state page_state(uint32_t(nchunks), resident_pages, ring->live_pages,
+        resident_cache->mutable_pages, resident_cache->all_pages_mutable);
     // the mask crosses to the host once per graph
     const ggml_tensor * mask = dst->src[3];
     kv_stream_cpu_graph * cpu_graph = ring->cpu_split == nullptr ? nullptr : &ring->cpu_split->graph;
@@ -2228,49 +2237,30 @@ bool ggml_cuda_kv_stream_graph_add_attention(
         if (n_cpu == 0 && cpu_graph->knobs.share > 0.0f) {
             uint32_t streamed = 0;
             for (uint32_t page = resident_pages; page < uint32_t(nchunks); ++page) {
-                streamed += kv_stream_page_live(ring, page, uint32_t(nchunks));
+                streamed += page_state.live(page);
             }
             n_cpu = uint32_t(std::lround(cpu_graph->knobs.share*float(streamed)));
         }
     }
-    std::vector<uint32_t> cpu_pages = ggml_cuda_kv_stream_select_cpu_pages(
-        uint32_t(nchunks), resident_pages, ring->live_pages,
-        resident_cache->mutable_pages, resident_cache->all_pages_mutable, n_cpu);
+    std::vector<uint32_t> cpu_pages = ggml_cuda_kv_stream_select_cpu_pages(page_state, n_cpu);
 
     for (int chunk = 0; chunk < nchunks; ++chunk) {
         const uint32_t page = uint32_t(chunk);
-        if (page < resident_pages ||
-                !kv_stream_page_live(ring, page, uint32_t(nchunks)) ||
+        if (page < resident_pages || !page_state.live(page) ||
                 std::binary_search(cpu_pages.begin(), cpu_pages.end(), page)) {
             continue;
         }
         const int64_t token_begin = chunk*block_tokens;
-        const int64_t token_count = std::min<int64_t>(block_tokens, K->ne[1] - token_begin);
-        const size_t k_row_bytes = ggml_row_size(K->type, K->ne[0]);
-        const size_t v_row_bytes = ggml_row_size(V->type, V->ne[0]);
 
         kv_stream_graph_request request;
         request.k_data = static_cast<const char *>(K->data);
         request.v_data = static_cast<const char *>(V->data);
-        request.k_nb1 = K->nb[1];
-        request.k_nb2 = K->nb[2];
-        request.v_nb1 = V->nb[1];
-        request.v_nb2 = V->nb[2];
-        request.n_head_kv = K->ne[2];
-        request.token_begin = token_begin;
-        request.token_count = token_count;
-        request.k_row_bytes = k_row_bytes;
-        request.v_row_bytes = v_row_bytes;
-        request.k_head_bytes = k_row_bytes*token_count;
-        request.k_bytes = request.k_head_bytes*K->ne[2];
-        request.v_offset = GGML_PAD(request.k_bytes, 128);
-        request.v_head_bytes = v_row_bytes*token_count;
-        request.v_bytes = request.v_head_bytes*V->ne[2];
+        request.geometry = kv_stream_chunk_geometry(
+            K, V, token_begin, std::min<int64_t>(block_tokens, K->ne[1] - token_begin));
         request.layer = plan.layer;
-        request.mutable_tail = !ggml_cuda_kv_stream_page_immutable(
-            page, uint32_t(nchunks), resident_cache->mutable_pages, resident_cache->all_pages_mutable);
+        request.mutable_tail = !page_state.immutable(page);
         request.eligible = !request.mutable_tail;
-        GGML_ASSERT(request.v_offset + request.v_bytes == ring->page_bytes);
+        GGML_ASSERT(request.geometry.page_bytes() == ring->page_bytes);
 
         plan.request_by_page[page] = ring->graph_requests.size();
         if (request.mutable_tail) {
@@ -2381,27 +2371,20 @@ void ggml_cuda_flash_attn_ext_streamed(
     const uint32_t maximum_streamed_span_pages = Q->ne[1] <= GGML_CUDA_KV_STREAM_MAX_DECODE_QUERY_TOKENS ?
         transfer_ring->graph_decode_span_pages : UINT32_MAX;
 
+    enum class chunk_kind : uint8_t {
+        resident,
+        streamed,
+        skipped,
+        cpu,
+    };
+
     struct chunk_descriptor {
-        int64_t token_begin = 0;
-        int64_t token_count = 0;
-        size_t k_row_bytes = 0;
-        size_t v_row_bytes = 0;
-        size_t k_head_bytes = 0;
-        size_t k_bytes = 0;
-        size_t v_offset = 0;
-        size_t v_head_bytes = 0;
-        size_t v_bytes = 0;
+        kv_stream_chunk_geometry geometry;
         char * k_stage = nullptr;
         char * v_stage = nullptr;
-        size_t k_stage_token_stride = 0;
-        size_t k_stage_head_stride = 0;
-        size_t v_stage_token_stride = 0;
-        size_t v_stage_head_stride = 0;
+        chunk_kind kind = chunk_kind::resident;
         bool upload = true;
         bool resident_refresh = false;
-        bool streamed = false;
-        bool skipped = false;
-        bool cpu = false;
         uint32_t slot = 0;
         size_t request_index = KV_STREAM_NO_REQUEST;
     };
@@ -2421,10 +2404,11 @@ void ggml_cuda_flash_attn_ext_streamed(
     uint32_t cpu_job = 0;
     if (has_cpu_pages) {
         GGML_ASSERT(resident_cache == transfer_ring->graph_resident_cache);
+        const ggml_cuda_kv_stream_page_state page_state(uint32_t(nchunks), resident_layer_pages,
+            transfer_ring->live_pages, resident_cache->mutable_pages, resident_cache->all_pages_mutable);
         for (const uint32_t page : plan->cpu_pages) {
-            GGML_ASSERT(ggml_cuda_kv_stream_page_immutable(
-                page, uint32_t(nchunks), resident_cache->mutable_pages, resident_cache->all_pages_mutable));
-            chunks[page].cpu = true;
+            GGML_ASSERT(page_state.immutable(page));
+            chunks[page].kind = chunk_kind::cpu;
         }
         transfer_ring->cpu_pages += plan->cpu_pages.size();
         cpu_job = kv_stream_cpu_split_dispatch(transfer_ring, dst, plan->cpu_pages, ctx.stream());
@@ -2447,42 +2431,23 @@ void ggml_cuda_flash_attn_ext_streamed(
     for (int chunk = 0; chunk < nchunks; ++chunk) {
         auto & desc = chunks[chunk];
         const int64_t token_begin = chunk*block_tokens;
-        const int64_t token_count = std::min<int64_t>(block_tokens, K->ne[1] - token_begin);
-        const size_t k_row_bytes = ggml_row_size(K->type, K->ne[0]);
-        const size_t v_row_bytes = ggml_row_size(V->type, V->ne[0]);
-        const size_t k_head_bytes = k_row_bytes*token_count;
-        const size_t k_bytes = k_head_bytes*K->ne[2];
-        const size_t v_offset = GGML_PAD(k_bytes, 128);
-        const size_t v_head_bytes = v_row_bytes*token_count;
-        const size_t v_bytes = v_head_bytes*V->ne[2];
-        GGML_ASSERT(v_offset <= stage_bytes && v_bytes <= stage_bytes - v_offset);
-
-        desc.token_begin = token_begin;
-        desc.token_count = token_count;
-        desc.k_row_bytes = k_row_bytes;
-        desc.v_row_bytes = v_row_bytes;
-        desc.k_head_bytes = k_head_bytes;
-        desc.k_bytes = k_bytes;
-        desc.v_offset = v_offset;
-        desc.v_head_bytes = v_head_bytes;
-        desc.v_bytes = v_bytes;
+        desc.geometry = kv_stream_chunk_geometry(
+            K, V, token_begin, std::min<int64_t>(block_tokens, K->ne[1] - token_begin));
+        const kv_stream_chunk_geometry & geometry = desc.geometry;
+        GGML_ASSERT(geometry.page_bytes() <= stage_bytes);
         desc.k_stage = static_cast<char *>(stage_data);
-        desc.v_stage = desc.k_stage + v_offset;
-        desc.k_stage_token_stride = k_row_bytes*K->ne[2];
-        desc.k_stage_head_stride = k_row_bytes;
-        desc.v_stage_token_stride = v_row_bytes*V->ne[2];
-        desc.v_stage_head_stride = v_row_bytes;
+        desc.v_stage = desc.k_stage + geometry.v_offset();
 
         if (resident_cache != nullptr) {
-            GGML_ASSERT(token_count == resident_cache->page_tokens);
-            GGML_ASSERT(v_offset + v_bytes == resident_cache->page_bytes);
+            GGML_ASSERT(geometry.token_count == resident_cache->page_tokens);
+            GGML_ASSERT(geometry.page_bytes() == resident_cache->page_bytes);
 
             const uint32_t page = token_begin/resident_cache->page_tokens;
             if (page < resident_layer_pages) {
                 // the planner hands the CPU only non-resident pages
-                GGML_ASSERT(!desc.cpu);
+                GGML_ASSERT(desc.kind != chunk_kind::cpu);
                 if (page < resident_first || page > resident_last) {
-                    desc.skipped = true;
+                    desc.kind = chunk_kind::skipped;
                     ++transfer_ring->skipped_pages;
                     continue;
                 }
@@ -2493,9 +2458,9 @@ void ggml_cuda_flash_attn_ext_streamed(
                 char * layer_base = resident_cache->pool_data + resident_cache->scratch_bytes +
                     resident_cache->layer_offsets[resident_layer]*resident_cache->page_bytes;
                 const size_t resident_k_plane_bytes =
-                    size_t(resident_layer_pages)*k_bytes;
-                desc.k_stage = layer_base + size_t(page)*k_bytes;
-                desc.v_stage = layer_base + resident_k_plane_bytes + size_t(page)*v_bytes;
+                    size_t(resident_layer_pages)*geometry.k_bytes();
+                desc.k_stage = layer_base + size_t(page)*geometry.k_bytes();
+                desc.v_stage = layer_base + resident_k_plane_bytes + size_t(page)*geometry.v_bytes();
                 if (resident_cache->loaded[resident_index]) {
                     ++resident_cache->stats.resident_hits;
                     desc.upload = resident_cache->precise_dirty_tracking[resident_layer] ?
@@ -2506,33 +2471,33 @@ void ggml_cuda_flash_attn_ext_streamed(
                     ++resident_cache->stats.resident_misses;
                     resident_cache->loaded[resident_index] = 1;
                 }
-            } else if (desc.cpu) {
+            } else if (desc.kind == chunk_kind::cpu) {
                 continue;
             } else if (!kv_stream_page_live(transfer_ring, page, uint32_t(nchunks))) {
-                desc.skipped = true;
+                desc.kind = chunk_kind::skipped;
                 ++transfer_ring->skipped_pages;
             } else {
                 ++resident_cache->stats.streamed_pages;
-                desc.streamed = true;
+                desc.kind = chunk_kind::streamed;
             }
         } else if (!kv_stream_page_live(transfer_ring, uint32_t(chunk), uint32_t(nchunks))) {
-            desc.skipped = true;
+            desc.kind = chunk_kind::skipped;
             ++transfer_ring->skipped_pages;
         } else {
-            desc.streamed = true;
+            desc.kind = chunk_kind::streamed;
         }
 
-        if (desc.streamed) {
+        if (desc.kind == chunk_kind::streamed) {
             const size_t stream_index = streamed_chunks.size();
             if (graph_planned) {
                 desc.request_index = plan->request_by_page[chunk];
                 GGML_ASSERT(desc.request_index != KV_STREAM_NO_REQUEST);
             } else {
                 desc.slot = uint32_t(stream_index%transfer_ring->active_slots);
-                desc.k_stage = transfer_ring->pool_data + size_t(desc.slot)*desc.k_bytes;
+                desc.k_stage = transfer_ring->pool_data + size_t(desc.slot)*geometry.k_bytes();
                 desc.v_stage = transfer_ring->pool_data +
-                    size_t(transfer_ring->active_slots)*desc.k_bytes +
-                    size_t(desc.slot)*desc.v_bytes;
+                    size_t(transfer_ring->active_slots)*geometry.k_bytes() +
+                    size_t(desc.slot)*geometry.v_bytes();
             }
             streamed_chunks.push_back(chunk);
         }
@@ -2569,46 +2534,46 @@ void ggml_cuda_flash_attn_ext_streamed(
         if (!desc.upload) {
             return;
         }
-        GGML_ASSERT(K->nb[1] == desc.k_stage_token_stride && K->nb[2] == desc.k_stage_head_stride);
-        GGML_ASSERT(V->nb[1] == desc.v_stage_token_stride && V->nb[2] == desc.v_stage_head_stride);
+        const kv_stream_chunk_geometry & geometry = desc.geometry;
+        const int64_t token_end = geometry.token_begin + geometry.token_count;
         size_t dirty_row_count = 0;
         if (resident_cache != nullptr && desc.resident_refresh &&
                 !resident_cache->all_pages_mutable) {
             for (const int64_t row : resident_cache->dirty_rows) {
-                if (row >= desc.token_begin && row < desc.token_begin + desc.token_count) {
+                if (row >= geometry.token_begin && row < token_end) {
                     ++dirty_row_count;
                 }
             }
         }
-        const size_t dirty_bytes = dirty_row_count*(desc.k_stage_token_stride + desc.v_stage_token_stride);
-        if (dirty_row_count > 0 && dirty_bytes < desc.k_bytes + desc.v_bytes) {
+        const size_t dirty_bytes = dirty_row_count*(geometry.k_token_stride() + geometry.v_token_stride());
+        if (dirty_row_count > 0 && dirty_bytes < geometry.k_bytes() + geometry.v_bytes()) {
             for (const int64_t row : resident_cache->dirty_rows) {
-                if (row < desc.token_begin || row >= desc.token_begin + desc.token_count) {
+                if (row < geometry.token_begin || row >= token_end) {
                     continue;
                 }
-                const size_t page_row = size_t(row - desc.token_begin);
+                const size_t page_row = size_t(row - geometry.token_begin);
                 CUDA_CHECK(cudaMemcpyAsync(
-                    desc.k_stage + page_row*desc.k_stage_token_stride,
+                    desc.k_stage + page_row*geometry.k_token_stride(),
                     static_cast<const char *>(K->data) + row*K->nb[1],
-                    desc.k_stage_token_stride, cudaMemcpyHostToDevice, stream));
+                    geometry.k_token_stride(), cudaMemcpyHostToDevice, stream));
                 CUDA_CHECK(cudaMemcpyAsync(
-                    desc.v_stage + page_row*desc.v_stage_token_stride,
+                    desc.v_stage + page_row*geometry.v_token_stride(),
                     static_cast<const char *>(V->data) + row*V->nb[1],
-                    desc.v_stage_token_stride, cudaMemcpyHostToDevice, stream));
+                    geometry.v_token_stride(), cudaMemcpyHostToDevice, stream));
             }
             transfer_ring->host_to_device_copy_commands += 2*dirty_row_count;
             resident_cache->stats.host_to_device_bytes += dirty_bytes;
             return;
         }
         CUDA_CHECK(cudaMemcpyAsync(
-            desc.k_stage, static_cast<const char *>(K->data) + desc.token_begin*K->nb[1],
-            desc.k_bytes, cudaMemcpyHostToDevice, stream));
+            desc.k_stage, static_cast<const char *>(K->data) + geometry.token_begin*K->nb[1],
+            geometry.k_bytes(), cudaMemcpyHostToDevice, stream));
         CUDA_CHECK(cudaMemcpyAsync(
-            desc.v_stage, static_cast<const char *>(V->data) + desc.token_begin*V->nb[1],
-            desc.v_bytes, cudaMemcpyHostToDevice, stream));
+            desc.v_stage, static_cast<const char *>(V->data) + geometry.token_begin*V->nb[1],
+            geometry.v_bytes(), cudaMemcpyHostToDevice, stream));
         transfer_ring->host_to_device_copy_commands += 2;
         if (resident_cache != nullptr) {
-            resident_cache->stats.host_to_device_bytes += desc.k_bytes + desc.v_bytes;
+            resident_cache->stats.host_to_device_bytes += geometry.k_bytes() + geometry.v_bytes();
         }
     };
 
@@ -2644,11 +2609,11 @@ void ggml_cuda_flash_attn_ext_streamed(
     size_t stream_index = 0;
     for (int chunk = 0; chunk < nchunks; ++chunk) {
         auto & desc = chunks[chunk];
-        if (desc.skipped || desc.cpu) {
+        if (desc.kind == chunk_kind::skipped || desc.kind == chunk_kind::cpu) {
             continue;
         }
         uint32_t streamed_span_pages = 0;
-        if (desc.streamed) {
+        if (desc.kind == chunk_kind::streamed) {
             streamed_span_pages = 1;
             uint32_t ready_slot = desc.slot;
             if (graph_planned) {
@@ -2656,10 +2621,10 @@ void ggml_cuda_flash_attn_ext_streamed(
                 GGML_ASSERT(request.scheduled && !request.consumed);
                 desc.slot = request.slot;
                 ready_slot = request.ready_slot;
-                desc.k_stage = transfer_ring->pool_data + size_t(desc.slot)*desc.k_bytes;
+                desc.k_stage = transfer_ring->pool_data + size_t(desc.slot)*desc.geometry.k_bytes();
                 desc.v_stage = transfer_ring->pool_data +
-                    size_t(transfer_ring->active_slots)*desc.k_bytes +
-                    size_t(desc.slot)*desc.v_bytes;
+                    size_t(transfer_ring->active_slots)*desc.geometry.k_bytes() +
+                    size_t(desc.slot)*desc.geometry.v_bytes();
                 if (request.deadline_sample) {
                     kv_stream_record_deadline<<<1, 1, 0, ctx.stream()>>>(
                         transfer_ring->ready_flags_device + desc.slot,
@@ -2679,7 +2644,7 @@ void ggml_cuda_flash_attn_ext_streamed(
                     chunk + int(streamed_span_pages) < nchunks) {
                 auto & candidate = chunks[chunk + streamed_span_pages];
                 uint32_t candidate_ready_slot = candidate.slot;
-                if (!candidate.streamed) {
+                if (candidate.kind != chunk_kind::streamed) {
                     break;
                 }
                 if (graph_planned) {
@@ -2690,13 +2655,13 @@ void ggml_cuda_flash_attn_ext_streamed(
                     candidate.slot = request.slot;
                     candidate_ready_slot = request.ready_slot;
                     candidate.k_stage = transfer_ring->pool_data +
-                        size_t(candidate.slot)*candidate.k_bytes;
+                        size_t(candidate.slot)*candidate.geometry.k_bytes();
                     candidate.v_stage = transfer_ring->pool_data +
-                        size_t(transfer_ring->active_slots)*candidate.k_bytes +
-                        size_t(candidate.slot)*candidate.v_bytes;
+                        size_t(transfer_ring->active_slots)*candidate.geometry.k_bytes() +
+                        size_t(candidate.slot)*candidate.geometry.v_bytes();
                 }
                 if (candidate.slot != desc.slot + streamed_span_pages ||
-                        candidate.token_begin != desc.token_begin +
+                        candidate.geometry.token_begin != desc.geometry.token_begin +
                             int64_t(streamed_span_pages)*block_tokens) {
                     break;
                 }
@@ -2718,7 +2683,7 @@ void ggml_cuda_flash_attn_ext_streamed(
                 }
                 ++streamed_span_pages;
             }
-            desc.token_count = int64_t(streamed_span_pages)*block_tokens;
+            desc.geometry.token_count = int64_t(streamed_span_pages)*block_tokens;
             if (resident_cache != nullptr) {
                 ++resident_cache->stats.streamed_attention_spans;
                 resident_cache->stats.streamed_pages_attended += streamed_span_pages;
@@ -2753,35 +2718,32 @@ void ggml_cuda_flash_attn_ext_streamed(
                             kv_stream_resident_index(resident_cache, resident_layer, page)] = 0;
                     }
                 }
-                desc.token_count = int64_t(resident_span_pages)*block_tokens;
-                desc.k_head_bytes = desc.k_row_bytes*desc.token_count;
-                desc.k_bytes = desc.k_head_bytes*K->ne[2];
-                desc.v_head_bytes = desc.v_row_bytes*desc.token_count;
-                desc.v_bytes = desc.v_head_bytes*V->ne[2];
+                desc.geometry.token_count = int64_t(resident_span_pages)*block_tokens;
                 ++resident_cache->stats.resident_attention_spans;
                 resident_cache->stats.resident_pages_attended += resident_span_pages;
             }
         }
 
+        const kv_stream_chunk_geometry & geometry = desc.geometry;
         ggml_tensor staged_k = *K;
         ggml_tensor staged_v = *V;
         staged_k.data = desc.k_stage;
-        staged_k.ne[1] = desc.token_count;
-        staged_k.nb[1] = desc.k_stage_token_stride;
-        staged_k.nb[2] = desc.k_stage_head_stride;
-        staged_k.nb[3] = desc.k_stage_token_stride*desc.token_count;
+        staged_k.ne[1] = geometry.token_count;
+        staged_k.nb[1] = geometry.k_token_stride();
+        staged_k.nb[2] = geometry.k_row_bytes;
+        staged_k.nb[3] = geometry.k_bytes();
         staged_v.data = desc.v_stage;
-        staged_v.ne[1] = desc.token_count;
-        staged_v.nb[1] = desc.v_stage_token_stride;
-        staged_v.nb[2] = desc.v_stage_head_stride;
-        staged_v.nb[3] = desc.v_stage_token_stride*desc.token_count;
+        staged_v.ne[1] = geometry.token_count;
+        staged_v.nb[1] = geometry.v_token_stride();
+        staged_v.nb[2] = geometry.v_row_bytes;
+        staged_v.nb[3] = geometry.v_bytes();
 
         ggml_tensor converted_k{};
         ggml_tensor converted_v{};
         if (convert_to_f16) {
             GGML_ASSERT(transfer_ring->conversion_data != nullptr);
-            const size_t k_elements = size_t(K->ne[0])*desc.token_count*K->ne[2];
-            const size_t v_elements = size_t(V->ne[0])*desc.token_count*V->ne[2];
+            const size_t k_elements = size_t(K->ne[0])*geometry.token_count*K->ne[2];
+            const size_t v_elements = size_t(V->ne[0])*geometry.token_count*V->ne[2];
             const size_t k_f16_bytes = k_elements*sizeof(half);
             const size_t v_f16_offset = GGML_PAD(k_f16_bytes, 128);
             const size_t v_f16_bytes = v_elements*sizeof(half);
@@ -2824,8 +2786,8 @@ void ggml_cuda_flash_attn_ext_streamed(
         ggml_tensor * staged_mask_ptr = nullptr;
         if (mask != nullptr) {
             staged_mask = *mask;
-            staged_mask.data = static_cast<char *>(mask->data) + desc.token_begin*mask->nb[0];
-            staged_mask.ne[0] = desc.token_count;
+            staged_mask.data = static_cast<char *>(mask->data) + geometry.token_begin*mask->nb[0];
+            staged_mask.ne[0] = geometry.token_count;
             staged_mask_ptr = &staged_mask;
         }
 
@@ -2838,7 +2800,7 @@ void ggml_cuda_flash_attn_ext_streamed(
         // This avoids a partial reduction and keeps logits identical to a non-streamed cache.
         if (!convert_to_f16 && !has_cpu_pages && (streamed_chunks.empty() || nchunks == 1)) {
             ggml_cuda_flash_attn_ext(ctx, &staged_dst);
-            if (desc.streamed) {
+            if (desc.kind == chunk_kind::streamed) {
                 if (graph_planned) {
                     kv_stream_graph_release(transfer_ring, desc.request_index, ctx.stream());
                     kv_stream_graph_fill_free_slots(transfer_ring);
@@ -2911,7 +2873,7 @@ void ggml_cuda_flash_attn_ext_streamed(
 
         first_chunk = false;
 
-        if (desc.streamed) {
+        if (desc.kind == chunk_kind::streamed) {
             for (uint32_t page = 0; page < streamed_span_pages; ++page) {
                 auto & member = chunks[chunk + page];
                 if (graph_planned) {

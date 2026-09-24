@@ -811,22 +811,25 @@ int main() {
 
     t.test("cpu page selection takes the highest immutable streamed pages", [](testing & t) {
         using pages = std::vector<uint32_t>;
+        using page_state = ggml_cuda_kv_stream_page_state;
         const std::vector<uint8_t> all_live;
         const pages no_mutable;
 
         t.assert_true("the last page stays on the GPU",
-            ggml_cuda_kv_stream_select_cpu_pages(8, 2, all_live, no_mutable, false, 1) == pages{6});
+            ggml_cuda_kv_stream_select_cpu_pages(page_state(8, 2, all_live, no_mutable, false), 1) == pages{6});
         t.assert_true("a one-page layer gets no CPU pages",
-            ggml_cuda_kv_stream_select_cpu_pages(1, 0, all_live, no_mutable, false, 4).empty());
+            ggml_cuda_kv_stream_select_cpu_pages(page_state(1, 0, all_live, no_mutable, false), 4).empty());
 
         std::vector<uint8_t> live(10, 1);
         live[5] = 0;
         t.assert_true("an oversized request clamps to non-resident, live, immutable pages",
-            ggml_cuda_kv_stream_select_cpu_pages(10, 3, live, pages{7}, false, 100) == pages{3, 4, 6, 8});
+            ggml_cuda_kv_stream_select_cpu_pages(page_state(10, 3, live, pages{7}, false), 100) == pages{3, 4, 6, 8});
         t.assert_true("a restore step gets no CPU pages",
-            ggml_cuda_kv_stream_select_cpu_pages(10, 3, all_live, no_mutable, true, 5).empty());
+            ggml_cuda_kv_stream_select_cpu_pages(page_state(10, 3, all_live, no_mutable, true), 5).empty());
         t.assert_true("an interior mutable page is passed over",
-            ggml_cuda_kv_stream_select_cpu_pages(10, 2, all_live, pages{7}, false, 2) == pages{6, 8});
+            ggml_cuda_kv_stream_select_cpu_pages(page_state(10, 2, all_live, pages{7}, false), 2) == pages{6, 8});
+        t.assert_true("every sorted mutable page is passed over",
+            ggml_cuda_kv_stream_select_cpu_pages(page_state(10, 2, all_live, pages{3, 5, 7}, false), 4) == pages{2, 4, 6, 8});
     });
 
     t.test("cpu split scope is q8_0 K, q4_0 V decode at head dim 256", [](testing & t) {
@@ -2386,6 +2389,63 @@ int main() {
                 t.assert_true(name + ": gpu output excludes cpu pages", is_finite(actual) && max_abs <= 1e-6f);
             }
         }
+    });
+
+    t.test("pages written out of page order stay on the GPU", [](testing & t) {
+        if (!ggml_cuda_kv_stream_cpu_attn_supported()) {
+            t.skip("CPU attention needs AVX-512 F, DQ, VNNI, F16C and FMA");
+            return;
+        }
+        constexpr int64_t n_kv = 41*256;
+        constexpr int64_t n_batch = 1;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+        auto runtime = make_runtime(make_stream_params(backend.get(), 40, 41, 1, 32));
+        if (!t.assert_true("runtime initializes", runtime != nullptr)) {
+            return;
+        }
+        t.assert_true("cpu split scratch allocates",
+            ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 1, N_Q_HEAD, 41));
+
+        // multi-sequence decode writes one row per sequence in batch order, not page order
+        const int64_t rows[] = {35*PAGE_TOKENS + 3, 20*PAGE_TOKENS + 1};
+        const attention_inputs inputs = make_inputs(n_kv, n_batch, n_kv);
+        attention_inputs hidden = inputs;
+        for (int64_t page = 1; page < 40; ++page) {
+            if (page == 20 || page == 35) {
+                continue;
+            }
+            for (int64_t token = page*PAGE_TOKENS; token < (page + 1)*PAGE_TOKENS; ++token) {
+                hidden.mask[token] = ggml_fp32_to_fp16(-INFINITY);
+            }
+        }
+        const std::vector<float> expected = run_attention(
+            backend.get(), hidden, ggml_backend_get_default_buffer_type(backend.get()),
+            n_kv, n_batch, 1, 2, false, GGML_TYPE_I32, true, nullptr, false, false, 0, rows);
+        std::vector<float> actual;
+        {
+            scoped_env env{
+                {"GGML_CUDA_KV_STREAM_CPU_PAGES", "64"},
+                // TODO: compare with full attention once Task D drops the spin body
+                {"GGML_CUDA_KV_STREAM_CPU_BODY", "spin"},
+            };
+            actual = run_attention(
+                backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime.get()),
+                n_kv, n_batch, 1, 2, false, GGML_TYPE_I32, true, runtime.get(), false, false, 0, rows);
+        }
+        const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime.get());
+
+        t.assert_equal(uint64_t(37), stats.cpu_pages);
+        t.assert_equal(uint64_t(3), stats.streamed_pages);
+        t.assert_equal(uint64_t(41), stats.resident_pages_attended + stats.skipped_pages +
+            stats.streamed_pages_attended + stats.cpu_pages);
+        if (!t.assert_equal(expected.size(), actual.size())) {
+            return;
+        }
+        t.assert_true("the written pages are attended on the GPU",
+            is_finite(actual) && max_abs_error(expected, actual) <= 1e-6f);
     });
 
     t.test("cpu pages stay with the layers of the first mask", [](testing & t) {

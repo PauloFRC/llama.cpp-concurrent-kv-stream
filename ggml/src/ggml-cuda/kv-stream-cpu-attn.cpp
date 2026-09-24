@@ -198,13 +198,12 @@ void ggml_cuda_kv_stream_cpu_attn(const ggml_cuda_kv_stream_cpu_attn_params & p)
     for (uint32_t slot = 0; slot < p.n_pages; ++slot) {
         for (uint32_t c0 = 0; c0 < p.page_tokens; c0 += TILE) {
             const size_t cell0 = size_t(p.pages[slot])*p.page_tokens + c0;
-            const size_t col0 = size_t(slot)*p.page_tokens + c0;
 
             bool any = false;
             for (int t = 0; t < p.n_tokens; ++t) {
                 __m512 m = _mm512_setzero_ps();
                 if (p.mask != nullptr) {
-                    const uint16_t * mp = (const uint16_t *)((const uint8_t *) p.mask + size_t(t)*p.mask_token_stride) + col0;
+                    const uint16_t * mp = (const uint16_t *)((const uint8_t *) p.mask + size_t(t)*p.mask_token_stride) + cell0;
                     m = _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *) mp));
                 }
                 mrow[t] = m;

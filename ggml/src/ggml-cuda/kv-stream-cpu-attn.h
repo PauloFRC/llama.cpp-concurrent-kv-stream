@@ -19,7 +19,7 @@ struct ggml_cuda_kv_stream_cpu_attn_params {
     const float * q = nullptr;
     size_t q_token_stride = 0;
     size_t q_head_stride = 0;
-    const uint16_t * mask = nullptr;
+    const uint16_t * mask = nullptr;   // indexed by cell
     size_t mask_token_stride = 0;
     const uint32_t * pages = nullptr;
     uint32_t n_pages = 0;

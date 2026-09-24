@@ -11,18 +11,33 @@
 #include <utility>
 #include <vector>
 
+#if defined(__linux__)
+#include <pthread.h>
+#include <sched.h>
+#endif
+
 // jobs run one at a time in arm order, each on every thread; job ids wrap and compare cyclically
+// thread i is pinned to cpus[i % cpus.size()] when cpus is not empty
 template <typename job_t>
 class ggml_cuda_kv_stream_cpu_pool {
 public:
     using body_fn = std::function<void(const job_t & job, int thread, int n_threads)>;
 
-    ggml_cuda_kv_stream_cpu_pool(int n_threads, uint32_t depth, body_fn body, std::atomic<uint32_t> * done = nullptr) :
+    ggml_cuda_kv_stream_cpu_pool(int n_threads, uint32_t depth, body_fn body, std::atomic<uint32_t> * done = nullptr,
+            const std::vector<int> & cpus = {}) :
             n_threads_(n_threads), jobs_(depth), body_(std::move(body)), done_(done), pending_(n_threads) {
         GGML_ASSERT(n_threads > 0 && depth > 0);
+#if defined(__linux__)
+        for (const int cpu : cpus) {
+            GGML_ASSERT(cpu >= 0 && cpu < CPU_SETSIZE);
+        }
+#else
+        GGML_ASSERT(cpus.empty() && "CPU pinning needs Linux");
+#endif
         threads_.reserve(n_threads);
         for (int thread = 0; thread < n_threads; ++thread) {
-            threads_.emplace_back([this, thread] { run(thread); });
+            const int cpu = cpus.empty() ? -1 : cpus[thread % cpus.size()];
+            threads_.emplace_back([this, thread, cpu] { run(thread, cpu); });
         }
     }
 
@@ -68,13 +83,29 @@ public:
         done_cv_.wait(lock, [this] { return completed_ == armed_; });
     }
 
+    // TODO: only the Task B skeleton counters read this
+    uint32_t queued() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return uint32_t(armed_ - completed_);
+    }
+
     bool idle() {
         std::lock_guard<std::mutex> lock(mutex_);
         return completed_ == armed_;
     }
 
 private:
-    void run(int thread) {
+    void run(int thread, int cpu) {
+#if defined(__linux__)
+        if (cpu >= 0) {
+            cpu_set_t set;
+            CPU_ZERO(&set);
+            CPU_SET(cpu, &set);
+            GGML_ASSERT(pthread_setaffinity_np(pthread_self(), sizeof(set), &set) == 0);
+        }
+#else
+        GGML_UNUSED(cpu);
+#endif
         uint64_t last = 0;
         std::unique_lock<std::mutex> lock(mutex_);
         for (;;) {

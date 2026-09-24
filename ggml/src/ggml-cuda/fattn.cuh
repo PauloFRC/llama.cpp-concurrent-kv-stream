@@ -32,6 +32,7 @@ struct ggml_cuda_kv_stream_transfer_stats {
     uint64_t deadline_misses = 0;
     uint32_t ring_peak_occupancy = 0;
     uint64_t cpu_pages = 0;
+    uint64_t cpu_jobs = 0;
 };
 
 ggml_cuda_kv_stream_resident_cache * ggml_cuda_kv_stream_resident_cache_new(
@@ -79,7 +80,8 @@ bool ggml_cuda_kv_stream_transfer_ring_set_active_slots(
 void ggml_cuda_kv_stream_transfer_ring_set_live_pages(
     ggml_cuda_kv_stream_transfer_ring * ring, const uint8_t * live_pages, size_t count);
 bool ggml_cuda_kv_stream_transfer_ring_set_cpu_split(
-    ggml_cuda_kv_stream_transfer_ring * ring, uint32_t n_threads, uint32_t n_head, uint32_t context_pages);
+    ggml_cuda_kv_stream_transfer_ring * ring, uint32_t n_threads, uint32_t n_head, uint32_t context_pages,
+    uint32_t n_layers);
 void ggml_cuda_kv_stream_transfer_ring_reset_span_tuner(ggml_cuda_kv_stream_transfer_ring * ring);
 bool ggml_cuda_kv_stream_transfer_ring_observe_decode_latency(
     ggml_cuda_kv_stream_transfer_ring * ring, double elapsed_ms);

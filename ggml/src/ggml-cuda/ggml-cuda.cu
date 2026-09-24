@@ -1793,7 +1793,7 @@ bool ggml_backend_cuda_kv_stream_set_cpu_split(
     }
     ggml_cuda_set_device(runtime->device);
     return ggml_cuda_kv_stream_transfer_ring_set_cpu_split(
-        runtime->transfer_ring, n_threads, n_head, context_pages);
+        runtime->transfer_ring, n_threads, n_head, context_pages, runtime->resident_layer_count);
 }
 
 ggml_backend_cuda_kv_stream_stats ggml_backend_cuda_kv_stream_get_stats(
@@ -1825,6 +1825,7 @@ ggml_backend_cuda_kv_stream_stats ggml_backend_cuda_kv_stream_get_stats(
         runtime->staged_set_rows,
         runtime->staged_set_rows_bytes,
         transfer_stats.cpu_pages,
+        transfer_stats.cpu_jobs,
     };
 }
 

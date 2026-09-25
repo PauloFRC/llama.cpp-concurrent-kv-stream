@@ -33,6 +33,10 @@ struct ggml_cuda_kv_stream_transfer_stats {
     uint32_t ring_peak_occupancy = 0;
     uint64_t cpu_pages = 0;
     uint64_t cpu_jobs = 0;
+    uint64_t cpu_decline_prefill = 0;
+    uint64_t cpu_decline_no_eligible_pages = 0;
+    uint64_t cpu_decline_below_min_pages = 0;
+    uint64_t cpu_decline_all_mutable = 0;
 };
 
 ggml_cuda_kv_stream_resident_cache * ggml_cuda_kv_stream_resident_cache_new(

@@ -93,6 +93,10 @@ struct ggml_backend_cuda_kv_stream_stats {
     uint64_t staged_set_rows_bytes;
     uint64_t cpu_pages;
     uint64_t cpu_jobs;
+    uint64_t cpu_decline_prefill;
+    uint64_t cpu_decline_no_eligible_pages;
+    uint64_t cpu_decline_below_min_pages;
+    uint64_t cpu_decline_all_mutable;
 };
 
 GGML_BACKEND_API ggml_backend_cuda_kv_stream_runtime_t ggml_backend_cuda_kv_stream_runtime_new(

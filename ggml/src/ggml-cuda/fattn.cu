@@ -544,6 +544,10 @@ struct ggml_cuda_kv_stream_transfer_ring {
     uint64_t cross_layer_prefetches = 0;
     uint64_t cpu_pages = 0;
     uint64_t cpu_jobs = 0;
+    uint64_t cpu_decline_prefill = 0;
+    uint64_t cpu_decline_no_eligible_pages = 0;
+    uint64_t cpu_decline_below_min_pages = 0;
+    uint64_t cpu_decline_all_mutable = 0;
     uint32_t current_occupancy = 0;
     uint32_t ring_peak_occupancy = 0;
     uint32_t current_ring_peak_occupancy = 0;
@@ -809,6 +813,10 @@ ggml_cuda_kv_stream_transfer_stats ggml_cuda_kv_stream_transfer_ring_get_stats(
         ring->ring_peak_occupancy,
         ring->cpu_pages,
         ring->cpu_jobs,
+        ring->cpu_decline_prefill,
+        ring->cpu_decline_no_eligible_pages,
+        ring->cpu_decline_below_min_pages,
+        ring->cpu_decline_all_mutable,
     };
 }
 
@@ -2148,6 +2156,9 @@ bool ggml_cuda_kv_stream_graph_add_attention(
     const bool decode_shaped = dst->src[0]->ne[1] <= GGML_CUDA_KV_STREAM_MAX_DECODE_QUERY_TOKENS;
     ring->graph_decode = ring->graph_decode && decode_shaped;
     if (!decode_shaped) {
+        if (ring->cpu_split != nullptr) {
+            ++ring->cpu_decline_prefill;
+        }
         // Graphs are rebuilt across warmup, prompt chunks, and slot reuse.
         // Relearn pointer-to-layer identity once per prefill ubatch while the
         // resident page contents are refreshed by the local multi-token path.
@@ -2220,6 +2231,18 @@ bool ggml_cuda_kv_stream_graph_add_attention(
         }
     }
     std::vector<uint32_t> cpu_pages = ggml_cuda_kv_stream_select_cpu_pages(page_state, n_cpu);
+
+    if (!cpu_pages.empty() && cpu_graph != nullptr && cpu_graph->knobs.pages_per_layer == 0 &&
+            cpu_pages.size() < GGML_CUDA_KV_STREAM_CPU_SPLIT_MIN_PAGES) {
+        cpu_pages.clear();
+        ++ring->cpu_decline_below_min_pages;
+    } else if (cpu_pages.empty() && n_cpu != 0) {
+        if (page_state.all_pages_mutable) {
+            ++ring->cpu_decline_all_mutable;
+        } else {
+            ++ring->cpu_decline_no_eligible_pages;
+        }
+    }
 
     for (int chunk = 0; chunk < nchunks; ++chunk) {
         const uint32_t page = uint32_t(chunk);

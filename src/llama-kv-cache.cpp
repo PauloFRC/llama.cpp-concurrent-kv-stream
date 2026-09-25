@@ -1413,33 +1413,23 @@ bool llama_kv_cache::kv_stream_adapt(uint32_t active_tokens, uint32_t query_toke
     owner.previous_adapt_us = now_us;
     owner.previous_query_tokens = query_tokens;
 
-    uint64_t deadline_samples = 0;
-    uint64_t deadline_misses = 0;
+    llama_kv_stream_feedback_counters counters;
     double copy_busy_ratio = 0.0;
     uint32_t peak_occupancy = 0;
     uint32_t ring_slots = 0;
     uint32_t resident_pages = 0;
     uint32_t controlled_pages = 0;
-    uint64_t skipped_pages = 0;
-    uint64_t resident_pages_attended = 0;
-    uint64_t cpu_pages = 0;
     if (!owner.feedback_fn(owner.runtime,
-            &deadline_samples, &deadline_misses, &copy_busy_ratio,
+            &counters.deadline_samples, &counters.deadline_misses, &copy_busy_ratio,
             &peak_occupancy, &ring_slots, &resident_pages, &controlled_pages,
-            &skipped_pages, &resident_pages_attended, &cpu_pages)) {
+            &counters.skipped_pages, &counters.resident_pages_attended, &counters.cpu_pages,
+            &counters.cpu_decline_prefill, &counters.cpu_decline_no_eligible_pages,
+            &counters.cpu_decline_below_min_pages, &counters.cpu_decline_all_mutable)) {
         return false;
     }
 
-    const auto delta = llama_kv_stream_feedback_delta_make(
-        { deadline_samples, deadline_misses, skipped_pages, resident_pages_attended, cpu_pages },
-        { owner.previous_deadline_samples, owner.previous_deadline_misses,
-          owner.previous_skipped_pages, owner.previous_resident_pages_attended,
-          owner.previous_cpu_pages });
-    owner.previous_deadline_samples = deadline_samples;
-    owner.previous_deadline_misses = deadline_misses;
-    owner.previous_skipped_pages = skipped_pages;
-    owner.previous_resident_pages_attended = resident_pages_attended;
-    owner.previous_cpu_pages = cpu_pages;
+    const auto delta = llama_kv_stream_feedback_delta_make(counters, owner.previous_counters);
+    owner.previous_counters = counters;
 
     const uint32_t active_pages = (active_tokens + page_tokens - 1) / page_tokens;
 
@@ -1451,14 +1441,18 @@ bool llama_kv_cache::kv_stream_adapt(uint32_t active_tokens, uint32_t query_toke
         decode_layout_pages != 0 && decode_layout_pages != owner.decode_layout_pages;
 
     if (getenv("LLAMA_KV_STREAM_TRACE") != nullptr) {
-        LLAMA_LOG_WARN("%s: active %u, resident %u, ring %u, layout %u, samples %llu, misses %llu, copy busy %.1f%%, peak %u, skipped %llu, resident attended %llu, cpu pages %llu\n",
+        LLAMA_LOG_WARN("%s: active %u, resident %u, ring %u, layout %u, samples %llu, misses %llu, copy busy %.1f%%, peak %u, skipped %llu, resident attended %llu, cpu pages %llu, cpu declines prefill/no eligible/below min/all mutable %llu/%llu/%llu/%llu\n",
             __func__, active_tokens, resident_pages, ring_slots, decode_layout_pages,
             (unsigned long long) delta.deadline_samples,
             (unsigned long long) delta.deadline_misses,
             100.0*copy_busy_ratio, peak_occupancy,
             (unsigned long long) delta.skipped_pages,
             (unsigned long long) delta.resident_pages_attended,
-            (unsigned long long) delta.cpu_pages);
+            (unsigned long long) delta.cpu_pages,
+            (unsigned long long) delta.cpu_decline_prefill,
+            (unsigned long long) delta.cpu_decline_no_eligible_pages,
+            (unsigned long long) delta.cpu_decline_below_min_pages,
+            (unsigned long long) delta.cpu_decline_all_mutable);
     }
 
     if (ring_slots != 0 && owner.minimum_ring_slots == 0) {

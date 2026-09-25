@@ -19,9 +19,9 @@
 #include <cstring>
 #include <limits>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -230,6 +230,8 @@ struct kv_stream_cpu_knobs {
     bool spin = false;
     double dram_bandwidth_gbps = 0.0;
     bool copy_part_to_device = false;
+    int delay_thread = -1;
+    int64_t delay_ns = 0;
 };
 
 struct kv_stream_cpu_job_record;
@@ -237,7 +239,9 @@ struct kv_stream_cpu_job_record;
 struct kv_stream_cpu_job {
     ggml_cuda_kv_stream_cpu_attn_params params;
     std::vector<uint32_t> pages;
-    mutable bool result_initialized = false;
+    // test hook, not skeleton: the fold order test needs it
+    int delay_thread = -1;
+    int64_t delay_ns = 0;
     // TODO: skeleton fields, removed with the spin body and the counters
     bool spin = false;
     int64_t spin_ns = 0;
@@ -321,7 +325,6 @@ struct kv_stream_cpu_split {
     float2 * result_meta_device = nullptr;
     // execution
     std::vector<kv_stream_cpu_worker> workers;
-    std::mutex fold_mutex;
     std::unique_ptr<kv_stream_cpu_pool> pool;
     // per graph
     kv_stream_cpu_graph graph;
@@ -391,19 +394,24 @@ static void kv_stream_cpu_job_run(kv_stream_cpu_split & split, const kv_stream_c
 
     kv_stream_cpu_worker & worker = split.workers[thread];
     ggml_cuda_kv_stream_cpu_attn_init(worker.part.data(), worker.part_meta.data(), rows);
+    if (thread == job.delay_thread) {
+        std::this_thread::sleep_for(std::chrono::nanoseconds(job.delay_ns));
+    }
     if (end > begin) {
         worker.run(job.params, job.pages.data() + begin, end - begin);
     }
     record.kernel_ns[thread] = kv_stream_now_ns();
-    // TODO: Task D5 chooses the fold strategy
-    {
-        std::lock_guard<std::mutex> lock(split.fold_mutex);
-        if (!job.result_initialized) {
-            job.result_initialized = true;
-            ggml_cuda_kv_stream_cpu_attn_init(split.result, split.result_meta, rows);
-        }
-        ggml_cuda_kv_stream_cpu_attn_fold(
-            split.result, split.result_meta, worker.part.data(), worker.part_meta.data(), rows);
+
+    const int row_begin = int(uint64_t(rows)*thread/n_threads);
+    const int row_end = int(uint64_t(rows)*(thread + 1)/n_threads);
+    float * acc = split.result + size_t(row_begin)*GGML_CUDA_KV_STREAM_HEAD_DIM;
+    float * acc_meta = split.result_meta + 2*row_begin;
+    ggml_cuda_kv_stream_cpu_attn_init(acc, acc_meta, row_end - row_begin);
+    split.pool->barrier();
+    for (const kv_stream_cpu_worker & w : split.workers) {
+        ggml_cuda_kv_stream_cpu_attn_fold(acc, acc_meta,
+            w.part.data() + size_t(row_begin)*GGML_CUDA_KV_STREAM_HEAD_DIM, w.part_meta.data() + 2*row_begin,
+            row_end - row_begin);
     }
     record.end_ns[thread] = kv_stream_now_ns();
 }
@@ -475,6 +483,19 @@ static bool kv_stream_cpu_env_number(const char * name, double & value) {
     return *end == '\0';
 }
 
+static void kv_stream_cpu_read_delay(const char * text, int & thread, int64_t & ns) {
+    char * end = nullptr;
+    const long parsed_thread = strtol(text, &end, 10);
+    if (end == text || *end != ':' || parsed_thread < 0 || parsed_thread > INT32_MAX) {
+        return;
+    }
+    const double us = strtod(end + 1, &end);
+    if (*end == '\0' && us > 0.0 && us <= 1e7) {   // at most 10 seconds
+        thread = int(parsed_thread);
+        ns = int64_t(us*1e3);
+    }
+}
+
 static kv_stream_cpu_knobs kv_stream_cpu_read_knobs() {
     const auto env = [](const char * name) {
         const char * value = getenv(name);
@@ -493,6 +514,7 @@ static kv_stream_cpu_knobs kv_stream_cpu_read_knobs() {
         knobs.dram_bandwidth_gbps = value;
     }
     knobs.copy_part_to_device = strcmp(env("GGML_CUDA_KV_STREAM_CPU_PART"), "copy") == 0;
+    kv_stream_cpu_read_delay(env("GGML_CUDA_KV_STREAM_CPU_DELAY"), knobs.delay_thread, knobs.delay_ns);
     return knobs;
 }
 
@@ -2001,6 +2023,8 @@ static uint32_t kv_stream_cpu_split_dispatch(
     p.n_tokens = int(Q->ne[1]);
     memcpy(&p.scale, (const float *) dst->op_params + 0, sizeof(float));
     job.pages = pages;
+    job.delay_thread = split.graph.knobs.delay_thread;
+    job.delay_ns = split.graph.knobs.delay_ns;
 
     // TODO: Task B skeleton body and counters
     GGML_ASSERT(split.diag.graph_jobs < split.diag.records.size());

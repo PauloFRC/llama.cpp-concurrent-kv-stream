@@ -110,6 +110,19 @@ public:
         done_cv_.wait(lock, [this] { return completed_ == armed_; });
     }
 
+    // every thread of the current job meets here
+    void barrier() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (++barrier_count_ == n_threads_) {
+            barrier_count_ = 0;
+            ++barrier_generation_;
+            barrier_cv_.notify_all();
+            return;
+        }
+        const uint64_t generation = barrier_generation_;
+        barrier_cv_.wait(lock, [&] { return barrier_generation_ != generation; });
+    }
+
     // TODO: only the Task B skeleton counters read this
     uint32_t queued() {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -161,9 +174,12 @@ private:
     std::mutex mutex_;
     std::condition_variable ready_cv_;
     std::condition_variable done_cv_;
+    std::condition_variable barrier_cv_;
     uint64_t armed_ = 0;
     uint64_t released_ = 0;
     uint64_t completed_ = 0;
+    int barrier_count_ = 0;
+    uint64_t barrier_generation_ = 0;
     int pending_;
     bool stop_ = false;
 };

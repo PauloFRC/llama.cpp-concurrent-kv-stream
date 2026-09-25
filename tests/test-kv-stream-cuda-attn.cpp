@@ -1357,6 +1357,38 @@ int main() {
         t.assert_true("pool is idle after both exits", pool.idle());
     });
 
+    t.test("cpu pool barrier holds every worker of one job at the same point", [](testing & t) {
+        struct job { uint32_t id; };
+        constexpr int n_threads = 4;
+        constexpr int rounds = 4;
+        std::atomic<int> phase1[rounds*n_threads] = {};
+        std::atomic<int> all_visible{0};
+        ggml_cuda_kv_stream_cpu_pool<job> pool(n_threads, 1, [&](const job &, int thread, int) {
+            for (int round = 0; round < rounds; ++round) {
+                // worker 0 lags, so phase 2 must not see a partial phase 1
+                if (thread == 0) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+                phase1[round*n_threads + thread].store(thread + 1, std::memory_order_relaxed);
+                pool.barrier();
+                int seen = 0;
+                for (int i = 0; i < n_threads; ++i) {
+                    if (phase1[round*n_threads + i].load(std::memory_order_relaxed) != 0) {
+                        ++seen;
+                    }
+                }
+                if (seen == n_threads) {
+                    ++all_visible;
+                }
+            }
+        });
+        const uint32_t job = pool.arm({});
+        pool.release();
+        pool.wait(job);
+        t.assert_equal(n_threads*rounds, all_visible.load());
+        t.assert_true("pool is idle after a barrier job", pool.idle());
+    });
+
     t.test("cpu pool pins each thread to its listed cpu", [](testing & t) {
 #if defined(__linux__)
         cpu_set_t allowed;
@@ -2888,6 +2920,53 @@ int main() {
                 std::fprintf(stderr, "%s: max_abs=%g\n", name.c_str(), max_abs);
                 t.assert_true(name + ": split matches the gpu", is_finite(outputs[1]) && max_abs <= 1e-5f);
             }
+        }
+    });
+
+    t.test("cpu fold order does not depend on worker finish order", [](testing & t) {
+        if (!ggml_cuda_kv_stream_cpu_attn_supported()) {
+            t.skip("CPU attention needs AVX-512 F, DQ, VNNI, F16C and FMA");
+            return;
+        }
+        constexpr int64_t n_kv = 41*256;
+        constexpr int64_t n_batch = 1;
+        constexpr int threads = 4;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        const auto params = make_stream_params(backend.get(), 40, 41, 1, 32);
+        const attention_inputs inputs = make_page_inputs(n_kv, n_batch);
+        std::vector<float> reference;
+        for (int delayed = 0; delayed < threads; ++delayed) {
+            auto runtime = make_runtime(params);
+            if (!t.assert_true("runtime initializes", runtime != nullptr)) {
+                return;
+            }
+            t.assert_true("cpu split scratch allocates",
+                ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), threads, N_Q_HEAD, 41));
+            std::vector<float> actual;
+            {
+                scoped_env env{
+                    {"GGML_CUDA_KV_STREAM_CPU_SHARE", "0.5"},
+                    {"GGML_CUDA_KV_STREAM_CPU_DELAY", std::to_string(delayed) + ":20000"},
+                };
+                actual = run_attention(
+                    backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime.get()), n_kv, n_batch);
+            }
+            const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime.get());
+            const std::string name = "worker " + std::to_string(delayed) + " last";
+
+            t.assert_equal(name + ": cpu pages", uint64_t(20), stats.cpu_pages);
+            t.assert_equal(name + ": cpu jobs", uint64_t(1), stats.cpu_jobs);
+            if (delayed == 0) {
+                reference = actual;
+                continue;
+            }
+            t.assert_true(name + ": the result is bitwise identical to the first run",
+                actual.size() == reference.size() &&
+                std::memcmp(actual.data(), reference.data(), actual.size()*sizeof(float)) == 0);
         }
     });
 

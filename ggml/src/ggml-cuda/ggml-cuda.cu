@@ -1457,6 +1457,8 @@ static bool ggml_backend_buft_is_cuda_kv_stream(ggml_backend_buffer_type_t buft)
 
 static void ggml_backend_cuda_kv_stream_buffer_free(ggml_backend_buffer_t buffer) {
     auto * context = static_cast<ggml_backend_cuda_kv_stream_buffer_context *>(buffer->context);
+    GGML_ASSERT(ggml_cuda_kv_stream_cpu_pool_idle(context->runtime->transfer_ring) &&
+        "cpu pool busy while the arena is freed");
     CUDA_CHECK(cudaFreeHost(context->host_data));
     ggml_backend_cuda_kv_stream_runtime_release(context->runtime);
     delete context;
@@ -1470,6 +1472,8 @@ static void * ggml_backend_cuda_kv_stream_buffer_base(ggml_backend_buffer_t buff
 static void ggml_backend_cuda_kv_stream_buffer_memset(
         ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     auto * context = static_cast<ggml_backend_cuda_kv_stream_buffer_context *>(buffer->context);
+    GGML_ASSERT(ggml_cuda_kv_stream_cpu_pool_idle(context->runtime->transfer_ring) &&
+        "cpu pool busy while the arena is rewritten");
     ggml_cuda_kv_stream_resident_cache_reset(context->runtime->resident_cache);
     ++context->runtime->generation;
     memset(static_cast<char *>(tensor->data) + offset, value, size);
@@ -1478,6 +1482,8 @@ static void ggml_backend_cuda_kv_stream_buffer_memset(
 static void ggml_backend_cuda_kv_stream_buffer_set(
         ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     auto * context = static_cast<ggml_backend_cuda_kv_stream_buffer_context *>(buffer->context);
+    GGML_ASSERT(ggml_cuda_kv_stream_cpu_pool_idle(context->runtime->transfer_ring) &&
+        "cpu pool busy while the arena is rewritten");
     ggml_cuda_kv_stream_resident_cache_reset(context->runtime->resident_cache);
     ++context->runtime->generation;
     memcpy(static_cast<char *>(tensor->data) + offset, data, size);
@@ -1491,6 +1497,8 @@ static void ggml_backend_cuda_kv_stream_buffer_get(
 
 static void ggml_backend_cuda_kv_stream_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     auto * context = static_cast<ggml_backend_cuda_kv_stream_buffer_context *>(buffer->context);
+    GGML_ASSERT(ggml_cuda_kv_stream_cpu_pool_idle(context->runtime->transfer_ring) &&
+        "cpu pool busy while the arena is rewritten");
     ggml_cuda_kv_stream_resident_cache_reset(context->runtime->resident_cache);
     ++context->runtime->generation;
     memset(context->host_data, value, buffer->size);
@@ -1685,6 +1693,7 @@ bool ggml_backend_cuda_kv_stream_reconfigure(
 
     ggml_cuda_set_device(runtime->device);
     CUDA_CHECK(cudaDeviceSynchronize());
+    GGML_ASSERT(ggml_cuda_kv_stream_cpu_pool_idle(runtime->transfer_ring) && "cpu pool busy between graphs");
     if (!ggml_cuda_kv_stream_resident_cache_reconfigure(
             runtime->resident_cache, scratch_bytes, active_pages_per_layer) ||
         !ggml_cuda_kv_stream_transfer_ring_set_active_slots(
@@ -1720,6 +1729,7 @@ bool ggml_backend_cuda_kv_stream_repartition(
     const bool changed = runtime->stage_slots != stage_slots;
     ggml_cuda_set_device(runtime->device);
     CUDA_CHECK(cudaDeviceSynchronize());
+    GGML_ASSERT(ggml_cuda_kv_stream_cpu_pool_idle(runtime->transfer_ring) && "cpu pool busy between graphs");
     if (!ggml_cuda_kv_stream_transfer_ring_set_active_slots(runtime->transfer_ring, stage_slots) ||
         !ggml_cuda_kv_stream_resident_cache_repartition(runtime->resident_cache, scratch_bytes)) {
         return false;
@@ -1746,6 +1756,7 @@ bool ggml_backend_cuda_kv_stream_set_decode_layout(
 
     ggml_cuda_set_device(runtime->device);
     CUDA_CHECK(cudaDeviceSynchronize());
+    GGML_ASSERT(ggml_cuda_kv_stream_cpu_pool_idle(runtime->transfer_ring) && "cpu pool busy between graphs");
     if (!ggml_cuda_kv_stream_resident_cache_set_decode_layout(
             runtime->resident_cache, active_pages_per_layer)) {
         return false;

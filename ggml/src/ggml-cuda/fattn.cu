@@ -342,6 +342,7 @@ struct kv_stream_cpu_split {
     }
 
     ~kv_stream_cpu_split() {
+        GGML_ASSERT((pool == nullptr || pool->idle()) && "cpu pool busy at split teardown");
         CUDA_CHECK(cudaDeviceSynchronize());
         pool.reset();
         if (side_stream != nullptr) {
@@ -681,10 +682,15 @@ ggml_cuda_kv_stream_transfer_ring * ggml_cuda_kv_stream_transfer_ring_new(
     return ring;
 }
 
+bool ggml_cuda_kv_stream_cpu_pool_idle(ggml_cuda_kv_stream_transfer_ring * ring) {
+    return ring == nullptr || ring->cpu_split == nullptr || ring->cpu_split->pool->idle();
+}
+
 void ggml_cuda_kv_stream_transfer_ring_free(ggml_cuda_kv_stream_transfer_ring * ring) {
     if (ring == nullptr) {
         return;
     }
+    GGML_ASSERT(ggml_cuda_kv_stream_cpu_pool_idle(ring) && "cpu pool busy at ring teardown");
     CUDA_CHECK(cudaStreamSynchronize(ring->copy_stream));
     for (cudaEvent_t event : ring->ready) {
         CUDA_CHECK(cudaEventDestroy(event));
@@ -2139,10 +2145,8 @@ void ggml_cuda_kv_stream_graph_begin(ggml_cuda_kv_stream_transfer_ring * ring) {
         ring->active_slots : KV_STREAM_COPY_BATCH_PAGES;
     if (ring->cpu_split != nullptr) {
         kv_stream_cpu_split & split = *ring->cpu_split;
-        const int64_t wait_begin = kv_stream_now_ns();
-        const bool idle = split.pool->idle();
-        split.pool->wait_idle();
-        kv_stream_cpu_split_report(split, idle ? 0 : kv_stream_now_ns() - wait_begin);
+        GGML_ASSERT(ggml_cuda_kv_stream_cpu_pool_idle(ring) && "cpu pool busy between graphs");
+        kv_stream_cpu_split_report(split, 0);
         split.graph = {};
         split.graph.knobs = kv_stream_cpu_read_knobs();
     }

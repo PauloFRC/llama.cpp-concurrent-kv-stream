@@ -189,7 +189,7 @@ attention_inputs make_f16_reference(const attention_inputs & inputs, int64_t n_k
 
 constexpr uint32_t PAGE_TOKENS = GGML_CUDA_KV_STREAM_PAGE_TOKENS;
 
-attention_inputs make_page_inputs(int64_t n_kv, int64_t n_batch) {
+attention_inputs make_page_inputs(int64_t n_kv, int64_t n_batch, float phase = 0.0f) {
     const int64_t n_pages = n_kv/PAGE_TOKENS;
     GGML_ASSERT(n_pages < HEAD_DIM/2);
     const auto wave = [](int64_t page, int64_t d) {
@@ -217,8 +217,8 @@ attention_inputs make_page_inputs(int64_t n_kv, int64_t n_batch) {
         for (int64_t h = 0; h < N_KV_HEAD; ++h) {
             for (int64_t d = 0; d < HEAD_DIM; ++d) {
                 const int64_t i = (token*N_KV_HEAD + h)*HEAD_DIM + d;
-                k_source[i] = 0.5f*wave(page, d) + 0.1f*std::sin(0.013f*float(i));
-                v_source[i] = 0.4f*std::sin(0.9f*float(page) + 0.07f*float(d) + 0.4f*float(h)) +
+                k_source[i] = 0.5f*wave(page, d) + 0.1f*std::sin(0.013f*float(i) + phase);
+                v_source[i] = 0.4f*std::sin(0.9f*float(page) + 0.07f*float(d) + 0.4f*float(h) + phase) +
                     0.1f*std::cos(0.0029f*float(i));
             }
         }
@@ -721,8 +721,11 @@ std::vector<float> run_attention_layers(
 
     for (size_t layer = 0; layer < layers.size(); ++layer) {
         layer_tensors current{};
-        current.q = ggml_new_tensor_4d(
-            compute_ctx.get(), GGML_TYPE_F32, HEAD_DIM, n_batch, N_Q_HEAD, 1);
+        ggml_tensor * q_storage = layers[layer].q_permuted ?
+            ggml_new_tensor_4d(compute_ctx.get(), GGML_TYPE_F32, HEAD_DIM, N_Q_HEAD, n_batch, 1) :
+            ggml_new_tensor_4d(compute_ctx.get(), GGML_TYPE_F32, HEAD_DIM, n_batch, N_Q_HEAD, 1);
+        current.q = layers[layer].q_permuted ?
+            ggml_permute(compute_ctx.get(), q_storage, 0, 2, 1, 3) : q_storage;
         // llama builds one mask per graph, read by every layer
         current.mask = shared_mask && layer > 0 ? tensors[0].mask : ggml_new_tensor_4d(
             compute_ctx.get(), GGML_TYPE_F16, n_kv, n_batch, 1, 1);
@@ -2920,6 +2923,78 @@ int main() {
                 std::fprintf(stderr, "%s: max_abs=%g\n", name.c_str(), max_abs);
                 t.assert_true(name + ": split matches the gpu", is_finite(outputs[1]) && max_abs <= 1e-5f);
             }
+        }
+    });
+
+    t.test("a multi-layer graph keeps every streaming layer's cpu pages apart", [](testing & t) {
+        if (!ggml_cuda_kv_stream_cpu_attn_supported()) {
+            t.skip("CPU attention needs AVX-512 F, DQ, VNNI, F16C and FMA");
+            return;
+        }
+        constexpr int64_t n_kv = 41*256;
+        constexpr int64_t n_batch = 1;
+        constexpr size_t layers = 4;
+        constexpr int64_t context_pages = 41;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        const auto params = make_stream_params(backend.get(), 39, 79, layers, 0);
+        std::vector<attention_inputs> inputs;
+        for (size_t layer = 0; layer < layers; ++layer) {
+            inputs.push_back(make_page_inputs(n_kv, n_batch, 0.5f*float(layer)));
+        }
+        // the second graph reads a different mask, so the pinned columns of the first must not survive
+        std::vector<attention_inputs> shifted = inputs;
+        for (int64_t cell = 0; cell < n_kv; ++cell) {
+            const float bias = ggml_fp16_to_fp32(shifted[0].mask[cell]);
+            if (bias != -INFINITY) {
+                shifted[0].mask[cell] = ggml_fp32_to_fp16(bias + 0.25f);
+            }
+        }
+
+        std::vector<float> reference[2];
+        std::vector<float> actual[2];
+        for (int graph = 0; graph < 2; ++graph) {
+            const std::vector<attention_inputs> & graph_inputs = graph == 0 ? inputs : shifted;
+            reference[graph] = run_attention_layers(
+                backend.get(), graph_inputs, ggml_backend_get_default_buffer_type(backend.get()),
+                n_kv, n_batch, 1, 1, GGML_TYPE_I32, nullptr, 0, nullptr, false, true);
+        }
+
+        auto runtime = make_runtime(params);
+        if (!t.assert_true("runtime initializes", runtime != nullptr)) {
+            return;
+        }
+        t.assert_true("cpu split scratch allocates",
+            ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 4, N_Q_HEAD, context_pages));
+        if (!t.assert_true("decode layout keeps one layer resident",
+                ggml_backend_cuda_kv_stream_set_decode_layout(runtime.get(), 39))) {
+            return;
+        }
+        {
+            scoped_env env{{"GGML_CUDA_KV_STREAM_CPU_PAGES", "20"}};
+            for (int graph = 0; graph < 2; ++graph) {
+                const std::vector<attention_inputs> & graph_inputs = graph == 0 ? inputs : shifted;
+                actual[graph] = run_attention_layers(
+                    backend.get(), graph_inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime.get()),
+                    n_kv, n_batch, 1, 1, GGML_TYPE_I32, runtime.get(), 0, nullptr, false, true);
+            }
+        }
+        const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime.get());
+
+        t.assert_equal(uint64_t(122), stats.cpu_pages);
+        t.assert_equal(uint64_t(8), stats.cpu_jobs);
+        t.assert_equal(uint64_t(0), stats.cpu_decline_below_min_pages);
+        for (int graph = 0; graph < 2; ++graph) {
+            if (!t.assert_equal(reference[graph].size(), actual[graph].size())) {
+                return;
+            }
+            const float max_abs = max_abs_error(reference[graph], actual[graph]);
+            std::fprintf(stderr, "multi-layer graph %d: max_abs=%g\n", graph, max_abs);
+            t.assert_true("multi-layer graph " + std::to_string(graph) + " matches the gpu",
+                is_finite(actual[graph]) && max_abs <= 1e-5f);
         }
     });
 

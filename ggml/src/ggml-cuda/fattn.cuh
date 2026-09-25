@@ -91,6 +91,7 @@ bool ggml_cuda_kv_stream_transfer_ring_observe_decode_latency(
     ggml_cuda_kv_stream_transfer_ring * ring, double elapsed_ms);
 ggml_cuda_kv_stream_transfer_stats ggml_cuda_kv_stream_transfer_ring_get_stats(
     const ggml_cuda_kv_stream_transfer_ring * ring);
+bool ggml_cuda_kv_stream_cpu_pool_idle(ggml_cuda_kv_stream_transfer_ring * ring);
 void ggml_cuda_kv_stream_graph_begin(ggml_cuda_kv_stream_transfer_ring * ring);
 bool ggml_cuda_kv_stream_graph_add_attention(
     ggml_cuda_kv_stream_transfer_ring * ring,

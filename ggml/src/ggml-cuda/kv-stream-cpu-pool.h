@@ -35,12 +35,14 @@ public:
             if (pool_ != nullptr) {
                 GGML_ASSERT(std::uncaught_exceptions() > exceptions_ && "job left without join()");
                 pool_->wait(job_);
+                GGML_ASSERT(pool_->idle() && "the pool is not idle at an op exit");
             }
         }
 
         void join() {
             GGML_ASSERT(pool_ != nullptr);
             pool_->wait(job_);
+            GGML_ASSERT(pool_->idle() && "the pool is not idle at an op exit");
             pool_ = nullptr;
         }
 

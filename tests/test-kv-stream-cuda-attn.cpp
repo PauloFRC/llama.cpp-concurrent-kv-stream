@@ -88,6 +88,7 @@ struct attention_inputs {
     std::vector<uint8_t> k;
     std::vector<uint8_t> v;
     std::vector<uint16_t> mask;
+    bool q_permuted = false;
 };
 
 attention_inputs make_inputs(
@@ -151,6 +152,7 @@ attention_inputs make_f16_reference(const attention_inputs & inputs, int64_t n_k
     result.type_k = GGML_TYPE_F16;
     result.type_v = GGML_TYPE_F16;
     result.q = inputs.q;
+    result.q_permuted = inputs.q_permuted;
     result.mask = inputs.mask;
 
     const int64_t nrows = n_kv*N_KV_HEAD;
@@ -185,6 +187,61 @@ attention_inputs make_f16_reference(const attention_inputs & inputs, int64_t n_k
 }
 
 constexpr uint32_t PAGE_TOKENS = GGML_CUDA_KV_STREAM_PAGE_TOKENS;
+
+attention_inputs make_page_inputs(int64_t n_kv, int64_t n_batch) {
+    const int64_t n_pages = n_kv/PAGE_TOKENS;
+    GGML_ASSERT(n_pages < HEAD_DIM/2);
+    const auto wave = [](int64_t page, int64_t d) {
+        return std::cos(6.2831853f*float((page + 1)*d)/float(HEAD_DIM));
+    };
+
+    attention_inputs result;
+    result.q_permuted = true;
+    result.q.resize(HEAD_DIM*N_Q_HEAD*n_batch);
+    for (int64_t t = 0; t < n_batch; ++t) {
+        for (int64_t h = 0; h < N_Q_HEAD; ++h) {
+            const int64_t favored = (7*t + 5*h + 3) % n_pages;
+            for (int64_t d = 0; d < HEAD_DIM; ++d) {
+                result.q[(t*N_Q_HEAD + h)*HEAD_DIM + d] =
+                    0.5f*wave(favored, d) + 0.05f*std::sin(0.37f*float(d + 3*h + 11*t));
+            }
+        }
+    }
+
+    const int64_t nrows = n_kv*N_KV_HEAD;
+    std::vector<float> k_source(HEAD_DIM*nrows);
+    std::vector<float> v_source(HEAD_DIM*nrows);
+    for (int64_t token = 0; token < n_kv; ++token) {
+        const int64_t page = token/PAGE_TOKENS;
+        for (int64_t h = 0; h < N_KV_HEAD; ++h) {
+            for (int64_t d = 0; d < HEAD_DIM; ++d) {
+                const int64_t i = (token*N_KV_HEAD + h)*HEAD_DIM + d;
+                k_source[i] = 0.5f*wave(page, d) + 0.1f*std::sin(0.013f*float(i));
+                v_source[i] = 0.4f*std::sin(0.9f*float(page) + 0.07f*float(d) + 0.4f*float(h)) +
+                    0.1f*std::cos(0.0029f*float(i));
+            }
+        }
+    }
+    result.k.resize(ggml_row_size(result.type_k, HEAD_DIM)*nrows);
+    const size_t k_written = ggml_quantize_chunk(
+        result.type_k, k_source.data(), result.k.data(), 0, nrows, HEAD_DIM, nullptr);
+    GGML_ASSERT(k_written == result.k.size());
+    result.v.resize(ggml_row_size(result.type_v, HEAD_DIM)*nrows);
+    const size_t v_written = ggml_quantize_chunk(
+        result.type_v, v_source.data(), result.v.data(), 0, nrows, HEAD_DIM, nullptr);
+    GGML_ASSERT(v_written == result.v.size());
+
+    result.mask.resize(n_kv*n_batch);
+    for (int64_t t = 0; t < n_batch; ++t) {
+        for (int64_t cell = 0; cell < n_kv; ++cell) {
+            const int64_t page = cell/PAGE_TOKENS;
+            const bool hidden = page > 0 && (page + 2*t) % 11 == 0;
+            const float bias = -0.5f*float((3*page + 7*t) % 5) - 0.015625f*float((cell + 73*t) % 127);
+            result.mask[t*n_kv + cell] = ggml_fp32_to_fp16(hidden ? -INFINITY : bias);
+        }
+    }
+    return result;
+}
 
 size_t query_page_bytes(ggml_backend_t backend, ggml_type type_k, ggml_type type_v) {
     using page_bytes_fn_t = bool (*)(
@@ -483,8 +540,10 @@ std::vector<float> run_attention(
     ggml_context_ptr index_ctx(ggml_init(params));
     GGML_ASSERT(compute_ctx && kv_ctx && index_ctx);
 
-    ggml_tensor * q = ggml_new_tensor_4d(
-        compute_ctx.get(), GGML_TYPE_F32, HEAD_DIM, n_batch, N_Q_HEAD, 1);
+    ggml_tensor * q_storage = inputs.q_permuted ?
+        ggml_new_tensor_4d(compute_ctx.get(), GGML_TYPE_F32, HEAD_DIM, N_Q_HEAD, n_batch, 1) :
+        ggml_new_tensor_4d(compute_ctx.get(), GGML_TYPE_F32, HEAD_DIM, n_batch, N_Q_HEAD, 1);
+    ggml_tensor * q = inputs.q_permuted ? ggml_permute(compute_ctx.get(), q_storage, 0, 2, 1, 3) : q_storage;
     ggml_tensor * mask = ggml_new_tensor_4d(
         compute_ctx.get(), GGML_TYPE_F16, n_kv, n_batch, 1, 1);
     ggml_tensor * k_storage = ggml_new_tensor_2d(
@@ -526,7 +585,7 @@ std::vector<float> run_attention(
             ggml_backend_cuda_host_buffer_type() : ggml_backend_get_default_buffer_type(backend)));
     GGML_ASSERT(kv_buffer && compute_buffer && index_buffer);
 
-    ggml_backend_tensor_set(q, inputs.q.data(), 0, inputs.q.size()*sizeof(float));
+    ggml_backend_tensor_set(q_storage, inputs.q.data(), 0, inputs.q.size()*sizeof(float));
     ggml_backend_tensor_set(k_storage, inputs.k.data(), 0, inputs.k.size());
     ggml_backend_tensor_set(v_storage, inputs.v.data(), 0, inputs.v.size());
     ggml_backend_tensor_set(mask, inputs.mask.data(), 0, inputs.mask.size()*sizeof(uint16_t));
@@ -2714,6 +2773,75 @@ int main() {
                     t.assert_true(name + ": cpu pages are attended on the cpu",
                         is_finite(actual) && max_abs <= 1e-5f);
                 }
+            }
+        }
+    });
+
+    t.test("a layer split between gpu and cpu matches the same layer on the gpu", [](testing & t) {
+        if (!ggml_cuda_kv_stream_cpu_attn_supported()) {
+            t.skip("CPU attention needs AVX-512 F, DQ, VNNI, F16C and FMA");
+            return;
+        }
+        constexpr int64_t n_kv = 41*256;
+        constexpr uint32_t context_pages = 48;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        const auto params = make_stream_params(backend.get(), 40, 41, 1, 32);
+
+        struct test_case {
+            const char * name;
+            const char * share;
+            std::vector<uint32_t> dead_pages;
+            uint64_t cpu_pages;
+            uint64_t streamed_pages;
+        };
+        const test_case cases[] = {
+            { "cpu tail",                     "0.2", {},        8, 32 },
+            { "even split",                   "0.5", {},       20, 20 },
+            { "whole streamed set with hole", "1",   {20, 40}, 38,  0 },
+        };
+        for (const int64_t n_batch : {1, 3, 32}) {
+            const attention_inputs inputs = make_page_inputs(n_kv, n_batch);
+            for (const auto & tc : cases) {
+                const std::string name = std::string(tc.name) + ", " + std::to_string(n_batch) + " tokens";
+                std::vector<uint8_t> live(41, 1);
+                for (const uint32_t page : tc.dead_pages) {
+                    live[page] = 0;
+                }
+                std::vector<float> outputs[2];
+                ggml_backend_cuda_kv_stream_stats stats[2];
+                for (const bool split : {false, true}) {
+                    auto runtime = make_runtime(params);
+                    if (!t.assert_true("runtime initializes", runtime != nullptr)) {
+                        return;
+                    }
+                    if (split) {
+                        t.assert_true("cpu split scratch allocates",
+                            ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 4, N_Q_HEAD, context_pages));
+                    }
+                    t.assert_true("live pages accepted",
+                        ggml_backend_cuda_kv_stream_set_live_pages(runtime.get(), live.data(), live.size()));
+                    scoped_env env{{"GGML_CUDA_KV_STREAM_CPU_SHARE", tc.share}};
+                    outputs[split] = run_attention(
+                        backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime.get()), n_kv, n_batch);
+                    stats[split] = ggml_backend_cuda_kv_stream_get_stats(runtime.get());
+                }
+
+                t.assert_equal(uint64_t(0), stats[0].cpu_pages);
+                t.assert_equal(tc.cpu_pages, stats[1].cpu_pages);
+                t.assert_equal(uint64_t(1), stats[1].cpu_jobs);
+                t.assert_equal(tc.streamed_pages, stats[1].streamed_pages);
+                t.assert_equal(uint64_t(41), stats[1].resident_pages_attended + stats[1].skipped_pages +
+                    stats[1].streamed_pages_attended + stats[1].cpu_pages);
+                if (!t.assert_equal(outputs[0].size(), outputs[1].size())) {
+                    return;
+                }
+                const float max_abs = max_abs_error(outputs[0], outputs[1]);
+                std::fprintf(stderr, "%s: max_abs=%g\n", name.c_str(), max_abs);
+                t.assert_true(name + ": split matches the gpu", is_finite(outputs[1]) && max_abs <= 1e-5f);
             }
         }
     });

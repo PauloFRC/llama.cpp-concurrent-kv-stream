@@ -13,15 +13,20 @@ struct llama_kv_stream_config {
     bool kv_unified      = false;
     bool flash_attention = false;
     bool kv_offload      = false;
+
+    uint32_t cpu_threads = 0;
 };
 
 struct llama_kv_stream_config_result {
     bool valid   = false;
     bool enabled = false;
     std::string error;
+    std::string warning;
 };
 
 llama_kv_stream_config_result llama_kv_stream_config_validate(const llama_kv_stream_config & config);
+
+uint32_t llama_kv_stream_cpu_threads_resolve(uint32_t requested, uint32_t max_threads);
 
 struct llama_kv_stream_pool_layout_params {
     uint64_t pool_bytes = 0;

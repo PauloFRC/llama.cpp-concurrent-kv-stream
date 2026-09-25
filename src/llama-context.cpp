@@ -121,6 +121,7 @@ llama_context::llama_context(
     cparams.embeddings_nextn_masked = false;
     cparams.offload_kqv             = params.offload_kqv;
     cparams.kv_stream_stage_mib     = params.kv_stream_stage_mib;
+    cparams.kv_stream_cpu_threads   = params.kv_stream_cpu_threads;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
 
@@ -409,10 +410,14 @@ llama_context::llama_context(
             /*.kv_unified          =*/ cparams.kv_unified,
             /*.flash_attention     =*/ cparams.flash_attn,
             /*.kv_offload          =*/ cparams.offload_kqv,
+            /*.cpu_threads         =*/ cparams.kv_stream_cpu_threads,
         };
         const auto stream_validation = llama_kv_stream_config_validate(stream_config);
         if (!stream_validation.valid) {
             throw std::runtime_error(stream_validation.error);
+        }
+        if (!stream_validation.warning.empty()) {
+            LLAMA_LOG_WARN("%s: %s\n", __func__, stream_validation.warning.c_str());
         }
         if (stream_validation.enabled) {
             LLAMA_LOG_INFO("%s: experimental block KV streaming enabled, pool = %.2f MiB\n",
@@ -423,6 +428,7 @@ llama_context::llama_context(
             /*.type_k                =*/ params.type_k,
             /*.type_v                =*/ params.type_v,
             /*.kv_stream_stage_bytes =*/ kv_stream_stage_bytes,
+            /*.kv_stream_cpu_threads =*/ cparams.kv_stream_cpu_threads,
             /*.swa_full              =*/ params.swa_full,
             /*.ctx_type              =*/ cparams.ctx_type,
             /*.mem_other             =*/ llama_get_memory(cparams.ctx_other),
@@ -3691,6 +3697,7 @@ llama_context_params llama_context_default_params() {
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.kv_stream_stage_mib         =*/ 0,
+        /*.kv_stream_cpu_threads       =*/ 0,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

@@ -55,6 +55,7 @@ struct llama_cparams {
     bool pipeline_parallel;
 
     uint32_t kv_stream_stage_mib;
+    uint32_t kv_stream_cpu_threads;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 

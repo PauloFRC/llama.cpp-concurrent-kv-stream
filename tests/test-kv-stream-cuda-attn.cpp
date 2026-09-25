@@ -613,7 +613,8 @@ std::vector<float> run_attention_layers(
         uint32_t layout_after_first = 0,
         const int64_t * custom_rows = nullptr,
         bool graph_per_layer = false,
-        bool shared_mask = false) {
+        bool shared_mask = false,
+        float logit_softcap = 0.0f) {
     constexpr size_t N_TENSORS = 256;
     const size_t graph_count = graph_per_layer ? layers.size() : 1;
     const size_t context_bytes = ggml_tensor_overhead()*N_TENSORS +
@@ -678,7 +679,7 @@ std::vector<float> run_attention_layers(
             compute_ctx.get(), current.v_storage, current.v_update, current.update_index);
         current.out = ggml_flash_attn_ext(
             compute_ctx.get(), current.q, k, v, current.mask,
-            1.0f/std::sqrt(float(HEAD_DIM)), 0.0f, 0.0f);
+            1.0f/std::sqrt(float(HEAD_DIM)), 0.0f, logit_softcap);
         ggml_flash_attn_ext_set_prec(current.out, GGML_PREC_F32);
         tensors.push_back(current);
     }
@@ -853,31 +854,135 @@ int main() {
         constexpr int64_t n_decode = GGML_CUDA_KV_STREAM_MAX_DECODE_QUERY_TOKENS;
 
         ggml_tensor decode = attention(HEAD_DIM, n_decode, 1, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0);
-        t.assert_true("the widest decode batch", ggml_cuda_kv_stream_cpu_split_supported(&decode));
+        t.assert_true("the widest decode batch",
+            ggml_cuda_kv_stream_cpu_split_get_block(&decode) == GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_OK);
         ggml_tensor prefill = attention(HEAD_DIM, n_decode + 1, 1, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0);
-        t.assert_true("not prefill", !ggml_cuda_kv_stream_cpu_split_supported(&prefill));
+        t.assert_true("not prefill",
+            ggml_cuda_kv_stream_cpu_split_get_block(&prefill) == GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_QUERY_TOKENS);
         ggml_tensor f16_k = attention(HEAD_DIM, 1, 1, GGML_TYPE_F16, GGML_TYPE_Q4_0);
-        t.assert_true("not an f16 K", !ggml_cuda_kv_stream_cpu_split_supported(&f16_k));
+        t.assert_true("not an f16 K",
+            ggml_cuda_kv_stream_cpu_split_get_block(&f16_k) == GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_K_TYPE);
         ggml_tensor q8_v = attention(HEAD_DIM, 1, 1, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
-        t.assert_true("not a q8_0 V", !ggml_cuda_kv_stream_cpu_split_supported(&q8_v));
+        t.assert_true("not a q8_0 V",
+            ggml_cuda_kv_stream_cpu_split_get_block(&q8_v) == GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_V_TYPE);
         ggml_tensor small_head = attention(128, 1, 1, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0);
-        t.assert_true("not head dim 128", !ggml_cuda_kv_stream_cpu_split_supported(&small_head));
+        t.assert_true("not head dim 128",
+            ggml_cuda_kv_stream_cpu_split_get_block(&small_head) == GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_HEAD_DIM);
         ggml_tensor two_seq = attention(HEAD_DIM, 1, 2, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0);
-        t.assert_true("not ne[3] == 2", !ggml_cuda_kv_stream_cpu_split_supported(&two_seq));
+        t.assert_true("not ne[3] == 2",
+            ggml_cuda_kv_stream_cpu_split_get_block(&two_seq) == GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_SEQ_DIM);
 
         ggml_tensor alibi = decode;
         ggml_set_op_params_f32(&alibi, 1, 8.0f);
-        t.assert_true("not a max_bias", !ggml_cuda_kv_stream_cpu_split_supported(&alibi));
+        t.assert_true("not a max_bias",
+            ggml_cuda_kv_stream_cpu_split_get_block(&alibi) == GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_MAX_BIAS);
         ggml_tensor softcap = decode;
         ggml_set_op_params_f32(&softcap, 2, 30.0f);
-        t.assert_true("not a logit_softcap", !ggml_cuda_kv_stream_cpu_split_supported(&softcap));
+        t.assert_true("not a logit_softcap",
+            ggml_cuda_kv_stream_cpu_split_get_block(&softcap) == GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_SOFT_CAP);
 
         ggml_tensor no_mask = attention(HEAD_DIM, 1, 1, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 1, false);
-        t.assert_true("not without a mask", !ggml_cuda_kv_stream_cpu_split_supported(&no_mask));
+        t.assert_true("not without a mask",
+            ggml_cuda_kv_stream_cpu_split_get_block(&no_mask) == GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_MASK);
         ggml_tensor head_mask = attention(HEAD_DIM, 1, 1, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, N_KV_HEAD);
-        t.assert_true("not a per-head mask", !ggml_cuda_kv_stream_cpu_split_supported(&head_mask));
+        t.assert_true("not a per-head mask",
+            ggml_cuda_kv_stream_cpu_split_get_block(&head_mask) == GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_MASK_ROWS);
         ggml_tensor gapped_q = attention(HEAD_DIM, 3, 1, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 1, true, 3);
-        t.assert_true("not a Q with gaps between tokens", !ggml_cuda_kv_stream_cpu_split_supported(&gapped_q));
+        t.assert_true("not a Q with gaps between tokens",
+            ggml_cuda_kv_stream_cpu_split_get_block(&gapped_q) == GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_Q_GAP);
+    });
+
+    t.test("cpu split block reasons are named", [](testing & t) {
+        t.assert_true("a layer that can split has no reason",
+            ggml_cuda_kv_stream_cpu_split_block_reason(GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_OK) == nullptr);
+        for (uint32_t block = 1; block < GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_COUNT; ++block) {
+            const char * reason = ggml_cuda_kv_stream_cpu_split_block_reason(
+                static_cast<ggml_cuda_kv_stream_cpu_split_block>(block));
+            t.assert_true("every block reason is named", reason != nullptr && reason[0] != '\0');
+        }
+    });
+
+    t.test("cpu split reports a declining layer once per run", [](testing & t) {
+        if (!ggml_cuda_kv_stream_cpu_attn_supported()) {
+            t.skip("CPU attention needs AVX-512 F, DQ, VNNI, F16C and FMA");
+            return;
+        }
+        constexpr int64_t n_kv = 8*256;
+        constexpr int64_t n_batch = 1;
+        constexpr int layers = 3;
+        constexpr int repeats = 2;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+        const auto params = make_stream_params(backend.get(), 8, 11, layers, 0);
+        auto runtime = make_runtime(params);
+        if (!t.assert_true("runtime initializes", runtime != nullptr)) {
+            return;
+        }
+        t.assert_true("cpu split scratch allocates",
+            ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 1, N_Q_HEAD, 8));
+
+        const std::vector<attention_inputs> inputs(layers, make_inputs(n_kv, n_batch, n_kv));
+        {
+            log_capture log("kv stream cpu split disabled");
+            scoped_env env{{"GGML_CUDA_KV_STREAM_CPU_PAGES", "2"}};
+            run_attention_layers(backend.get(), inputs,
+                ggml_backend_cuda_kv_stream_buffer_type(runtime.get()), n_kv, n_batch, repeats);
+
+            const auto lines = log.snapshot();
+            t.assert_equal(size_t(1), lines.size());
+            if (!lines.empty()) {
+                const char * reason = ggml_cuda_kv_stream_cpu_split_block_reason(
+                    GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_MASK_CHANGED);
+                t.assert_true("the line names the reason",
+                    reason != nullptr && lines[0].find(reason) != std::string::npos);
+            }
+        }
+        const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime.get());
+        t.assert_equal(uint64_t(2*repeats), stats.cpu_pages);
+    });
+
+    t.test("cpu split reports a static reason once per run", [](testing & t) {
+        if (!ggml_cuda_kv_stream_cpu_attn_supported()) {
+            t.skip("CPU attention needs AVX-512 F, DQ, VNNI, F16C and FMA");
+            return;
+        }
+        constexpr int64_t n_kv = 8*256;
+        constexpr int64_t n_batch = 1;
+        constexpr int layers = 2;
+        constexpr int repeats = 2;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+        const auto params = make_stream_params(backend.get(), 8, 11, layers, 0);
+        auto runtime = make_runtime(params);
+        if (!t.assert_true("runtime initializes", runtime != nullptr)) {
+            return;
+        }
+        t.assert_true("cpu split scratch allocates",
+            ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 1, N_Q_HEAD, 8));
+
+        const std::vector<attention_inputs> inputs(layers, make_inputs(n_kv, n_batch, n_kv));
+        {
+            log_capture log("kv stream cpu split disabled");
+            scoped_env env{{"GGML_CUDA_KV_STREAM_CPU_PAGES", "2"}};
+            run_attention_layers(backend.get(), inputs,
+                ggml_backend_cuda_kv_stream_buffer_type(runtime.get()), n_kv, n_batch, repeats,
+                1, GGML_TYPE_I32, nullptr, 0, nullptr, false, false, 30.0f);
+
+            const auto lines = log.snapshot();
+            t.assert_equal(size_t(1), lines.size());
+            if (!lines.empty()) {
+                const char * reason = ggml_cuda_kv_stream_cpu_split_block_reason(
+                    GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_SOFT_CAP);
+                t.assert_true("the line names the reason",
+                    reason != nullptr && lines[0].find(reason) != std::string::npos);
+            }
+        }
+        const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime.get());
+        t.assert_equal(uint64_t(0), stats.cpu_pages);
     });
 
     t.test("cpu attention kernel matches the scalar reference", [](testing & t) {
@@ -1994,7 +2099,7 @@ int main() {
 
         using feedback_fn_t = bool (*)(
             void *, uint64_t *, uint64_t *, double *, uint32_t *,
-            uint32_t *, uint32_t *, uint32_t *, uint64_t *, uint64_t *);
+            uint32_t *, uint32_t *, uint32_t *, uint64_t *, uint64_t *, uint64_t *);
         ggml_backend_dev_t device = ggml_backend_get_device(backend.get());
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
         auto feedback_fn = reinterpret_cast<feedback_fn_t>(
@@ -2008,11 +2113,12 @@ int main() {
         uint32_t controlled_pages = 0;
         uint64_t skipped_pages = 0;
         uint64_t resident_pages_attended = 0;
+        uint64_t cpu_pages = 0;
         t.assert_true("feedback remains readable after resident graph replay",
             feedback_fn != nullptr && feedback_fn(
                 runtime, &deadline_samples, &deadline_misses, &copy_busy_ratio,
                 &peak_occupancy, &ring_slots, &resident_pages, &controlled_pages,
-                &skipped_pages, &resident_pages_attended));
+                &skipped_pages, &resident_pages_attended, &cpu_pages));
         ggml_backend_cuda_kv_stream_runtime_free(runtime);
 
         t.assert_equal(uint64_t(2*page_bytes), stats.host_to_device_bytes);
@@ -3043,7 +3149,7 @@ int main() {
 
         using feedback_fn_t = bool (*)(
             void *, uint64_t *, uint64_t *, double *, uint32_t *,
-            uint32_t *, uint32_t *, uint32_t *, uint64_t *, uint64_t *);
+            uint32_t *, uint32_t *, uint32_t *, uint64_t *, uint64_t *, uint64_t *);
         ggml_backend_dev_t device = ggml_backend_get_device(backend.get());
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
         auto feedback_fn = reinterpret_cast<feedback_fn_t>(
@@ -3062,12 +3168,14 @@ int main() {
         uint32_t controlled_pages = 0;
         uint64_t skipped_pages = 0;
         uint64_t resident_pages_attended = 0;
+        uint64_t cpu_pages = 0;
         t.assert_true("dynamic feedback is readable", feedback_fn(
             runtime, &deadline_samples, &deadline_misses, &copy_busy_ratio,
             &peak_occupancy, &ring_slots, &resident_pages, &controlled_pages,
-            &skipped_pages, &resident_pages_attended));
+            &skipped_pages, &resident_pages_attended, &cpu_pages));
         t.assert_equal(stats.skipped_pages, skipped_pages);
         t.assert_equal(stats.resident_pages_attended, resident_pages_attended);
+        t.assert_equal(stats.cpu_pages, cpu_pages);
         t.assert_equal(uint64_t(6), deadline_samples);
         t.assert_true("copy busy ratio is normalized",
             copy_busy_ratio >= 0.0 && copy_busy_ratio <= 1.0);

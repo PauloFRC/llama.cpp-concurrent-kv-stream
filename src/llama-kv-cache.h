@@ -115,7 +115,8 @@ public:
         const  layer_share_cb & share,
         // a model can hold more than one cache, so the tensor names have to stay unique
                  const char *   name_tag = "",
-                         size_t kv_stream_stage_bytes = 0);
+                         size_t kv_stream_stage_bytes = 0,
+                       uint32_t kv_stream_cpu_threads = 0);
 
     ~llama_kv_cache() = default;
 
@@ -302,7 +303,7 @@ private:
     struct kv_stream_runtime_owner {
         using feedback_fn_t = bool (*)(
             void *, uint64_t *, uint64_t *, double *, uint32_t *,
-            uint32_t *, uint32_t *, uint32_t *, uint64_t *, uint64_t *);
+            uint32_t *, uint32_t *, uint32_t *, uint64_t *, uint64_t *, uint64_t *);
         using span_feedback_fn_t = bool (*)(void *, double);
         using reconfigure_fn_t = bool (*)(void *, uint32_t, uint32_t);
         using repartition_fn_t = bool (*)(void *, uint32_t);
@@ -332,6 +333,7 @@ private:
         uint64_t previous_deadline_misses = 0;
         uint64_t previous_skipped_pages = 0;
         uint64_t previous_resident_pages_attended = 0;
+        uint64_t previous_cpu_pages = 0;
         int64_t previous_adapt_us = 0;
         uint32_t previous_query_tokens = UINT32_MAX;
 
@@ -381,9 +383,10 @@ private:
                       uint32_t layer_count,
                      ggml_type type_k,
                      ggml_type type_v,
+                      uint32_t cpu_threads,
                       uint32_t il);
 
-    void kv_stream_init_cpu_split(ggml_backend_dev_t dev, uint32_t n_head, uint32_t context_pages);
+    void kv_stream_init_cpu_split(ggml_backend_dev_t dev, uint32_t n_head, uint32_t context_pages, uint32_t n_threads);
 
     ggml_tensor * build_rope_shift(
             const llama_cparams & cparams,

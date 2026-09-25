@@ -2,7 +2,6 @@
 
 #include "ggml.h"
 
-#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
@@ -23,9 +22,9 @@ class ggml_cuda_kv_stream_cpu_pool {
 public:
     using body_fn = std::function<void(const job_t & job, int thread, int n_threads)>;
 
-    ggml_cuda_kv_stream_cpu_pool(int n_threads, uint32_t depth, body_fn body, std::atomic<uint32_t> * done = nullptr,
+    ggml_cuda_kv_stream_cpu_pool(int n_threads, uint32_t depth, body_fn body,
             const std::vector<int> & cpus = {}) :
-            n_threads_(n_threads), jobs_(depth), body_(std::move(body)), done_(done), pending_(n_threads) {
+            n_threads_(n_threads), jobs_(depth), body_(std::move(body)), pending_(n_threads) {
         GGML_ASSERT(n_threads > 0 && depth > 0);
 #if defined(__linux__)
         for (const int cpu : cpus) {
@@ -121,9 +120,6 @@ private:
             if (--pending_ == 0) {
                 pending_ = n_threads_;
                 completed_ = job;
-                if (done_ != nullptr) {
-                    done_->store(uint32_t(job), std::memory_order_release);
-                }
                 ready_cv_.notify_all();
                 done_cv_.notify_all();
             }
@@ -133,7 +129,6 @@ private:
     const int n_threads_;
     std::vector<job_t> jobs_;
     body_fn body_;
-    std::atomic<uint32_t> * done_;
     std::vector<std::thread> threads_;
     std::mutex mutex_;
     std::condition_variable ready_cv_;

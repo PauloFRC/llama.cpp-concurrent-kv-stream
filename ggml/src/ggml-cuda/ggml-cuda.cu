@@ -1804,7 +1804,7 @@ bool ggml_backend_cuda_kv_stream_set_cpu_split(
     }
     ggml_cuda_set_device(runtime->device);
     return ggml_cuda_kv_stream_transfer_ring_set_cpu_split(
-        runtime->transfer_ring, n_threads, n_head, context_pages, runtime->resident_layer_count);
+        runtime->transfer_ring, n_threads, n_head, context_pages);
 }
 
 ggml_backend_cuda_kv_stream_stats ggml_backend_cuda_kv_stream_get_stats(

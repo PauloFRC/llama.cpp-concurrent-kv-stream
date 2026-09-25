@@ -120,12 +120,6 @@ public:
         barrier_cv_.wait(lock, [&] { return barrier_generation_ != generation; });
     }
 
-    // TODO: only the Task B skeleton counters read this
-    uint32_t queued() {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return uint32_t(armed_ - completed_);
-    }
-
     bool idle() {
         std::lock_guard<std::mutex> lock(mutex_);
         return completed_ == armed_;

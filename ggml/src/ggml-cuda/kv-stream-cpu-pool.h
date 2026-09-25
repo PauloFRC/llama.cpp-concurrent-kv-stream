@@ -4,6 +4,7 @@
 
 #include <condition_variable>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <mutex>
 #include <thread>
@@ -21,6 +22,33 @@ template <typename job_t>
 class ggml_cuda_kv_stream_cpu_pool {
 public:
     using body_fn = std::function<void(const job_t & job, int thread, int n_threads)>;
+
+    // waits for its job on every exit
+    class scoped_join {
+    public:
+        scoped_join(ggml_cuda_kv_stream_cpu_pool & pool, uint32_t job) :
+                pool_(&pool), job_(job), exceptions_(std::uncaught_exceptions()) {}
+        scoped_join(const scoped_join &) = delete;
+        scoped_join & operator=(const scoped_join &) = delete;
+
+        ~scoped_join() {
+            if (pool_ != nullptr) {
+                GGML_ASSERT(std::uncaught_exceptions() > exceptions_ && "job left without join()");
+                pool_->wait(job_);
+            }
+        }
+
+        void join() {
+            GGML_ASSERT(pool_ != nullptr);
+            pool_->wait(job_);
+            pool_ = nullptr;
+        }
+
+    private:
+        ggml_cuda_kv_stream_cpu_pool * pool_;
+        const uint32_t job_;
+        const int exceptions_;
+    };
 
     ggml_cuda_kv_stream_cpu_pool(int n_threads, uint32_t depth, body_fn body,
             const std::vector<int> & cpus = {}) :

@@ -22,6 +22,7 @@
 #include <cfloat>
 #include <mutex>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
@@ -1304,6 +1305,41 @@ int main() {
             pool.wait(last);
         }
         t.assert_true("bursts run every job once per thread", ran(ids) && pool.idle());
+    });
+
+    t.test("cpu pool scoped join waits for its job on join and on an exception", [](testing & t) {
+        struct job {};
+        constexpr int n_threads = 3;
+        std::atomic<int> runs{0};
+        ggml_cuda_kv_stream_cpu_pool<job> pool(n_threads, 1, [&](const job &, int, int) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            ++runs;
+        });
+        using scoped_join = ggml_cuda_kv_stream_cpu_pool<job>::scoped_join;
+
+        {
+            scoped_join join(pool, pool.arm({}));
+            pool.release();
+            join.join();
+            t.assert_equal("join returns after the job ran on every thread", n_threads, runs.load());
+        }
+
+        std::thread releaser;
+        const int runs_before = runs.load();
+        int runs_at_catch = -1;
+        try {
+            scoped_join join(pool, pool.arm({}));
+            releaser = std::thread([&] {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                pool.release();
+            });
+            throw std::runtime_error("op failed after dispatch");
+        } catch (const std::runtime_error &) {
+            runs_at_catch = runs.load();
+        }
+        releaser.join();
+        t.assert_equal("the exception leaves the scope only after the job ran", runs_before + n_threads, runs_at_catch);
+        t.assert_true("pool is idle after both exits", pool.idle());
     });
 
     t.test("cpu pool pins each thread to its listed cpu", [](testing & t) {

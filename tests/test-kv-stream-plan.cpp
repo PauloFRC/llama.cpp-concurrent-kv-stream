@@ -605,7 +605,7 @@ int main() {
 
     t.test("cumulative CUDA feedback becomes one bounded evaluation delta", [](testing & t) {
         const auto delta = llama_kv_stream_feedback_delta_make(
-            { 145, 17, 30, 50, 12 }, { 120, 12, 10, 20, 2 });
+            { 145, 17, 30, 50, 12, 4, 5, 6, 7 }, { 120, 12, 10, 20, 2, 1, 1, 1, 1 });
         t.assert_true("feedback delta is valid", delta.valid);
         t.assert_true("feedback contains a new evaluation", delta.has_evaluation);
         t.assert_equal(uint64_t(25), delta.deadline_samples);
@@ -613,6 +613,10 @@ int main() {
         t.assert_equal(uint64_t(20), delta.skipped_pages);
         t.assert_equal(uint64_t(30), delta.resident_pages_attended);
         t.assert_equal(uint64_t(10), delta.cpu_pages);
+        t.assert_equal(uint64_t(3), delta.cpu_decline_prefill);
+        t.assert_equal(uint64_t(4), delta.cpu_decline_no_eligible_pages);
+        t.assert_equal(uint64_t(5), delta.cpu_decline_below_min_pages);
+        t.assert_equal(uint64_t(6), delta.cpu_decline_all_mutable);
         t.assert_true("deadline ratio is exact",
             std::abs(delta.deadline_miss_ratio - 0.20) < 1e-12);
 
@@ -635,6 +639,16 @@ int main() {
         const auto cpu_reset = llama_kv_stream_feedback_delta_make(
             { 145, 17, 30, 50, 3 }, { 145, 17, 30, 50, 8 });
         t.assert_true("cpu pages counter reset is rejected", !cpu_reset.valid);
+
+        using counters_t = llama_kv_stream_feedback_counters;
+        for (uint64_t counters_t::* decline : {
+                &counters_t::cpu_decline_prefill, &counters_t::cpu_decline_no_eligible_pages,
+                &counters_t::cpu_decline_below_min_pages, &counters_t::cpu_decline_all_mutable}) {
+            counters_t previous = { 145, 17, 30, 50, 8 };
+            previous.*decline = 1;
+            t.assert_true("cpu decline counter reset is rejected",
+                !llama_kv_stream_feedback_delta_make({ 145, 17, 30, 50, 8 }, previous).valid);
+        }
 
         const auto impossible = llama_kv_stream_feedback_delta_make(
             { 150, 30 }, { 145, 17 });

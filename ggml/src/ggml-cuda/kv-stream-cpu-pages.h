@@ -8,6 +8,9 @@
 #include <cstring>
 #include <vector>
 
+// below this many pages a job may cost more than it saves
+constexpr uint32_t GGML_CUDA_KV_STREAM_CPU_SPLIT_MIN_PAGES = 2;
+
 // why a layer cannot hand its pages to the CPU; BLOCK_OK means it can
 enum ggml_cuda_kv_stream_cpu_split_block {
     GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_OK = 0,

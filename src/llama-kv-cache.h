@@ -3,6 +3,7 @@
 #include "llama-batch.h"
 #include "llama-graph.h"
 #include "llama-kv-cells.h"
+#include "llama-kv-stream-plan.h"
 #include "llama-memory.h"
 
 #include <unordered_map>
@@ -303,7 +304,8 @@ private:
     struct kv_stream_runtime_owner {
         using feedback_fn_t = bool (*)(
             void *, uint64_t *, uint64_t *, double *, uint32_t *,
-            uint32_t *, uint32_t *, uint32_t *, uint64_t *, uint64_t *, uint64_t *);
+            uint32_t *, uint32_t *, uint32_t *, uint64_t *, uint64_t *, uint64_t *,
+            uint64_t *, uint64_t *, uint64_t *, uint64_t *);
         using span_feedback_fn_t = bool (*)(void *, double);
         using reconfigure_fn_t = bool (*)(void *, uint32_t, uint32_t);
         using repartition_fn_t = bool (*)(void *, uint32_t);
@@ -329,11 +331,7 @@ private:
         uint32_t starved_evaluations = 0;
         uint32_t overprovisioned_evaluations = 0;
         uint32_t evaluations_since_repartition = UINT32_MAX;
-        uint64_t previous_deadline_samples = 0;
-        uint64_t previous_deadline_misses = 0;
-        uint64_t previous_skipped_pages = 0;
-        uint64_t previous_resident_pages_attended = 0;
-        uint64_t previous_cpu_pages = 0;
+        llama_kv_stream_feedback_counters previous_counters;
         int64_t previous_adapt_us = 0;
         uint32_t previous_query_tokens = UINT32_MAX;
 

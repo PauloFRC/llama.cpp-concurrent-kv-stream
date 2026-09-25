@@ -491,7 +491,11 @@ llama_kv_stream_feedback_delta llama_kv_stream_feedback_delta_make(
             current.deadline_misses < previous.deadline_misses ||
             current.skipped_pages < previous.skipped_pages ||
             current.resident_pages_attended < previous.resident_pages_attended ||
-            current.cpu_pages < previous.cpu_pages) {
+            current.cpu_pages < previous.cpu_pages ||
+            current.cpu_decline_prefill < previous.cpu_decline_prefill ||
+            current.cpu_decline_no_eligible_pages < previous.cpu_decline_no_eligible_pages ||
+            current.cpu_decline_below_min_pages < previous.cpu_decline_below_min_pages ||
+            current.cpu_decline_all_mutable < previous.cpu_decline_all_mutable) {
         result.error = "KV stream feedback counters moved backwards";
         return result;
     }
@@ -501,6 +505,10 @@ llama_kv_stream_feedback_delta llama_kv_stream_feedback_delta_make(
     result.skipped_pages = current.skipped_pages - previous.skipped_pages;
     result.resident_pages_attended = current.resident_pages_attended - previous.resident_pages_attended;
     result.cpu_pages = current.cpu_pages - previous.cpu_pages;
+    result.cpu_decline_prefill = current.cpu_decline_prefill - previous.cpu_decline_prefill;
+    result.cpu_decline_no_eligible_pages = current.cpu_decline_no_eligible_pages - previous.cpu_decline_no_eligible_pages;
+    result.cpu_decline_below_min_pages = current.cpu_decline_below_min_pages - previous.cpu_decline_below_min_pages;
+    result.cpu_decline_all_mutable = current.cpu_decline_all_mutable - previous.cpu_decline_all_mutable;
     if (result.deadline_misses > result.deadline_samples) {
         result.error = "KV stream deadline misses exceed samples";
         return result;

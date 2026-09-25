@@ -343,6 +343,16 @@ struct kv_stream_cpu_split {
     // TODO: Task B skeleton counters
     kv_stream_cpu_diag diag;
 
+    uint32_t warned_blocks = 0;
+    void warn_block(ggml_cuda_kv_stream_cpu_split_block block) {
+        static_assert(GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_COUNT <= 32, "block reasons must fit the warned bitmask");
+        const uint32_t bit = 1u << uint32_t(block);
+        if ((warned_blocks & bit) == 0) {
+            warned_blocks |= bit;
+            GGML_LOG_WARN("kv stream cpu split disabled: %s\n", ggml_cuda_kv_stream_cpu_split_block_reason(block));
+        }
+    }
+
     ~kv_stream_cpu_split() {
         CUDA_CHECK(cudaDeviceSynchronize());
         pool.reset();
@@ -2230,16 +2240,25 @@ bool ggml_cuda_kv_stream_graph_add_attention(
     const ggml_tensor * mask = dst->src[3];
     kv_stream_cpu_graph * cpu_graph = ring->cpu_split == nullptr ? nullptr : &ring->cpu_split->graph;
     uint32_t n_cpu = 0;
-    if (cpu_graph != nullptr && ggml_cuda_kv_stream_cpu_split_supported(dst) && (cpu_graph->mask == nullptr ||
-            (mask->data == cpu_graph->mask->data && mask->nb[1] == cpu_graph->mask->nb[1]))) {
-        // TODO: Task F sets the default share; the absolute page count goes with the skeleton knobs
-        n_cpu = cpu_graph->knobs.pages_per_layer;
-        if (n_cpu == 0 && cpu_graph->knobs.share > 0.0f) {
-            uint32_t streamed = 0;
-            for (uint32_t page = resident_pages; page < uint32_t(nchunks); ++page) {
-                streamed += page_state.live(page);
+    if (cpu_graph != nullptr) {
+        ggml_cuda_kv_stream_cpu_split_block block = ggml_cuda_kv_stream_cpu_split_get_block(dst);
+        if (block == GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_OK && cpu_graph->mask != nullptr &&
+                (mask->data != cpu_graph->mask->data || mask->nb[1] != cpu_graph->mask->nb[1])) {
+            block = GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_MASK_CHANGED;
+        }
+        if (block != GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_OK) {
+            // wide batches returned above, so the per-batch BLOCK_QUERY_TOKENS never warns here
+            ring->cpu_split->warn_block(block);
+        } else {
+            // TODO: Task F sets the default share; the absolute page count goes with the skeleton knobs
+            n_cpu = cpu_graph->knobs.pages_per_layer;
+            if (n_cpu == 0 && cpu_graph->knobs.share > 0.0f) {
+                uint32_t streamed = 0;
+                for (uint32_t page = resident_pages; page < uint32_t(nchunks); ++page) {
+                    streamed += page_state.live(page);
+                }
+                n_cpu = uint32_t(std::lround(cpu_graph->knobs.share*float(streamed)));
             }
-            n_cpu = uint32_t(std::lround(cpu_graph->knobs.share*float(streamed)));
         }
     }
     std::vector<uint32_t> cpu_pages = ggml_cuda_kv_stream_select_cpu_pages(page_state, n_cpu);

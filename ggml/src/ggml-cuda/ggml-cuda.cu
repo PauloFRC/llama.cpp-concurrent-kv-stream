@@ -6587,7 +6587,8 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
                 uint32_t * resident_pages_per_layer,
                 uint32_t * controlled_pool_pages,
                 uint64_t * skipped_pages,
-                uint64_t * resident_pages_attended) -> bool {
+                uint64_t * resident_pages_attended,
+                uint64_t * cpu_pages) -> bool {
             auto * runtime = static_cast<ggml_backend_cuda_kv_stream_runtime_t>(opaque);
             if (runtime == nullptr || deadline_samples == nullptr || deadline_misses == nullptr ||
                     copy_engine_busy_ratio == nullptr || ring_peak_occupancy == nullptr ||
@@ -6618,6 +6619,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
                 const auto resident_stats =
                     ggml_cuda_kv_stream_resident_cache_get_stats(runtime->resident_cache);
                 *resident_pages_attended = resident_stats.resident_pages_attended;
+            }
+            if (cpu_pages != nullptr) {
+                *cpu_pages = stats.cpu_pages;
             }
             return true;
         };

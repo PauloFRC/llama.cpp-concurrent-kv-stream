@@ -30,7 +30,8 @@ llama_memory_hybrid::llama_memory_hybrid(
                             /* layer filters */
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr,
-                     size_t kv_stream_stage_bytes) :
+                     size_t kv_stream_stage_bytes,
+                   uint32_t kv_stream_cpu_threads) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache(
         model,
@@ -52,7 +53,8 @@ llama_memory_hybrid::llama_memory_hybrid(
         nullptr,
         nullptr,
         "",
-        kv_stream_stage_bytes
+        kv_stream_stage_bytes,
+        kv_stream_cpu_threads
     )),
     mem_recr(new llama_memory_recurrent(
         model,

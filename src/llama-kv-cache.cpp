@@ -1,4 +1,5 @@
 #include "llama-kv-cache.h"
+#include "llama-kv-stream-config.h"
 #include "llama-kv-stream-plan.h"
 
 #include "llama-impl.h"
@@ -14,6 +15,7 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 
 static bool ggml_is_power_of_2(int n) {
@@ -82,7 +84,8 @@ llama_kv_cache::llama_kv_cache(
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
              const char *   name_tag,
-                     size_t kv_stream_stage_bytes) :
+                     size_t kv_stream_stage_bytes,
+                   uint32_t kv_stream_cpu_threads) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
@@ -242,9 +245,9 @@ llama_kv_cache::llama_kv_cache(
 
                 if (kv_stream_runtime.runtime == nullptr) {
                     kv_stream_buft = kv_stream_init_runtime(
-                        dev, kv_stream_stage_bytes, kv_stream_layer_count, type_k, type_v, il);
+                        dev, kv_stream_stage_bytes, kv_stream_layer_count, type_k, type_v, kv_stream_cpu_threads, il);
                     kv_stream_dev = dev;
-                    kv_stream_init_cpu_split(dev, kv_stream_n_head, (kv_size + page_tokens - 1)/page_tokens);
+                    kv_stream_init_cpu_split(dev, kv_stream_n_head, (kv_size + page_tokens - 1)/page_tokens, kv_stream_cpu_threads);
                 }
 
                 buft = kv_stream_buft;
@@ -1419,21 +1422,24 @@ bool llama_kv_cache::kv_stream_adapt(uint32_t active_tokens, uint32_t query_toke
     uint32_t controlled_pages = 0;
     uint64_t skipped_pages = 0;
     uint64_t resident_pages_attended = 0;
+    uint64_t cpu_pages = 0;
     if (!owner.feedback_fn(owner.runtime,
             &deadline_samples, &deadline_misses, &copy_busy_ratio,
             &peak_occupancy, &ring_slots, &resident_pages, &controlled_pages,
-            &skipped_pages, &resident_pages_attended)) {
+            &skipped_pages, &resident_pages_attended, &cpu_pages)) {
         return false;
     }
 
     const auto delta = llama_kv_stream_feedback_delta_make(
-        { deadline_samples, deadline_misses, skipped_pages, resident_pages_attended },
+        { deadline_samples, deadline_misses, skipped_pages, resident_pages_attended, cpu_pages },
         { owner.previous_deadline_samples, owner.previous_deadline_misses,
-          owner.previous_skipped_pages, owner.previous_resident_pages_attended });
+          owner.previous_skipped_pages, owner.previous_resident_pages_attended,
+          owner.previous_cpu_pages });
     owner.previous_deadline_samples = deadline_samples;
     owner.previous_deadline_misses = deadline_misses;
     owner.previous_skipped_pages = skipped_pages;
     owner.previous_resident_pages_attended = resident_pages_attended;
+    owner.previous_cpu_pages = cpu_pages;
 
     const uint32_t active_pages = (active_tokens + page_tokens - 1) / page_tokens;
 
@@ -1445,13 +1451,14 @@ bool llama_kv_cache::kv_stream_adapt(uint32_t active_tokens, uint32_t query_toke
         decode_layout_pages != 0 && decode_layout_pages != owner.decode_layout_pages;
 
     if (getenv("LLAMA_KV_STREAM_TRACE") != nullptr) {
-        LLAMA_LOG_WARN("%s: active %u, resident %u, ring %u, layout %u, samples %llu, misses %llu, copy busy %.1f%%, peak %u, skipped %llu, resident attended %llu\n",
+        LLAMA_LOG_WARN("%s: active %u, resident %u, ring %u, layout %u, samples %llu, misses %llu, copy busy %.1f%%, peak %u, skipped %llu, resident attended %llu, cpu pages %llu\n",
             __func__, active_tokens, resident_pages, ring_slots, decode_layout_pages,
             (unsigned long long) delta.deadline_samples,
             (unsigned long long) delta.deadline_misses,
             100.0*copy_busy_ratio, peak_occupancy,
             (unsigned long long) delta.skipped_pages,
-            (unsigned long long) delta.resident_pages_attended);
+            (unsigned long long) delta.resident_pages_attended,
+            (unsigned long long) delta.cpu_pages);
     }
 
     if (ring_slots != 0 && owner.minimum_ring_slots == 0) {
@@ -1540,6 +1547,7 @@ ggml_backend_buffer_type_t llama_kv_cache::kv_stream_init_runtime(
                   uint32_t layer_count,
                  ggml_type type_k,
                  ggml_type type_v,
+                  uint32_t cpu_threads,
                   uint32_t il) {
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
     using type_pair_supported_fn_t = bool (*)(ggml_type, ggml_type);
@@ -1584,9 +1592,14 @@ ggml_backend_buffer_type_t llama_kv_cache::kv_stream_init_runtime(
         reg, "ggml_backend_cuda_kv_stream_mark_dirty_rows");
     auto * set_live_pages_fn = (set_live_pages_fn_t) ggml_backend_reg_get_proc_address(
         reg, "ggml_backend_cuda_kv_stream_set_live_pages");
-    // TODO: reject --kv-stream-cpu-threads here once the CPU share reaches fattn
     auto * cpu_attn_supported_fn = (cpu_attn_supported_fn_t) ggml_backend_reg_get_proc_address(
         reg, "ggml_backend_cuda_kv_stream_cpu_attn_supported");
+
+    if (cpu_threads > 0 && cpu_attn_supported_fn != nullptr && !cpu_attn_supported_fn()) {
+        throw std::runtime_error(
+            "block KV streaming CPU attention is not available in this build or on this CPU "
+            "(it needs AVX-512 F, DQ, VNNI, F16C and FMA)");
+    }
 
     if (type_pair_supported_fn == nullptr || page_bytes_fn == nullptr ||
             workspace_bytes_fn == nullptr || runtime_new_fn == nullptr ||
@@ -1643,33 +1656,33 @@ ggml_backend_buffer_type_t llama_kv_cache::kv_stream_init_runtime(
     return buft;
 }
 
-// TODO: Task C's --kv-stream-cpu-threads replaces the skeleton gate and its thread count
-void llama_kv_cache::kv_stream_init_cpu_split(ggml_backend_dev_t dev, uint32_t n_head, uint32_t context_pages) {
-    const char * skeleton = getenv("GGML_CUDA_KV_STREAM_CPU_SKELETON");
-    if (skeleton == nullptr || strcmp(skeleton, "1") != 0) {
+void llama_kv_cache::kv_stream_init_cpu_split(ggml_backend_dev_t dev, uint32_t n_head, uint32_t context_pages, uint32_t n_threads) {
+    if (n_threads == 0) {
         return;
     }
-    if (kv_stream_runtime.cpu_attn_supported_fn == nullptr || !kv_stream_runtime.cpu_attn_supported_fn()) {
-        LLAMA_LOG_WARN("%s: the CPU split skeleton needs AVX-512 CPU attention, which this build or CPU lacks; it stays off\n",
-            __func__);
-        return;
-    }
-    const char * threads = getenv("GGML_CUDA_KV_STREAM_CPU_THREADS");
-    const long n_threads = threads == nullptr ? 0 : strtol(threads, nullptr, 10);
-    if (n_threads <= 0 || n_threads > 1024) {
-        LLAMA_LOG_WARN("%s: the CPU split skeleton needs GGML_CUDA_KV_STREAM_CPU_THREADS in 1..1024; it stays off\n",
+    const uint32_t n_threads_max = std::thread::hardware_concurrency();
+    const uint32_t n_threads_eff = llama_kv_stream_cpu_threads_resolve(n_threads, n_threads_max);
+    if (kv_stream_runtime.cpu_attn_supported_fn == nullptr) {
+        LLAMA_LOG_WARN("%s: this build has no CPU attention over streamed KV pages; the split stays off\n",
             __func__);
         return;
     }
     using set_cpu_split_fn_t = bool (*)(void *, uint32_t, uint32_t, uint32_t);
     auto * set_cpu_split_fn = (set_cpu_split_fn_t) ggml_backend_reg_get_proc_address(
         ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_kv_stream_set_cpu_split");
-    if (set_cpu_split_fn == nullptr ||
-            !set_cpu_split_fn(kv_stream_runtime.runtime, uint32_t(n_threads), n_head, context_pages)) {
+    if (set_cpu_split_fn == nullptr) {
+        LLAMA_LOG_WARN("%s: the CUDA backend does not export the CPU split entry point "
+            "(libllama and ggml-cuda builds do not match); the split stays off\n", __func__);
         return;
     }
-    LLAMA_LOG_WARN("%s: CPU split skeleton on, %ld threads: decode output is not validated, use it for Task B measurements only\n",
-        __func__, n_threads);
+    if (!set_cpu_split_fn(kv_stream_runtime.runtime, n_threads_eff, n_head, context_pages)) {
+        return; // the ggml side warns when the scratch allocation fails
+    }
+    if (n_threads_eff != n_threads) {
+        LLAMA_LOG_WARN("%s: %u CPU attention threads requested, clamped to this machine's %u\n",
+            __func__, n_threads, n_threads_eff);
+    }
+    LLAMA_LOG_INFO("%s: CPU split on, %u threads\n", __func__, n_threads_eff);
 }
 
 bool llama_kv_cache::get_has_shift() const {

@@ -9,6 +9,16 @@ int main() {
         const auto result = llama_kv_stream_config_validate(config);
         t.assert_true("disabled config is valid", result.valid);
         t.assert_true("disabled config remains disabled", !result.enabled);
+        t.assert_true("disabled config does not warn", result.warning.empty());
+    });
+
+    t.test("cpu attention threads without streaming warn and stay off", [](testing & t) {
+        llama_kv_stream_config config;
+        config.cpu_threads = 4;
+        const auto result = llama_kv_stream_config_validate(config);
+        t.assert_true("config is valid", result.valid);
+        t.assert_true("config remains disabled", !result.enabled);
+        t.assert_true("config warns", !result.warning.empty());
     });
 
     t.test("supported target configuration is accepted", [](testing & t) {
@@ -20,10 +30,12 @@ int main() {
         config.single_sequence    = true;
         config.flash_attention    = true;
         config.kv_offload         = true;
+        config.cpu_threads        = 4;
 
         const auto result = llama_kv_stream_config_validate(config);
         t.assert_true("config is valid", result.valid);
         t.assert_true("config is enabled", result.enabled);
+        t.assert_true("config does not warn", result.warning.empty());
     });
 
     t.test("multi-sequence with unified KV is accepted and enabled", [](testing & t) {
@@ -76,6 +88,13 @@ int main() {
         config = base;
         config.stage_bytes = config.minimum_stage_bytes - 1;
         expect_invalid("stage smaller than one page", config);
+    });
+
+    t.test("cpu attention threads clamp to the machine and keep zero off", [](testing & t) {
+        t.assert_equal(uint32_t(0), llama_kv_stream_cpu_threads_resolve(0, 8));
+        t.assert_equal(uint32_t(6), llama_kv_stream_cpu_threads_resolve(6, 8));
+        t.assert_equal(uint32_t(8), llama_kv_stream_cpu_threads_resolve(64, 8));
+        t.assert_equal(uint32_t(4), llama_kv_stream_cpu_threads_resolve(4, 0));
     });
 
     t.test("pool is partitioned evenly across layers with one scratch page", [](testing & t) {

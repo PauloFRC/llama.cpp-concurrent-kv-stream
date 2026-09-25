@@ -96,11 +96,13 @@ static void test(void) {
         base.n_parallel = 4;
         base.n_outputs_max_per_seq = 8;
         base.kv_stream_stage_mib = 64;
+        base.kv_stream_cpu_threads = 4;
 
         const auto draft = common_base_params_to_speculative(base);
         assert(draft.n_outputs_max == 4);
         assert(draft.n_outputs_max_per_seq == 1);
         assert(draft.kv_stream_stage_mib == 0);
+        assert(draft.kv_stream_cpu_threads == 0);
     }
 
     printf("test-arg-parser: make sure there is no duplicated arguments in any examples\n\n");
@@ -198,6 +200,19 @@ static void test(void) {
 
         argv = {"binary_name", "-m", "model_file.gguf", "--kv-stream-stage-mib", "-1"};
         assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), stream_params, LLAMA_EXAMPLE_COMMON));
+    }
+
+    {
+        common_params cpu_params;
+        assert(cpu_params.kv_stream_cpu_threads == 0);
+
+        argv = {"binary_name", "-m", "model_file.gguf", "--kv-stream-cpu-threads", "1"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), cpu_params, LLAMA_EXAMPLE_COMMON));
+        assert(cpu_params.kv_stream_cpu_threads == 1);
+
+        argv = {"binary_name", "-m", "model_file.gguf", "--kv-stream-cpu-threads", "-1"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), cpu_params, LLAMA_EXAMPLE_COMMON));
+        assert(cpu_params.kv_stream_cpu_threads == 1);
     }
 
     {
@@ -357,6 +372,17 @@ static void test(void) {
     argv = {"binary_name"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_DIRECT_IO);
+
+    setenv("LLAMA_ARG_KV_STREAM_CPU_THREADS", "3", true);
+    argv = {"binary_name"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.kv_stream_cpu_threads == 3);
+
+    setenv("LLAMA_ARG_KV_STREAM_CPU_THREADS", "-1", true);
+    argv = {"binary_name"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.kv_stream_cpu_threads == 3);
+    unsetenv("LLAMA_ARG_KV_STREAM_CPU_THREADS");
 
     printf("test-arg-parser: test negated environment variables\n\n");
 

@@ -1,14 +1,18 @@
 #include "llama-kv-stream-config.h"
 
+#include <algorithm>
 #include <limits>
 
 llama_kv_stream_config_result llama_kv_stream_config_validate(const llama_kv_stream_config & config) {
     if (config.stage_bytes == 0) {
-        return { true, false, {} };
+        if (config.cpu_threads > 0) {
+            return { true, false, {}, "CPU attention threads are set but block KV streaming is off; the CPU split stays off" };
+        }
+        return { true, false, {}, {} };
     }
 
     auto invalid = [](const char * error) {
-        return llama_kv_stream_config_result { false, false, error };
+        return llama_kv_stream_config_result { false, false, error, {} };
     };
 
     if (!config.arch_qwen35) {
@@ -30,7 +34,11 @@ llama_kv_stream_config_result llama_kv_stream_config_validate(const llama_kv_str
         return invalid("block KV streaming stage is too small for one 256-token cache page");
     }
 
-    return { true, true, {} };
+    return { true, true, {}, {} };
+}
+
+uint32_t llama_kv_stream_cpu_threads_resolve(uint32_t requested, uint32_t max_threads) {
+    return max_threads == 0 ? requested : std::min(requested, max_threads);
 }
 
 llama_kv_stream_pool_layout llama_kv_stream_pool_layout_make(

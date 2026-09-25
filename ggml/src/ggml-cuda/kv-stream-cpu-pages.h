@@ -8,7 +8,25 @@
 #include <cstring>
 #include <vector>
 
-inline bool ggml_cuda_kv_stream_cpu_split_supported(const ggml_tensor * dst) {
+// why a layer cannot hand its pages to the CPU; BLOCK_OK means it can
+enum ggml_cuda_kv_stream_cpu_split_block {
+    GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_OK = 0,
+    GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_K_TYPE,
+    GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_V_TYPE,
+    GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_Q_TYPE,
+    GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_Q_GAP,
+    GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_HEAD_DIM,
+    GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_QUERY_TOKENS,
+    GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_SEQ_DIM,
+    GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_MASK,
+    GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_MASK_ROWS,
+    GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_MAX_BIAS,
+    GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_SOFT_CAP,
+    GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_MASK_CHANGED,
+    GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_COUNT,
+};
+
+inline ggml_cuda_kv_stream_cpu_split_block ggml_cuda_kv_stream_cpu_split_get_block(const ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
@@ -19,12 +37,60 @@ inline bool ggml_cuda_kv_stream_cpu_split_supported(const ggml_tensor * dst) {
     memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
     memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
 
-    return K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0 &&
-        Q->type == GGML_TYPE_F32 && ggml_nbytes(Q) == size_t(ggml_nelements(Q))*sizeof(float) &&
-        Q->ne[0] == GGML_CUDA_KV_STREAM_HEAD_DIM && V->ne[0] == GGML_CUDA_KV_STREAM_HEAD_DIM &&
-        Q->ne[1] <= GGML_CUDA_KV_STREAM_MAX_DECODE_QUERY_TOKENS && Q->ne[3] == 1 &&
-        mask != nullptr && mask->ne[2] == 1 &&
-        max_bias == 0.0f && logit_softcap == 0.0f;
+    if (K->type != GGML_TYPE_Q8_0) {
+        return GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_K_TYPE;
+    }
+    if (V->type != GGML_TYPE_Q4_0) {
+        return GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_V_TYPE;
+    }
+    if (Q->type != GGML_TYPE_F32) {
+        return GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_Q_TYPE;
+    }
+    if (ggml_nbytes(Q) != size_t(ggml_nelements(Q))*sizeof(float)) {
+        return GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_Q_GAP;
+    }
+    if (Q->ne[0] != GGML_CUDA_KV_STREAM_HEAD_DIM || V->ne[0] != GGML_CUDA_KV_STREAM_HEAD_DIM) {
+        return GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_HEAD_DIM;
+    }
+    if (Q->ne[1] > GGML_CUDA_KV_STREAM_MAX_DECODE_QUERY_TOKENS) {
+        return GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_QUERY_TOKENS;
+    }
+    if (Q->ne[3] != 1) {
+        return GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_SEQ_DIM;
+    }
+    if (mask == nullptr) {
+        return GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_MASK;
+    }
+    if (mask->ne[2] != 1) {
+        return GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_MASK_ROWS;
+    }
+    if (max_bias != 0.0f) {
+        return GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_MAX_BIAS;
+    }
+    if (logit_softcap != 0.0f) {
+        return GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_SOFT_CAP;
+    }
+    return GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_OK;
+}
+
+inline const char * ggml_cuda_kv_stream_cpu_split_block_reason(ggml_cuda_kv_stream_cpu_split_block block) {
+    switch (block) {
+        case GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_OK:           return nullptr;
+        case GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_K_TYPE:       return "K cache is not q8_0";
+        case GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_V_TYPE:       return "V cache is not q4_0";
+        case GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_Q_TYPE:       return "Q is not f32";
+        case GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_Q_GAP:        return "Q has gaps between tokens";
+        case GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_HEAD_DIM:     return "head dim is not 256";
+        case GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_QUERY_TOKENS: return "the decode batch is wider than 32 tokens";
+        case GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_SEQ_DIM:      return "the batch has more than one sequence dimension";
+        case GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_MASK:         return "the layer has no mask";
+        case GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_MASK_ROWS:    return "the mask has more than one row per token";
+        case GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_MAX_BIAS:     return "attention has a max_bias";
+        case GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_SOFT_CAP:     return "attention has a logit softcap";
+        case GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_MASK_CHANGED: return "another mask already owns this graph";
+        case GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_COUNT:        break;
+    }
+    return "unknown";
 }
 
 struct ggml_cuda_kv_stream_page_state {

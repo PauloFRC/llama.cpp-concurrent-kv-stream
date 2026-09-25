@@ -605,13 +605,14 @@ int main() {
 
     t.test("cumulative CUDA feedback becomes one bounded evaluation delta", [](testing & t) {
         const auto delta = llama_kv_stream_feedback_delta_make(
-            { 145, 17, 30, 50 }, { 120, 12, 10, 20 });
+            { 145, 17, 30, 50, 12 }, { 120, 12, 10, 20, 2 });
         t.assert_true("feedback delta is valid", delta.valid);
         t.assert_true("feedback contains a new evaluation", delta.has_evaluation);
         t.assert_equal(uint64_t(25), delta.deadline_samples);
         t.assert_equal(uint64_t(5), delta.deadline_misses);
         t.assert_equal(uint64_t(20), delta.skipped_pages);
         t.assert_equal(uint64_t(30), delta.resident_pages_attended);
+        t.assert_equal(uint64_t(10), delta.cpu_pages);
         t.assert_true("deadline ratio is exact",
             std::abs(delta.deadline_miss_ratio - 0.20) < 1e-12);
 
@@ -630,6 +631,10 @@ int main() {
         const auto skipped_reset = llama_kv_stream_feedback_delta_make(
             { 145, 17, 5, 20 }, { 145, 17, 10, 20 });
         t.assert_true("skipped pages counter reset is rejected", !skipped_reset.valid);
+
+        const auto cpu_reset = llama_kv_stream_feedback_delta_make(
+            { 145, 17, 30, 50, 3 }, { 145, 17, 30, 50, 8 });
+        t.assert_true("cpu pages counter reset is rejected", !cpu_reset.valid);
 
         const auto impossible = llama_kv_stream_feedback_delta_make(
             { 150, 30 }, { 145, 17 });

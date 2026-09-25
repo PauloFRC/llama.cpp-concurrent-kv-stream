@@ -35,12 +35,14 @@ public:
             if (pool_ != nullptr) {
                 GGML_ASSERT(std::uncaught_exceptions() > exceptions_ && "job left without join()");
                 pool_->wait(job_);
+                GGML_ASSERT(pool_->idle() && "the pool is not idle at an op exit");
             }
         }
 
         void join() {
             GGML_ASSERT(pool_ != nullptr);
             pool_->wait(job_);
+            GGML_ASSERT(pool_->idle() && "the pool is not idle at an op exit");
             pool_ = nullptr;
         }
 
@@ -103,11 +105,6 @@ public:
     void wait(uint32_t job) {
         std::unique_lock<std::mutex> lock(mutex_);
         done_cv_.wait(lock, [&] { return int32_t(uint32_t(completed_) - job) >= 0; });
-    }
-
-    void wait_idle() {
-        std::unique_lock<std::mutex> lock(mutex_);
-        done_cv_.wait(lock, [this] { return completed_ == armed_; });
     }
 
     // every thread of the current job meets here

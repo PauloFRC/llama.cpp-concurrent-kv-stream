@@ -20,6 +20,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -2377,7 +2378,7 @@ void ggml_cuda_flash_attn_ext_streamed(
     GGML_ASSERT(plan == nullptr || size_t(nchunks) == plan->request_by_page.size());
     std::vector<chunk_descriptor> chunks(nchunks);
     const bool has_cpu_pages = plan != nullptr && !plan->cpu_pages.empty();
-    uint32_t cpu_job = 0;
+    std::optional<kv_stream_cpu_pool::scoped_join> cpu_join;
     if (has_cpu_pages) {
         GGML_ASSERT(resident_cache == transfer_ring->graph_resident_cache);
         const ggml_cuda_kv_stream_page_state page_state(uint32_t(nchunks), resident_layer_pages,
@@ -2387,7 +2388,8 @@ void ggml_cuda_flash_attn_ext_streamed(
             chunks[page].kind = chunk_kind::cpu;
         }
         transfer_ring->cpu_pages += plan->cpu_pages.size();
-        cpu_job = kv_stream_cpu_split_dispatch(transfer_ring, dst, plan->cpu_pages, ctx.stream());
+        cpu_join.emplace(*transfer_ring->cpu_split->pool,
+            kv_stream_cpu_split_dispatch(transfer_ring, dst, plan->cpu_pages, ctx.stream()));
     }
 
     std::vector<size_t> streamed_chunks;
@@ -2877,7 +2879,7 @@ void ggml_cuda_flash_attn_ext_streamed(
     if (has_cpu_pages) {
         const kv_stream_cpu_split & split = *transfer_ring->cpu_split;
         GGML_ASSERT(size_t(nrows) <= split.max_rows);
-        split.pool->wait(cpu_job);
+        cpu_join->join();
         const float * cpu_result = split.result_device;
         const float2 * cpu_result_meta = split.result_meta_device;
         // TODO: Task D keeps one of the two part paths

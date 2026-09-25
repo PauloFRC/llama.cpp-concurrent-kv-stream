@@ -1,4 +1,5 @@
 import os
+import sys
 import tempfile
 import pytest
 from utils import *
@@ -113,3 +114,105 @@ def test_disabled_with_flag():
     })
     assert res.status_code == 200
     assert "__TEST_TAG_CACHE_IDLE_SLOT__" not in log.drain()
+
+
+linux_only = pytest.mark.skipif(sys.platform != "linux", reason="--cache-disk-dir is Linux only")
+
+
+def token_prompt(seed: int, n: int, base: int = 20) -> list[int]:
+    return [(seed * 7 + i) % 400 + base for i in range(n)]
+
+
+def complete(prompt: list[int], id_slot: int = -1) -> dict:
+    res = server.make_request("POST", "/completion", data={
+        "prompt": prompt,
+        "id_slot": id_slot,
+        "cache_prompt": True,
+    })
+    assert res.status_code == 200, res.body
+    return res.body
+
+
+def spill_files(directory) -> int:
+    n = 0
+    for fd in os.listdir(f"/proc/{server.process.pid}/fd"):
+        try:
+            if os.readlink(f"/proc/{server.process.pid}/fd/{fd}").startswith(f"{directory}/"):
+                n += 1
+        except OSError:
+            pass
+    return n
+
+
+@linux_only
+def test_disk_spill_restore(tmp_path):
+    global server
+    server.n_ctx = 2048
+    server.cache_ram = 1
+    server.cache_disk_dir = str(tmp_path)
+    server.start()
+    log = LogReader(server.log_path)
+
+    prompts = [token_prompt(k, 700) for k in range(4)]
+
+    # each launch on the other slot parks the idle one
+    first = [complete(p, id_slot) for p, id_slot in zip(prompts, (0, 1, 0, 1))]
+    content = log.drain()
+    assert "__TEST_TAG_CACHE_DISK_SPILL__" in content
+    assert "removing oldest entry" not in content
+    assert spill_files(tmp_path) == 1
+    assert not os.listdir(tmp_path)
+
+    res = complete(prompts[0])
+    assert "__TEST_TAG_CACHE_DISK_RESTORE__" in log.drain()
+    assert res["timings"]["cache_n"] > 0
+    assert res["timings"]["prompt_n"] < first[0]["timings"]["prompt_n"]
+    assert res["content"] == first[0]["content"]
+    assert spill_files(tmp_path) == 1
+    assert not os.listdir(tmp_path)
+
+
+@linux_only
+def test_disk_limit(tmp_path):
+    global server
+    server.n_ctx = 4096
+    server.cache_ram = 2
+    server.cache_disk_dir = str(tmp_path)
+    server.cache_disk = 1
+    server.start()
+    log = LogReader(server.log_path)
+
+    # cache: A (1.25 MiB) and B (0.19 MiB), C (0.69 MiB) idle in slot 0
+    complete(token_prompt(0, 2000), 0)
+    complete(token_prompt(1, 300), 1)
+    complete(token_prompt(2, 1100), 0)
+    log.drain()
+
+    # parking C needs 0.12 MiB: A is too big for the disk tier, B is not
+    complete(token_prompt(3, 1100))
+    content = log.drain()
+    assert "__TEST_TAG_CACHE_IDLE_SLOT__" in content
+    assert "__TEST_TAG_CACHE_DISK_SPILL__" in content
+    assert "removing oldest entry" not in content
+
+    # parking P3 spills C, then parking P4 finds no room on disk and drops A
+    complete(token_prompt(4, 1100), 0)
+    complete(token_prompt(5, 1100), 1)
+    content = log.drain()
+    assert "disk tier is full" in content
+    assert "removing oldest entry" in content
+    assert spill_files(tmp_path) == 2
+
+
+@linux_only
+def test_disk_needs_ram_limit(tmp_path):
+    global server
+    server.n_ctx = 1024
+    server.cache_ram = -1
+    server.cache_disk_dir = str(tmp_path)
+    server.start()
+    log = LogReader(server.log_path)
+
+    for k, id_slot in ((0, 0), (1, 1), (2, 0), (3, 1)):
+        complete(token_prompt(k, 400), id_slot)
+    assert "cache token limit" in log.drain()

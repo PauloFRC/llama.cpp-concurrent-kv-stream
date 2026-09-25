@@ -27,6 +27,7 @@
 #include <climits>
 #include <cmath>
 #include <cstdarg>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <list>
@@ -40,7 +41,9 @@
 
 #ifndef __EMSCRIPTEN__
 #ifdef __linux__
+#include <fcntl.h>
 #include <linux/limits.h>
+#include <unistd.h>
 #elif defined(_WIN32)
 #   if !defined(PATH_MAX)
 #   define PATH_MAX MAX_PATH
@@ -1722,6 +1725,31 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_ram_mib = value;
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--cache-disk-dir"}, "PATH",
+        "directory for parked slot states spilled from the prompt cache when --cache-ram is full (default: disabled, Linux only)",
+        [](common_params & params, const std::string & value) {
+#ifdef __linux__
+            const int fd = open(value.c_str(), O_TMPFILE | O_RDWR | O_CLOEXEC, 0600);
+            if (fd < 0) {
+                throw std::invalid_argument("cannot create files in " + value + ": " + strerror(errno));
+            }
+            close(fd);
+            params.cache_disk_dir = value;
+#else
+            GGML_UNUSED(params);
+            GGML_UNUSED(value);
+            throw std::invalid_argument("--cache-disk-dir is only supported on Linux");
+#endif
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_DIR").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-disk"}, "N",
+        string_format("maximum disk space for spilled slot states in MiB (default: %d, -1 - no limit, 0 - disable)", params.cache_disk_mib),
+        [](common_params & params, int value) {
+            params.cache_disk_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},

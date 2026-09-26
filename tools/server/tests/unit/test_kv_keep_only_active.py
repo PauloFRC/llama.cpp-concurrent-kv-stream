@@ -216,3 +216,94 @@ def test_disk_needs_ram_limit(tmp_path):
     for k, id_slot in ((0, 0), (1, 1), (2, 0), (3, 1)):
         complete(token_prompt(k, 400), id_slot)
     assert "cache token limit" in log.drain()
+
+
+@linux_only
+def test_disk_direct_checkpoints(tmp_path):
+    global server
+    server = ServerPreset.tinygemma3()
+    server.no_mmproj = True
+    server.n_slots = 2
+    server.n_predict = 4
+    server.temperature = 0.0
+    server.kv_unified = True
+    server.cache_ram = 0
+    server.cache_disk_dir = str(tmp_path)
+    server.debug = True
+    fd, server.log_path = tempfile.mkstemp(suffix='.log')
+    os.close(fd)
+    server.start()
+    log = LogReader(server.log_path)
+
+    # gemma ids below 1000 are special tokens
+    prompt = token_prompt(0, 400, base=1000)
+    other = token_prompt(1, 400, base=1000)
+
+    complete(prompt, 0)
+    assert "created context checkpoint" in log.drain()
+
+    # launching slot 1 parks slot 0 with no RAM copy: main and ckpt blobs
+    complete(other, 1)
+    assert "__TEST_TAG_CACHE_DISK_DIRECT__" in log.drain()
+    assert spill_files(tmp_path) == 2
+
+    # diverge two tokens before the end: restore from disk, then the checkpoint at n-4; slot 1 parks direct
+    body = complete(prompt[:-2] + token_prompt(9, 30, base=1000))
+    content = log.drain()
+    assert "__TEST_TAG_CACHE_DISK_RESTORE__" in content
+    assert "restored context checkpoint" in content
+    assert body["timings"]["cache_n"] >= 390
+    assert spill_files(tmp_path) == 2
+    assert not os.listdir(tmp_path)
+
+
+@linux_only
+def test_disk_direct_full(tmp_path):
+    global server
+    server.n_ctx = 2048
+    server.cache_ram = 0
+    server.cache_disk_dir = str(tmp_path)
+    server.cache_disk = 1
+    server.start()
+    log = LogReader(server.log_path)
+
+    for k, id_slot in ((0, 0), (1, 1), (2, 0), (3, 1)):
+        complete(token_prompt(k, 700), id_slot)
+    content = log.drain()
+    assert "__TEST_TAG_CACHE_DISK_DIRECT__" in content
+    assert "disk tier is full" in content
+    assert "removing oldest entry" in content
+    assert "exceeds cache size limit" not in content
+    assert spill_files(tmp_path) == 2
+
+
+@linux_only
+def test_disk_pin_pending_load(tmp_path):
+    global server
+    server.n_ctx = 2048
+    server.cache_ram = 1
+    server.cache_disk_dir = str(tmp_path)
+    server.start()
+    log = LogReader(server.log_path)
+
+    prompts = [token_prompt(k, 700) for k in range(4)]
+    for p, id_slot in zip(prompts, (0, 1, 0, 1)):
+        complete(p, id_slot)
+    log.drain()
+
+    body = complete(prompts[1])
+    content = log.drain()
+    assert "__TEST_TAG_CACHE_DISK_SPILL__" in content
+    assert "__TEST_TAG_CACHE_DISK_RESTORE__" not in content
+    # only the last prompt token is evaluated again
+    assert body["timings"]["prompt_n"] == 1
+
+    complete(token_prompt(4, 1100), 1)
+    log.drain()
+    body = complete(prompts[3])
+    content = log.drain()
+    assert "__TEST_TAG_CACHE_DISK_DIRECT__" in content
+    assert "__TEST_TAG_CACHE_DISK_SPILL__" not in content
+    assert "__TEST_TAG_CACHE_DISK_RESTORE__" not in content
+    assert "removing oldest entry" not in content
+    assert body["timings"]["prompt_n"] == 1

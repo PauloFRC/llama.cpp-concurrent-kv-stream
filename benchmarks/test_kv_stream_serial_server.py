@@ -14,6 +14,7 @@ import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SERVER = ROOT / "build/bin/llama-server"
+UBATCH = 256
 
 
 def request(port: int, path: str, payload: dict | None, timeout: int = 1800) -> dict:
@@ -33,7 +34,7 @@ class Server:
             str(server),
             "-m", str(model), "--host", "127.0.0.1", "--port", str(port),
             "--ctx-size", str(ctx_size), "-fa", "on", "-ctk", "q8_0", "-ctv", "q4_0",
-            "-ngl", "all", "-b", "256", "-ub", "256", "-np", str(n_parallel),
+            "-ngl", "all", "-b", "256", "-ub", str(UBATCH), "-np", str(n_parallel),
             "--no-mmproj", "--no-warmup", "--reasoning-format", "none",
             "--kv-stream-stage-mib", str(stage_mib), "--cache-ram", str(cache_mib),
             *extra,
@@ -134,6 +135,8 @@ TRACE_LINE = re.compile(rb"kv_stream_adapt: active (\d+), resident \d+, ring \d+
 CACHE_EVICT = re.compile(rb"removing oldest entry|exceeds cache size limit")
 DISK_SPILL = re.compile(rb"spilled entry with (\d+) tokens to disk \(([0-9.]+) MiB in ([0-9.]+) ms\)")
 DISK_RESTORE = re.compile(rb"restored entry with (\d+) tokens from disk \(([0-9.]+) MiB in ([0-9.]+) ms\)")
+DISK_DIRECT = re.compile(rb"saved entry with (\d+) tokens to disk \(([0-9.]+) MiB in ([0-9.]+) ms\)")
+DISK_FILES = re.compile(rb"disk files: (\d+)")
 STATE_SIZE = re.compile(rb"saving prompt with length (\d+), total state size = ([0-9.]+) MiB")
 
 
@@ -180,7 +183,7 @@ def run_parked_slots(binary: Path, model: Path, port: int, output: Path, args):
     parked_n, active_n = args.fill
     # unified cache holds the parked sequence, both active ones and their decode tokens
     ctx_size = max(12288, (parked_n + 2 * active_n + 1024 + 255) // 256 * 256)
-    cache_ram = args.cache_ram or max(2048, (parked_n + 2 * active_n) * 64 // 1024 + 2048)
+    cache_ram = args.cache_ram if args.cache_ram is not None else max(2048, (parked_n + 2 * active_n) * 64 // 1024 + 2048)
     env = {"LLAMA_KV_STREAM_TRACE": "1"}
     if args.debug_cells:
         env["LLAMA_KV_CACHE_DEBUG"] = "3"
@@ -200,20 +203,36 @@ def run_parked_slots(binary: Path, model: Path, port: int, output: Path, args):
         parked = patterned(parked_n, (23066, 1200, 2200, 3200))
         active_a = patterned(active_n, (23066, 4200, 5200, 6200))
         active_b = patterned(active_n, (23066, 7200, 8200, 9200))
+        diverged = parked[:-UBATCH // 2] + patterned(UBATCH // 2, (23066, 1300, 2300, 3300))
 
         mark("prefill-parked")
         expected = completion(server, parked, True)
+        if args.checkpoint_hit:
+            mark("hit-baseline")
+            expected_hit = completion(server, diverged, True)
+            mark("prefill-parked-again")
+            again = completion(server, parked, True)
+            if again["content"] != expected["content"]:
+                raise RuntimeError("re-sending the parent after a checkpoint hit changed its output")
         mark("active-concurrent")
         with ThreadPoolExecutor(max_workers=2) as pool:
             fut_a = pool.submit(completion, server, active_a, True, 64)
             fut_b = pool.submit(completion, server, active_b, True, 256)
             result_a = fut_a.result()
+            if args.cache_disk_dir and cache_ram > 0:
+                # parking A spills the parent here
+                mark("spill-parked")
+                completion(server, patterned(512, (23066, 1400, 2400, 3400)), True, 4)
             mark("restore-parked")
             restored = completion(server, parked, True)
             mark("active-tail")
             result_b = fut_b.result()
         mark("restore-active")
         restored_a = completion(server, active_a, True, 64)
+        if args.checkpoint_hit:
+            # the parent came back from disk
+            mark("hit-after-disk")
+            hit_after = completion(server, diverged, True)
         mark("end")
         open_spills = spill_files(server.process.pid, args.cache_disk_dir) if args.cache_disk_dir else 0
 
@@ -238,22 +257,40 @@ def run_parked_slots(binary: Path, model: Path, port: int, output: Path, args):
         for (name, start, t_start, rss_start), (_, end, t_end, rss_end) in zip(marks, marks[1:]):
             span = log[start:end]
             windows[name] = {
+                "span": [start, end],
                 "seconds": t_end - t_start,
                 "rss_mib": [rss_start, rss_end],
                 "spills": [[int(n), float(mib), float(ms)] for n, mib, ms in DISK_SPILL.findall(span)],
                 "disk_restores": [[int(n), float(mib), float(ms)] for n, mib, ms in DISK_RESTORE.findall(span)],
+                "direct_saves": [[int(n), float(mib), float(ms)] for n, mib, ms in DISK_DIRECT.findall(span)],
                 "restores": [[int(cells), int(runs)] for cells, runs in RESTORE_RUNS.findall(span)],
                 **summarize_trace(span),
             }
         if args.cache_disk_dir:
-            if not windows["restore-parked"]["spills"] or not windows["restore-parked"]["disk_restores"]:
-                raise RuntimeError("parent was not spilled to and restored from disk, lower --cache-ram")
-            # the last cache-state trace lists the entries still on disk
-            on_disk = log[log.rfind(b"cache state:"):].count(b"(disk)")
+            if not any(n >= parked_n for n, _, _ in windows["restore-parked"]["disk_restores"]):
+                raise RuntimeError("parent was not restored from disk")
+            if any(n >= parked_n for n, _, _ in windows["restore-parked"]["spills"]):
+                raise RuntimeError("parent was spilled by its own restore")
+            if cache_ram > 0 and not any(n >= parked_n for n, _, _ in windows["spill-parked"]["spills"]):
+                raise RuntimeError("parent did not spill in spill-parked, lower --cache-ram")
+            if cache_ram == 0 and not any(n >= parked_n for n, _, _ in windows["active-concurrent"]["direct_saves"]):
+                raise RuntimeError("parent was not saved direct to disk in active-concurrent")
+            # the last cache-state trace lists every blob still open
+            on_disk = sum(int(n) for n in DISK_FILES.findall(log[log.rfind(b"cache state:"):]))
             if open_spills != on_disk:
-                raise RuntimeError(f"{open_spills} spill files open for {on_disk} entries on disk")
+                raise RuntimeError(f"{open_spills} spill files open for {on_disk} blobs on disk")
             if any(Path(args.cache_disk_dir).iterdir()):
                 raise RuntimeError("named files left in --cache-disk-dir")
+        if args.checkpoint_hit:
+            if hit_after["content"] != expected_hit["content"]:
+                raise RuntimeError("checkpoint hit after the disk round trip changed output: "
+                                   f"{json.dumps([expected_hit['content'], hit_after['content']])}")
+            if args.cache_disk_dir and not windows["hit-after-disk"]["disk_restores"]:
+                raise RuntimeError("the checkpoint hit did not restore the parent from disk")
+            for name in ("hit-baseline", "hit-after-disk"):
+                start, end = windows[name]["span"]
+                if b"restored context checkpoint" not in log[start:end]:
+                    raise RuntimeError(f"{name} did not restore a checkpoint")
         if not windows["restore-parked"]["restores"] or not windows["restore-active"]["restores"]:
             raise RuntimeError("no state_read_data restore found in a restore window")
         cells, runs = windows["restore-parked"]["restores"][-1]
@@ -280,10 +317,12 @@ def run_parked_slots(binary: Path, model: Path, port: int, output: Path, args):
         }
         (output / "parked-slots-summary.json").write_text(json.dumps(summary, indent=2))
         disk_info = ""
-        if windows["restore-parked"]["spills"] and windows["restore-parked"]["disk_restores"]:
-            spill_ms = windows["restore-parked"]["spills"][-1][2]
-            restore_ms = windows["restore-parked"]["disk_restores"][-1][2]
-            disk_info = f", spill {spill_ms:.1f} ms, disk restore {restore_ms:.1f} ms"
+        if "spill-parked" in windows and windows["spill-parked"]["spills"]:
+            disk_info += f", spill {windows['spill-parked']['spills'][-1][2]:.1f} ms"
+        if windows["restore-parked"]["disk_restores"]:
+            disk_info += f", disk restore {windows['restore-parked']['disk_restores'][-1][2]:.1f} ms"
+        if windows["active-concurrent"]["direct_saves"]:
+            disk_info += f", direct save {windows['active-concurrent']['direct_saves'][-1][2]:.1f} ms"
 
         print(f"parked-slot restore test: PASS (cache_n={cache_n}, slot {expected['id_slot']} -> "
               f"{restored['id_slot']}, {cells} cells in {runs} runs, "
@@ -309,7 +348,9 @@ def main():
     shape.add_argument("--debug-cells", action="store_true",
                        help="LLAMA_KV_CACHE_DEBUG=3 and the mixed-page check; slow, off for timing runs")
     shape.add_argument("--cache-disk-dir", type=Path,
-                       help="spill parked states here; set --cache-ram between one and two parked states so the parent spills")
+                       help="spill parked states here; set --cache-ram between one and two parked states so the parent spills, or 0 for direct-to-disk only")
+    shape.add_argument("--checkpoint-hit", action="store_true",
+                       help="also resume the parent with a prompt that diverges ub/2 tokens before its end (hits a context checkpoint)")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     if args.only in (None, "serial"):

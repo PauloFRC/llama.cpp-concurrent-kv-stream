@@ -612,17 +612,29 @@ struct server_prompt_disk_blob {
 
     bool open(const std::string & dir);
 
-\    bool write(const std::vector<uint8_t> & data);
+    bool write(const std::vector<uint8_t> & data);
 
     bool sync();
+
+    // save straight from the slot
+    bool save(llama_context * ctx, llama_seq_id seq_id);
+
+    // (u64 size, bytes) x 3 per checkpoint
+    bool write_checkpoints(const std::list<common_prompt_checkpoint> & ckpts);
+    bool read_checkpoints(std::list<common_prompt_checkpoint> & ckpts);
 };
 
 struct server_prompt_disk {
     server_prompt_disk_blob main;
     server_prompt_disk_blob drft;
+    server_prompt_disk_blob ckpt;
 
     size_t size() const {
-        return main.size + drft.size;
+        return main.size + drft.size + ckpt.size;
+    }
+
+    size_t n_files() const {
+        return main.valid() + drft.valid() + ckpt.valid();
     }
 };
 
@@ -656,6 +668,7 @@ struct server_prompt_cache {
         this->limit_tokens = limit_tokens;
         this->disk_dir     = limit_size_mib < 0 || limit_disk_mib == 0 ? "" : disk_dir;
         this->limit_disk   = has_disk() ? 1024ull*1024ull*(limit_disk_mib < 0 ? 0 : limit_disk_mib) : 0;
+        this->ram_enabled  = limit_size_mib != 0;
     }
 
     std::list<server_prompt_cache_state> states;
@@ -666,6 +679,9 @@ struct server_prompt_cache {
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
 
+    // false with --cache-ram 0, every park goes direct to disk
+    bool ram_enabled = true;
+
     // spill target, empty = no disk tier
     std::string disk_dir;
 
@@ -674,6 +690,9 @@ struct server_prompt_cache {
 
     // the disk-full error was logged, the next spill resets it
     bool disk_full = false;
+
+    // entry the next load() consumes, never spilled or dropped
+    const server_prompt_cache_state * pinned = nullptr;
 
     size_t size() const;
     size_t size_resident() const;
@@ -688,18 +707,28 @@ struct server_prompt_cache {
     // free space in disk_dir, capped by what limit_disk leaves
     size_t disk_room() const;
 
+    bool disk_fits(size_t n_bytes) const { return has_disk() && n_bytes <= disk_room(); }
+
+    // disk_room() with every unpinned disk entry dropped
+    size_t disk_capacity() const;
+
+    bool goes_direct(size_t n_bytes) const;
+
     bool can_fit(size_t n_bytes, size_t n_tokens) const;
 
     // spill or drop oldest entries until n_bytes more fit in RAM
     void make_room(size_t n_bytes);
 
+    // false when no entry is left to drop
+    bool drop_oldest(const char * reason, bool disk_only = false);
+
     bool spill(server_prompt_cache_state & state);
 
     std::list<server_prompt_cache_state>::iterator find(const server_prompt & prompt, const server_tokens & tokens_new);
 
-    bool has_match(const server_prompt & prompt, const server_tokens & tokens_new);
-
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+
+    server_prompt_cache_state * alloc_direct(const server_prompt & prompt, size_t state_size, size_t state_size_dft);
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 

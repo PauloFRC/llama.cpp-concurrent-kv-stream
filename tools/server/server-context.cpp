@@ -323,9 +323,27 @@ struct server_slot {
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
+        const int64_t t_start = ggml_time_us();
+
         auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
         if (cur == nullptr) {
             return false;
+        }
+
+        if (cur->on_disk()) {
+            if (!cur->disk.main.save(ctx_tgt, id) ||
+                (cur->disk.drft.valid() && !cur->disk.drft.save(ctx_dft, id)) ||
+                (cur->disk.ckpt.valid() && !cur->disk.ckpt.write_checkpoints(prompt.checkpoints))) {
+                // alloc pushed the entry last
+                prompt_cache.states.pop_back();
+                return false;
+            }
+
+            SRV_INF(" - saved entry with %d tokens to disk (%.3f MiB in %.2f ms)\n",
+                    prompt.n_tokens(), cur->disk.size() / (1024.0 * 1024.0), (ggml_time_us() - t_start) / 1000.0);
+            SLT_DBG(*this, "%s", "__TEST_TAG_CACHE_DISK_DIRECT__\n");
+
+            return true;
         }
 
         llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
@@ -1362,13 +1380,17 @@ private:
             batch.init(std::max(n_batch, params_base.n_parallel), n_embd);
         }
 
-        if (params_base.cache_ram_mib != 0) {
+        const bool cache_disk = !params_base.cache_disk_dir.empty() && params_base.cache_disk_mib != 0;
+
+        if (params_base.cache_ram_mib != 0 || cache_disk) {
             if (params_base.cache_ram_mib < 0) {
                 SRV_TRC("prompt cache is enabled, size limit: %s\n", "no limit");
+            } else if (params_base.cache_ram_mib == 0) {
+                SRV_TRC("%s", "prompt cache is enabled, RAM tier disabled\n");
             } else {
                 SRV_TRC("prompt cache is enabled, size limit: %d MiB\n", params_base.cache_ram_mib);
             }
-            SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
+            SRV_TRC("%s", "use `--cache-ram 0` without `--cache-disk-dir` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx, params_base.cache_disk_dir, params_base.cache_disk_mib);
 
@@ -1442,8 +1464,8 @@ private:
         metrics.init();
 
         if (params_base.cache_idle_slots) {
-            if (params_base.cache_ram_mib == 0) {
-                SRV_WRN("%s", "--cache-idle-slots requires --cache-ram, disabling\n");
+            if (!prompt_cache) {
+                SRV_WRN("%s", "--cache-idle-slots requires --cache-ram or --cache-disk-dir, disabling\n");
                 params_base.cache_idle_slots = false;
             } else {
                 if (params_base.kv_unified) {
@@ -1668,8 +1690,13 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
-                // saving this slot must not evict the prompt we are about to load
-                if (!prompt_cache->has_match(ret->prompt, task.tokens) || prompt_cache->can_fit(ret->prompt_state_size(), ret->prompt.n_tokens())) {
+                // saving this slot and parking idle ones must neither spill nor drop the prompt we are about to load
+                const auto it_match = prompt_cache->find(ret->prompt, task.tokens);
+                const bool has_match = it_match != prompt_cache->states.end();
+
+                prompt_cache->pinned = has_match ? &*it_match : nullptr;
+
+                if (!has_match || prompt_cache->can_fit(ret->prompt_state_size(), ret->prompt.n_tokens())) {
                     ret->prompt_save(*prompt_cache);
                 }
 

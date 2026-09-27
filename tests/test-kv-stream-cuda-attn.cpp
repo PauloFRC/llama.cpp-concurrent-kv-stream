@@ -258,7 +258,7 @@ size_t query_page_bytes(ggml_backend_t backend, ggml_type type_k, ggml_type type
 
 using feedback_fn_t = bool (*)(
     void *, uint64_t *, uint64_t *, double *, uint32_t *, uint32_t *, uint32_t *, uint32_t *,
-    uint64_t *, uint64_t *, uint64_t *, uint64_t *, uint64_t *, uint64_t *, uint64_t *);
+    uint64_t *, uint64_t *, uint64_t *, uint64_t *, uint64_t *, uint64_t *);
 
 feedback_fn_t query_feedback_fn(ggml_backend_t backend) {
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
@@ -352,8 +352,7 @@ bool stats_equal_except_timing(const ggml_backend_cuda_kv_stream_stats & a, cons
            a.cpu_jobs == b.cpu_jobs &&
            a.cpu_decline_prefill == b.cpu_decline_prefill &&
            a.cpu_decline_no_eligible_pages == b.cpu_decline_no_eligible_pages &&
-           a.cpu_decline_below_min_pages == b.cpu_decline_below_min_pages &&
-           a.cpu_decline_all_mutable == b.cpu_decline_all_mutable;
+           a.cpu_decline_below_min_pages == b.cpu_decline_below_min_pages;
 }
 
 struct alignas(64) cpu_attn_line { uint8_t bytes[64]; };
@@ -541,8 +540,7 @@ std::vector<float> run_attention(
         bool change_indices = false,
         bool replace_cache = false,
         uint64_t graph_uid = 0,
-        const int64_t * custom_rows = nullptr,
-        const std::vector<int64_t> * mark_rows = nullptr) {
+        const int64_t * custom_rows = nullptr) {
     constexpr size_t N_TENSORS = 32;
     const size_t context_bytes = ggml_tensor_overhead()*N_TENSORS + ggml_graph_overhead_custom(N_TENSORS, false);
 
@@ -658,8 +656,8 @@ std::vector<float> run_attention(
                 update_index, dirty_rows.data(), 0, dirty_rows.size()*sizeof(int64_t));
         }
         if (dirty_runtime != nullptr) {
-            const std::vector<int64_t> & marked = mark_rows != nullptr ? *mark_rows : dirty_rows;
-            GGML_ASSERT(ggml_backend_cuda_kv_stream_mark_dirty_rows(dirty_runtime, marked.data(), marked.size()));
+            GGML_ASSERT(ggml_backend_cuda_kv_stream_mark_dirty_rows(
+                dirty_runtime, dirty_rows.data(), dirty_rows.size()));
         }
         if (repeat > 0 && change_updates) {
             for (float & value : k_update_data) { value = -2.0f*value; }
@@ -903,7 +901,7 @@ int main() {
         live[5] = 0;
         t.assert_true("an oversized request clamps to non-resident, live, immutable pages",
             ggml_cuda_kv_stream_select_cpu_pages(page_state(10, 3, live, pages{7}, false), 100) == pages{3, 4, 6, 8});
-        t.assert_true("a restore step gets no CPU pages",
+        t.assert_true("an all-mutable step gets no CPU pages",
             ggml_cuda_kv_stream_select_cpu_pages(page_state(10, 3, all_live, no_mutable, true), 5).empty());
         t.assert_true("an interior mutable page is passed over",
             ggml_cuda_kv_stream_select_cpu_pages(page_state(10, 2, all_live, pages{7}, false), 2) == pages{6, 8});
@@ -2259,7 +2257,7 @@ int main() {
             feedback_fn != nullptr && feedback_fn(
                 runtime, &deadline_samples, &deadline_misses, &copy_busy_ratio,
                 &peak_occupancy, &ring_slots, &resident_pages, &controlled_pages,
-                &skipped_pages, &resident_pages_attended, &cpu_pages, nullptr, nullptr, nullptr, nullptr));
+                &skipped_pages, &resident_pages_attended, &cpu_pages, nullptr, nullptr, nullptr));
         ggml_backend_cuda_kv_stream_runtime_free(runtime);
 
         t.assert_equal(uint64_t(2*page_bytes), stats.host_to_device_bytes);
@@ -2944,7 +2942,6 @@ int main() {
         t.assert_equal(uint64_t(1), stats.cpu_decline_below_min_pages);
         t.assert_equal(uint64_t(0), stats.cpu_decline_prefill);
         t.assert_equal(uint64_t(0), stats.cpu_decline_no_eligible_pages);
-        t.assert_equal(uint64_t(0), stats.cpu_decline_all_mutable);
         t.assert_equal(uint64_t(40), stats.streamed_pages);
         t.assert_equal(size_t(0), lines.size());
         t.assert_true("the pages go back to the gpu", actual.size() == expected.size() &&
@@ -2982,21 +2979,16 @@ int main() {
             const char * name;
             int64_t n_batch;
             int64_t only_live_page;  // -1: every page live
-            bool all_mutable;
             const char * share;
             uint64_t stats_t::* decline;
         };
         const test_case cases[] = {
-            { "prefill-shaped",    33, -1, false, "0.5", &stats_t::cpu_decline_prefill },
-            { "no eligible page",   1, 40, false, "1",   &stats_t::cpu_decline_no_eligible_pages },
-            { "all pages mutable",  1, -1, true,  "0.5", &stats_t::cpu_decline_all_mutable },
+            { "prefill-shaped",   33, -1, "0.5", &stats_t::cpu_decline_prefill },
+            { "no eligible page",  1, 40, "1",   &stats_t::cpu_decline_no_eligible_pages },
         };
         const auto total_declines = [](const stats_t & s) {
-            return s.cpu_decline_prefill + s.cpu_decline_no_eligible_pages +
-                s.cpu_decline_below_min_pages + s.cpu_decline_all_mutable;
+            return s.cpu_decline_prefill + s.cpu_decline_no_eligible_pages + s.cpu_decline_below_min_pages;
         };
-        // a negative row marks every page mutable for the batch
-        const std::vector<int64_t> all_pages = {-1};
         for (const auto & tc : cases) {
             const std::string name = tc.name;
             const attention_inputs inputs = make_inputs(n_kv, tc.n_batch, n_kv);
@@ -3018,9 +3010,7 @@ int main() {
                 scoped_env env{{"GGML_CUDA_KV_STREAM_CPU_SHARE", tc.share}};
                 run_attention(
                     backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime.get()),
-                    n_kv, tc.n_batch, 1, 1, false, GGML_TYPE_I32, true,
-                    tc.all_mutable ? runtime.get() : nullptr, false, false, 0, nullptr,
-                    tc.all_mutable ? &all_pages : nullptr);
+                    n_kv, tc.n_batch);
                 lines = log.snapshot();
             }
             const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime.get());
@@ -3035,7 +3025,7 @@ int main() {
             t.assert_true(name + ": feedback is readable", feedback_fn(
                 runtime.get(), &samples, &misses, &copy_busy, &peak, &slots, &resident, &controlled,
                 nullptr, nullptr, nullptr, &fed.cpu_decline_prefill, &fed.cpu_decline_no_eligible_pages,
-                &fed.cpu_decline_below_min_pages, &fed.cpu_decline_all_mutable));
+                &fed.cpu_decline_below_min_pages));
 
             t.assert_equal(name + ": cpu pages", uint64_t(0), stats.cpu_pages);
             t.assert_equal(name + ": cpu jobs", uint64_t(0), stats.cpu_jobs);
@@ -3267,7 +3257,7 @@ int main() {
             t.assert_equal(name + ": cpu jobs", uint64_t(0), stats.cpu_jobs);
             t.assert_equal(name + ": declines",
                 uint64_t(0), stats.cpu_decline_prefill + stats.cpu_decline_no_eligible_pages +
-                stats.cpu_decline_below_min_pages + stats.cpu_decline_all_mutable);
+                stats.cpu_decline_below_min_pages);
             t.assert_true(name + ": every counter matches the split-off run",
                 stats_equal_except_timing(stats, base));
             t.assert_true(name + ": the output is bit-identical to the split-off run",
@@ -3431,9 +3421,14 @@ int main() {
         }
         t.assert_true("cpu split scratch allocates",
             ggml_backend_cuda_kv_stream_set_cpu_split(split_runtime, 2, N_Q_HEAD, 4));
-        const std::vector<float> split_actual = run_attention_layers(
-            backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(split_runtime),
-            n_kv, n_batch, 1, 2, GGML_TYPE_I64, split_runtime, 0, nullptr, /* graph_per_layer = */ true);
+        std::vector<float> split_actual;
+        {
+            // a share, so a prefill that reaches the planner takes pages
+            scoped_env env{{"GGML_CUDA_KV_STREAM_CPU_SHARE", "0.5"}};
+            split_actual = run_attention_layers(
+                backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(split_runtime),
+                n_kv, n_batch, 1, 2, GGML_TYPE_I64, split_runtime, 0, nullptr, /* graph_per_layer = */ true);
+        }
         const auto split_stats = ggml_backend_cuda_kv_stream_get_stats(split_runtime);
         ggml_backend_cuda_kv_stream_runtime_free(split_runtime);
 
@@ -3471,10 +3466,14 @@ int main() {
         }
         t.assert_true("cpu split scratch allocates",
             ggml_backend_cuda_kv_stream_set_cpu_split(streamed_runtime, 2, N_Q_HEAD, 8));
-        const std::vector<float> streamed_split = run_attention_layers(
-            backend.get(), streamed_inputs, ggml_backend_cuda_kv_stream_buffer_type(streamed_runtime),
-            streamed_kv, n_batch, 1, 2, GGML_TYPE_I64, streamed_runtime, 0, nullptr,
-            /* graph_per_layer = */ true);
+        std::vector<float> streamed_split;
+        {
+            scoped_env env{{"GGML_CUDA_KV_STREAM_CPU_SHARE", "0.5"}};
+            streamed_split = run_attention_layers(
+                backend.get(), streamed_inputs, ggml_backend_cuda_kv_stream_buffer_type(streamed_runtime),
+                streamed_kv, n_batch, 1, 2, GGML_TYPE_I64, streamed_runtime, 0, nullptr,
+                /* graph_per_layer = */ true);
+        }
         const auto streamed_stats = ggml_backend_cuda_kv_stream_get_stats(streamed_runtime);
         ggml_backend_cuda_kv_stream_runtime_free(streamed_runtime);
 
@@ -3630,7 +3629,7 @@ int main() {
         t.assert_true("dynamic feedback is readable", feedback_fn(
             runtime, &deadline_samples, &deadline_misses, &copy_busy_ratio,
             &peak_occupancy, &ring_slots, &resident_pages, &controlled_pages,
-            &skipped_pages, &resident_pages_attended, &cpu_pages, nullptr, nullptr, nullptr, nullptr));
+            &skipped_pages, &resident_pages_attended, &cpu_pages, nullptr, nullptr, nullptr));
         t.assert_equal(stats.skipped_pages, skipped_pages);
         t.assert_equal(stats.resident_pages_attended, resident_pages_attended);
         t.assert_equal(stats.cpu_pages, cpu_pages);

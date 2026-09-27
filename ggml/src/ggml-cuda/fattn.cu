@@ -485,7 +485,6 @@ struct ggml_cuda_kv_stream_transfer_ring {
     uint64_t cpu_decline_prefill = 0;
     uint64_t cpu_decline_no_eligible_pages = 0;
     uint64_t cpu_decline_below_min_pages = 0;
-    uint64_t cpu_decline_all_mutable = 0;
     uint32_t current_occupancy = 0;
     uint32_t ring_peak_occupancy = 0;
     uint32_t current_ring_peak_occupancy = 0;
@@ -748,7 +747,6 @@ ggml_cuda_kv_stream_transfer_stats ggml_cuda_kv_stream_transfer_ring_get_stats(
         ring->cpu_decline_prefill,
         ring->cpu_decline_no_eligible_pages,
         ring->cpu_decline_below_min_pages,
-        ring->cpu_decline_all_mutable,
     };
 }
 
@@ -2101,11 +2099,7 @@ bool ggml_cuda_kv_stream_graph_add_attention(
         cpu_pages.clear();
         ++ring->cpu_decline_below_min_pages;
     } else if (cpu_pages.empty() && n_cpu != 0) {
-        if (page_state.all_pages_mutable) {
-            ++ring->cpu_decline_all_mutable;
-        } else {
-            ++ring->cpu_decline_no_eligible_pages;
-        }
+        ++ring->cpu_decline_no_eligible_pages;
     }
 
     for (int chunk = 0; chunk < nchunks; ++chunk) {

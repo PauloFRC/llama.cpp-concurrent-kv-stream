@@ -210,7 +210,6 @@ struct llama_kv_stream_feedback_counters {
     uint64_t cpu_decline_prefill           = 0;
     uint64_t cpu_decline_no_eligible_pages = 0;
     uint64_t cpu_decline_below_min_pages   = 0;
-    uint64_t cpu_decline_all_mutable       = 0;
 };
 
 struct llama_kv_stream_feedback_delta {
@@ -226,7 +225,6 @@ struct llama_kv_stream_feedback_delta {
     uint64_t cpu_decline_prefill           = 0;
     uint64_t cpu_decline_no_eligible_pages = 0;
     uint64_t cpu_decline_below_min_pages   = 0;
-    uint64_t cpu_decline_all_mutable       = 0;
 };
 
 llama_kv_stream_feedback_delta llama_kv_stream_feedback_delta_make(

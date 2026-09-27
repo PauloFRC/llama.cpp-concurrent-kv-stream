@@ -1424,7 +1424,7 @@ bool llama_kv_cache::kv_stream_adapt(uint32_t active_tokens, uint32_t query_toke
             &peak_occupancy, &ring_slots, &resident_pages, &controlled_pages,
             &counters.skipped_pages, &counters.resident_pages_attended, &counters.cpu_pages,
             &counters.cpu_decline_prefill, &counters.cpu_decline_no_eligible_pages,
-            &counters.cpu_decline_below_min_pages, &counters.cpu_decline_all_mutable)) {
+            &counters.cpu_decline_below_min_pages)) {
         return false;
     }
 
@@ -1441,7 +1441,7 @@ bool llama_kv_cache::kv_stream_adapt(uint32_t active_tokens, uint32_t query_toke
         decode_layout_pages != 0 && decode_layout_pages != owner.decode_layout_pages;
 
     if (getenv("LLAMA_KV_STREAM_TRACE") != nullptr) {
-        LLAMA_LOG_WARN("%s: active %u, resident %u, ring %u, layout %u, samples %llu, misses %llu, copy busy %.1f%%, peak %u, skipped %llu, resident attended %llu, cpu pages %llu, cpu declines prefill/no eligible/below min/all mutable %llu/%llu/%llu/%llu\n",
+        LLAMA_LOG_WARN("%s: active %u, resident %u, ring %u, layout %u, samples %llu, misses %llu, copy busy %.1f%%, peak %u, skipped %llu, resident attended %llu, cpu pages %llu, cpu declines prefill/no eligible/below min %llu/%llu/%llu\n",
             __func__, active_tokens, resident_pages, ring_slots, decode_layout_pages,
             (unsigned long long) delta.deadline_samples,
             (unsigned long long) delta.deadline_misses,
@@ -1451,8 +1451,7 @@ bool llama_kv_cache::kv_stream_adapt(uint32_t active_tokens, uint32_t query_toke
             (unsigned long long) delta.cpu_pages,
             (unsigned long long) delta.cpu_decline_prefill,
             (unsigned long long) delta.cpu_decline_no_eligible_pages,
-            (unsigned long long) delta.cpu_decline_below_min_pages,
-            (unsigned long long) delta.cpu_decline_all_mutable);
+            (unsigned long long) delta.cpu_decline_below_min_pages);
     }
 
     if (ring_slots != 0 && owner.minimum_ring_slots == 0) {

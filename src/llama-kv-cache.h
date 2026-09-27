@@ -305,7 +305,7 @@ private:
         using feedback_fn_t = bool (*)(
             void *, uint64_t *, uint64_t *, double *, uint32_t *,
             uint32_t *, uint32_t *, uint32_t *, uint64_t *, uint64_t *, uint64_t *,
-            uint64_t *, uint64_t *, uint64_t *, uint64_t *);
+            uint64_t *, uint64_t *, uint64_t *);
         using span_feedback_fn_t = bool (*)(void *, double);
         using reconfigure_fn_t = bool (*)(void *, uint32_t, uint32_t);
         using repartition_fn_t = bool (*)(void *, uint32_t);

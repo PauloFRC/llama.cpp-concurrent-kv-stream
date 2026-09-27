@@ -1382,6 +1382,10 @@ private:
 
         const bool cache_disk = !params_base.cache_disk_dir.empty() && params_base.cache_disk_mib != 0;
 
+        if (params_base.cache_disk_mib > 0 && params_base.cache_disk_dir.empty()) {
+            SRV_WRN("%s", "--cache-disk needs --cache-disk-dir, ignoring it\n");
+        }
+
         if (params_base.cache_ram_mib != 0 || cache_disk) {
             if (params_base.cache_ram_mib < 0) {
                 SRV_TRC("prompt cache is enabled, size limit: %s\n", "no limit");

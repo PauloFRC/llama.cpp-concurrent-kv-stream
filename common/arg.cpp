@@ -1719,7 +1719,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
-        string_format("set the maximum cache size in MiB (default: %d, -1 - no limit, 0 - disable, or no RAM tier when --cache-disk-dir is set)"
+        string_format("set the maximum cache size in MiB (default: %d, -1 - no limit, 0 - disable)"
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),
         [](common_params & params, int value) {
             params.cache_ram_mib = value;
@@ -1727,7 +1727,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
         {"--cache-disk-dir"}, "PATH",
-        "directory for prompt cache states that do not fit in --cache-ram (default: disabled, Linux only)",
+        "directory for prompt cache states that do not fit in --cache-ram, with --cache-ram 0 every state goes here (default: disabled, Linux only)",
         [](common_params & params, const std::string & value) {
 #ifdef __linux__
             const int fd = open(value.c_str(), O_TMPFILE | O_RDWR | O_CLOEXEC, 0600);
@@ -1745,7 +1745,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_CACHE_DISK_DIR").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--cache-disk"}, "N",
-        string_format("maximum disk space for spilled slot states in MiB (default: %d, -1 - no limit, 0 - disable)", params.cache_disk_mib),
+        string_format("maximum disk space for prompt cache states in MiB (default: %d, -1 - no limit, 0 - disable)", params.cache_disk_mib),
         [](common_params & params, int value) {
             params.cache_disk_mib = value;
         }

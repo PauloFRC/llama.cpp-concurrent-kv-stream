@@ -220,7 +220,6 @@ def run_parked_slots(binary: Path, model: Path, port: int, output: Path, args):
             fut_b = pool.submit(completion, server, active_b, True, 256)
             result_a = fut_a.result()
             if args.cache_disk_dir and cache_ram > 0:
-                # parking A spills the parent here
                 mark("spill-parked")
                 completion(server, patterned(512, (23066, 1400, 2400, 3400)), True, 4)
             mark("restore-parked")
@@ -230,7 +229,6 @@ def run_parked_slots(binary: Path, model: Path, port: int, output: Path, args):
         mark("restore-active")
         restored_a = completion(server, active_a, True, 64)
         if args.checkpoint_hit:
-            # the parent came back from disk
             mark("hit-after-disk")
             hit_after = completion(server, diverged, True)
         mark("end")

@@ -278,6 +278,32 @@ def test_disk_direct_full(tmp_path):
 
 
 @linux_only
+@pytest.mark.parametrize("cache_ram", [0, 1])
+def test_disk_entry_limit(tmp_path, cache_ram):
+    import resource
+    global server
+    server.cache_ram = cache_ram
+    server.cache_disk_dir = str(tmp_path)
+
+    # the server inherits 192 fds, room for 32 disk entries
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (192, hard))
+    try:
+        server.start()
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+    log = LogReader(server.log_path)
+
+    # 59 parks, direct or spilled once 1 MiB of RAM is full
+    for k in range(60):
+        complete(token_prompt(k, 100), k % 2)
+    content = log.drain()
+    assert "disk tier is full" in content
+    assert "removing oldest entry" in content
+    assert spill_files(tmp_path) == 32
+
+
+@linux_only
 def test_disk_pin_pending_load(tmp_path):
     global server
     server.n_ctx = 2048

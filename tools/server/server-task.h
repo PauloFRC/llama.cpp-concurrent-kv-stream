@@ -697,6 +697,7 @@ struct server_prompt_cache {
     size_t size() const;
     size_t size_resident() const;
     size_t size_disk() const;
+    size_t n_disk() const;
 
     size_t n_tokens() const;
 
@@ -707,13 +708,17 @@ struct server_prompt_cache {
     // free space in disk_dir, capped by what limit_disk leaves
     size_t disk_room() const;
 
-    bool disk_fits(size_t n_bytes) const { return has_disk() && n_bytes <= disk_room(); }
+    // up to 3 fds per entry
+    size_t limit_disk_entries() const;
+
+    bool disk_fits(size_t n_bytes) const { return has_disk() && n_bytes <= disk_room() && n_disk() < limit_disk_entries(); }
 
     // disk_room() with every unpinned disk entry dropped
     size_t disk_capacity() const;
 
     bool goes_direct(size_t n_bytes) const;
 
+    // true when the state fits without dropping an entry
     bool can_fit(size_t n_bytes, size_t n_tokens) const;
 
     // spill or drop oldest entries until n_bytes more fit in RAM
@@ -722,13 +727,15 @@ struct server_prompt_cache {
     // false when no entry is left to drop
     bool drop_oldest(const char * reason, bool disk_only = false);
 
+    bool can_spill(const server_prompt_cache_state & state) const { return &state != pinned && !state.on_disk(); }
+
     bool spill(server_prompt_cache_state & state);
 
     std::list<server_prompt_cache_state>::iterator find(const server_prompt & prompt, const server_tokens & tokens_new);
 
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
-    server_prompt_cache_state * alloc_direct(const server_prompt & prompt, size_t state_size, size_t state_size_dft);
+    server_prompt_cache_state * alloc_direct(const server_prompt & prompt, size_t state_size, bool has_dft);
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 

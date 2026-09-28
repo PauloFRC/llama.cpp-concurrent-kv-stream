@@ -33,7 +33,9 @@ UVM_ENV_NAMES = (
 KV_STREAM_TRACE_RE = re.compile(
     r"kv_stream_adapt: active (\d+), resident (\d+), ring (\d+), "
     r"(?:layout \d+, )?"
-    r"samples (\d+), misses (\d+), copy busy ([0-9.]+)%, peak (\d+)"
+    r"samples (\d+), misses (\d+), copy busy ([0-9.]+)%, peak (\d+), "
+    r"skipped (\d+), resident attended (\d+), cpu pages (\d+), "
+    r"cpu declines prefill/no eligible/below min (\d+)/(\d+)/(\d+)"
 )
 
 
@@ -131,6 +133,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--fixed-pool-mib",
         type=int,
         help="use exactly this KV pool size and skip per-context probing",
+    )
+    parser.add_argument(
+        "--fixed-ring-slots",
+        type=int,
+        help="pin GGML_CUDA_KV_STREAM_FIXED_RING_SLOTS for the server; "
+        "the pin is read at runtime creation, so the mode is per process",
     )
     parser.add_argument(
         "--parallel", type=int, default=1,
@@ -262,12 +270,15 @@ def http_json(url: str, payload: dict | None, timeout: int) -> dict:
 def clean_server_env(
     cuda_visible_devices: str | None,
     trace_kv_stream: bool = False,
+    fixed_ring_slots: int | None = None,
 ) -> dict[str, str]:
     env = os.environ.copy()
     for name in UVM_ENV_NAMES:
         env.pop(name, None)
     env.pop("GGML_CUDA_KV_STREAM_FIXED_RING_SLOTS", None)
     env.pop("LLAMA_KV_STREAM_TRACE", None)
+    if fixed_ring_slots is not None:
+        env["GGML_CUDA_KV_STREAM_FIXED_RING_SLOTS"] = str(fixed_ring_slots)
     if trace_kv_stream:
         env["LLAMA_KV_STREAM_TRACE"] = "1"
     if cuda_visible_devices is not None:
@@ -355,6 +366,7 @@ class Server:
                 env=clean_server_env(
                     args.cuda_visible_devices,
                     args.trace_kv_stream,
+                    args.fixed_ring_slots,
                 ),
                 stdout=self.log_file,
                 stderr=subprocess.STDOUT,
@@ -515,6 +527,7 @@ def resume_signature(args: argparse.Namespace, capacities: list[int]) -> dict:
         "cache_type_k": args.cache_type_k,
         "cache_type_v": args.cache_type_v,
         "fixed_pool_mib": args.fixed_pool_mib,
+        "fixed_ring_slots": args.fixed_ring_slots,
         "parallel": args.parallel,
         "kv_unified": args.kv_unified,
         "n_gpu_layers": args.n_gpu_layers,
@@ -622,6 +635,16 @@ def parse_kv_stream_trace(log_path: Path) -> dict:
                 "active_pages": (active_tokens + 255) // 256,
                 "resident_pages": resident_pages,
                 "ring_slots": int(match.group(3)),
+                "samples": int(match.group(4)),
+                "misses": int(match.group(5)),
+                "copy_busy": float(match.group(6)),
+                "peak": int(match.group(7)),
+                "skipped_pages": int(match.group(8)),
+                "resident_pages_attended": int(match.group(9)),
+                "cpu_pages": int(match.group(10)),
+                "cpu_decline_prefill": int(match.group(11)),
+                "cpu_decline_no_eligible": int(match.group(12)),
+                "cpu_decline_below_min": int(match.group(13)),
             }
         )
     streamed = [
@@ -637,6 +660,10 @@ def parse_kv_stream_trace(log_path: Path) -> dict:
             else None
         ),
         "stream_trace_samples": len(samples),
+        "stream_windows": samples,
+        "stream_zero_sample_windows": sum(
+            1 for sample in samples if sample["samples"] == 0
+        ),
         "stream_max_active_pages": max(
             (sample["active_pages"] for sample in samples), default=None
         ),
@@ -645,6 +672,12 @@ def parse_kv_stream_trace(log_path: Path) -> dict:
         ),
         "stream_max_ring_slots": max(
             (sample["ring_slots"] for sample in samples), default=None
+        ),
+        "stream_max_copy_busy": max(
+            (sample["copy_busy"] for sample in samples), default=None
+        ),
+        "stream_total_cpu_pages": sum(
+            sample["cpu_pages"] for sample in samples
         ),
         "stream_repartitions": text.count("adaptive KV partition:"),
     }
@@ -962,6 +995,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("ubatch size must not exceed batch size")
     if args.fixed_pool_mib is not None and args.fixed_pool_mib < 0:
         raise SystemExit("fixed pool must not be negative")
+    if args.fixed_ring_slots is not None and args.fixed_ring_slots < 1:
+        raise SystemExit("fixed ring slots must be positive")
     if (
         args.pool_retries < 0
         or args.release_slack_mib < 0

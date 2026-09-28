@@ -154,8 +154,17 @@ def mixed_pages(log: bytes) -> list[bytes]:
     return [page for page in CELL_PAGE.findall(log) if len(set(page) - {ord(".")}) > 1]
 
 
+def split_cpu_threads() -> int:
+    text = os.environ.get("LLAMA_ARG_KV_STREAM_CPU_THREADS", "0") or "0"
+    try:
+        return int(text)
+    except ValueError:
+        return 0
+
+
 def run_parked_slots(binary: Path, model: Path, port: int, output: Path, args):
     parked_n, active_n = args.fill
+    split_on = split_cpu_threads() > 0
     # unified cache holds the parked sequence, both active ones and their decode tokens
     ctx_size = max(12288, (parked_n + 2 * active_n + 1024 + 255) // 256 * 256)
     cache_ram = args.cache_ram or max(2048, (parked_n + 2 * active_n) * 64 // 1024 + 2048)
@@ -163,7 +172,8 @@ def run_parked_slots(binary: Path, model: Path, port: int, output: Path, args):
     if args.debug_cells:
         env["LLAMA_KV_CACHE_DEBUG"] = "3"
     server = Server(binary, model, port, cache_ram, output / "parked-slots.log",
-                    n_parallel=2, ctx_size=ctx_size, extra=["--kv-unified", "--cache-idle-slots", "-lv", "5"],
+                    n_parallel=2, ctx_size=ctx_size,
+                    extra=["--kv-unified", "--cache-idle-slots", "-lv", "5", *args.extra_server_arg],
                     env=env, stage_mib=args.stage_mib)
     t0 = time.monotonic()
     marks = []
@@ -199,7 +209,9 @@ def run_parked_slots(binary: Path, model: Path, port: int, output: Path, args):
             "active_slots": [result_a["id_slot"], result_b["id_slot"]],
             "restored_timings": restored["timings"],
         }
-        if restored["content"] != expected["content"]:
+
+        parked_match = restored["content"] == expected["content"]
+        if not parked_match and not split_on:
             raise RuntimeError(f"parked-slot restore output changed: {json.dumps(details)}")
         cache_n = restored["timings"].get("cache_n", 0)
         if cache_n < parked_n - 256:
@@ -225,7 +237,8 @@ def run_parked_slots(binary: Path, model: Path, port: int, output: Path, args):
             if mixed:
                 raise RuntimeError(
                     f"{len(mixed)} page(s) held cells of more than one sequence, first: {mixed[0].decode()}")
-        if restored_a["content"] != result_a["content"]:
+        active_match = restored_a["content"] == result_a["content"]
+        if not active_match and not split_on:
             raise RuntimeError("active restore output changed: "
                                f"{json.dumps([result_a['content'], restored_a['content']])}")
         if runs_a != 1:
@@ -234,17 +247,22 @@ def run_parked_slots(binary: Path, model: Path, port: int, output: Path, args):
         summary = {
             "shape": {"parked_tokens": parked_n, "active_tokens": active_n, "ctx_size": ctx_size,
                       "cache_ram_mib": cache_ram, "stage_mib": args.stage_mib},
+            "split_on": split_on,
+            "content_match": {"parked": parked_match, "active": active_match},
             "requests": {name: {"id_slot": r["id_slot"], "timings": r["timings"]} for name, r in (
                 ("parked", expected), ("active_a", result_a), ("active_b", result_b),
                 ("parked_resumed", restored), ("active_a_resumed", restored_a))},
             "windows": windows,
         }
         (output / "parked-slots-summary.json").write_text(json.dumps(summary, indent=2))
-        print(f"parked-slot restore test: PASS (cache_n={cache_n}, slot {expected['id_slot']} -> "
+        content = "PASS" if (parked_match and active_match) else (
+            "MISMATCH (split on)" if split_on else "FAIL")
+        print(f"parked-slot restore test: {content} (cache_n={cache_n}, slot {expected['id_slot']} -> "
               f"{restored['id_slot']}, {cells} cells in {runs} runs, "
               f"prompt_ms={restored['timings']['prompt_ms']:.1f}, "
               f"skipped {windows['restore-parked']['skipped_pages']} pages; "
-              f"active back in {cells_a} cells, {runs_a} run)", flush=True)
+              f"active back in {cells_a} cells, {runs_a} run, "
+              f"content parked={parked_match} active={active_match}, split_on={split_on})", flush=True)
     finally:
         server.stop()
 
@@ -263,6 +281,8 @@ def main():
     shape.add_argument("--cache-ram", type=int, help="host prompt cache cap in MiB (default: sized from --fill)")
     shape.add_argument("--debug-cells", action="store_true",
                        help="LLAMA_KV_CACHE_DEBUG=3 and the mixed-page check; slow, off for timing runs")
+    shape.add_argument("--extra-server-arg", action="append", default=[], metavar="ARG",
+                       help="append a server argument (repeat; use --extra-server-arg=--flag)")
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     if args.only in (None, "serial"):

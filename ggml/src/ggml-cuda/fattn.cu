@@ -223,7 +223,7 @@ struct kv_stream_layer_plan {
 
 struct kv_stream_cpu_knobs {
     uint32_t pages_per_layer = 0;
-    float share = 0.0f;
+    float share = GGML_CUDA_KV_STREAM_CPU_DEFAULT_SHARE;
     int delay_thread = -1;
     int64_t delay_ns = 0;
 };
@@ -425,7 +425,7 @@ static kv_stream_cpu_knobs kv_stream_cpu_read_knobs() {
     if (kv_stream_cpu_env_number("GGML_CUDA_KV_STREAM_CPU_PAGES", value) && value >= 0.0 && value <= double(UINT32_MAX)) {
         knobs.pages_per_layer = uint32_t(value);
     }
-    if (kv_stream_cpu_env_number("GGML_CUDA_KV_STREAM_CPU_SHARE", value) && value > 0.0) {
+    if (kv_stream_cpu_env_number("GGML_CUDA_KV_STREAM_CPU_SHARE", value) && value >= 0.0) {
         knobs.share = std::min(float(value), 1.0f);
     }
     if (const char * delay = getenv("GGML_CUDA_KV_STREAM_CPU_DELAY")) {
@@ -2081,7 +2081,6 @@ bool ggml_cuda_kv_stream_graph_add_attention(
             // wide batches returned above, so the per-batch BLOCK_QUERY_TOKENS never warns here
             ring->cpu_split->warn_block(block);
         } else {
-            // TODO: Task F sets the default share
             n_cpu = cpu_graph->knobs.pages_per_layer;
             if (n_cpu == 0 && cpu_graph->knobs.share > 0.0f) {
                 uint32_t streamed = 0;

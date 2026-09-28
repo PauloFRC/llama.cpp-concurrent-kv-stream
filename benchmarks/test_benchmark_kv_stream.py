@@ -98,8 +98,27 @@ class BenchmarkKvStreamTest(unittest.TestCase):
         self.assertNotIn("GGML_CUDA_KV_STREAM_FIXED_RING_SLOTS", env)
         self.assertEqual(env["KEEP_ME"], "yes")
         self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "2")
+        pinned = BENCHMARK.clean_server_env(None, fixed_ring_slots=380)
+        self.assertEqual(pinned["GGML_CUDA_KV_STREAM_FIXED_RING_SLOTS"], "380")
         traced = BENCHMARK.clean_server_env(None, trace_kv_stream=True)
         self.assertEqual(traced["LLAMA_KV_STREAM_TRACE"], "1")
+
+    def test_fixed_ring_slots_must_be_positive(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model = root / "model.gguf"
+            server = root / "llama-server"
+            model.touch()
+            server.touch(mode=0o755)
+            base = [
+                "--model", str(model), "--server", str(server),
+                "--max-context", "64K", "--min-context", "8K",
+            ]
+            args = BENCHMARK.parse_args(base + ["--fixed-ring-slots", "0"])
+            self.assertEqual(args.fixed_ring_slots, 0)
+            with self.assertRaisesRegex(SystemExit, "fixed ring slots"):
+                BENCHMARK.validate_args(args)
+            BENCHMARK.validate_args(BENCHMARK.parse_args(base + ["--fixed-ring-slots", "380"]))
 
     def test_server_command_uses_tested_configuration(self) -> None:
         args = argparse.Namespace(
@@ -224,13 +243,16 @@ class BenchmarkKvStreamTest(unittest.TestCase):
     def test_trace_parser_marks_only_pages_beyond_resident_partition(self) -> None:
         log = (
             "0.01.000.000 W kv_stream_adapt: active 65536, resident 256, ring 32, layout 256, "
-            "samples 1, misses 0, copy busy 0.0%, peak 1, skipped 0, resident attended 0\n"
+            "samples 1, misses 0, copy busy 0.0%, peak 1, skipped 0, resident attended 0, "
+            "cpu pages 0, cpu declines prefill/no eligible/below min 17/0/0\n"
             "0.01.001.000 W kv_stream_adapt: adaptive KV partition: resident pages/layer "
             "256 -> 248, ring slots 32 -> 160, miss 50.0%, copy busy 25.0%\n"
             "0.01.002.000 W kv_stream_adapt: active 65792, resident 248, ring 160, layout 248, "
-            "samples 2, misses 1, copy busy 25.0%, peak 10, skipped 4, resident attended 8\n"
+            "samples 2, misses 1, copy busy 25.0%, peak 10, skipped 4, resident attended 8, "
+            "cpu pages 300, cpu declines prefill/no eligible/below min 0/1/0\n"
             "0.01.003.000 W kv_stream_adapt: active 66048, resident 248, ring 160, "
-            "samples 3, misses 1, copy busy 25.0%, peak 10\n"
+            "samples 0, misses 0, copy busy 25.0%, peak 10, skipped 0, resident attended 2, "
+            "cpu pages 140, cpu declines prefill/no eligible/below min 0/0/2\n"
         )
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "server.log"
@@ -241,6 +263,18 @@ class BenchmarkKvStreamTest(unittest.TestCase):
         self.assertEqual(parsed["stream_trace_samples"], 3)
         self.assertEqual(parsed["stream_repartitions"], 1)
         self.assertEqual(parsed["stream_max_ring_slots"], 160)
+        self.assertEqual(parsed["stream_zero_sample_windows"], 1)
+        self.assertEqual(parsed["stream_total_cpu_pages"], 440)
+        self.assertEqual(parsed["stream_max_copy_busy"], 25.0)
+        busy = [window for window in parsed["stream_windows"] if window["active_tokens"] == 65792]
+        self.assertEqual(len(busy), 1)
+        self.assertEqual(busy[0]["samples"], 2)
+        self.assertEqual(busy[0]["misses"], 1)
+        self.assertEqual(busy[0]["peak"], 10)
+        self.assertEqual(busy[0]["skipped_pages"], 4)
+        self.assertEqual(busy[0]["resident_pages_attended"], 8)
+        self.assertEqual(busy[0]["cpu_pages"], 300)
+        self.assertEqual(busy[0]["cpu_decline_no_eligible"], 1)
 
 
     def test_resume_rejects_changed_settings(self) -> None:

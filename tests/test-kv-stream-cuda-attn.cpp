@@ -5,6 +5,7 @@
 #include "ggml-cuda.h"
 #include "../ggml/src/ggml-impl.h"
 #include "../ggml/src/ggml-cuda/kv-stream-span-tuner.h"
+#include "../ggml/src/ggml-cuda/kv-stream-share-tuner.h"
 #include "../ggml/src/ggml-cuda/kv-stream-cpu-attn.h"
 #include "../ggml/src/ggml-cuda/kv-stream-cpu-pages.h"
 #include "../ggml/src/ggml-cuda/kv-stream-cpu-pool.h"
@@ -836,6 +837,17 @@ std::vector<float> run_attention_layers(
     return result;
 }
 
+template <typename F>
+uint32_t run_share_trial(ggml_cuda_kv_stream_share_tuner & tuner, const ggml_cuda_kv_stream_share_key & key, F ms) {
+    uint32_t graphs[ggml_cuda_kv_stream_share_tuner::N_ARMS] = {};
+    for (int step = 0; step < 1000 && !tuner.decided(key); ++step) {
+        const uint32_t arm = tuner.arm(key);
+        GGML_ASSERT(arm < ggml_cuda_kv_stream_share_tuner::N_ARMS);
+        tuner.observe(key, arm, ms(arm, graphs[arm]++));
+    }
+    return tuner.arm(key);
+}
+
 } // namespace
 
 int main() {
@@ -884,6 +896,132 @@ int main() {
 
         tuner.observe(1.0, /* streamed = */ true, /* greedy = */ true);
         t.assert_true("selection remains stable until layout reset", !tuner.use_greedy_batch());
+    });
+
+    t.test("share tuner buckets streamed pages by powers of two", [](testing & t) {
+        const std::pair<uint32_t, uint32_t> cases[] = { {1, 0}, {2, 1}, {40, 5}, {370, 8}, {511, 8}, {512, 9} };
+        for (const auto & [pages, expected] : cases) {
+            t.assert_equal(std::to_string(pages) + " pages", expected, ggml_cuda_kv_stream_share_tuner::bucket(pages));
+        }
+    });
+
+    t.test("share tuner rotates the grid and drops one warm-up per arm", [](testing & t) {
+        using tuner_t = ggml_cuda_kv_stream_share_tuner;
+        tuner_t tuner;
+        const ggml_cuda_kv_stream_share_key key = { 1, 8 };
+        const uint32_t trial = tuner_t::N_ARMS*(1 + 8);
+        for (uint32_t n = 0; n < trial; ++n) {
+            t.assert_true("undecided after " + std::to_string(n) + " samples", !tuner.decided(key));
+            const uint32_t arm = tuner.arm(key);
+            if (!t.assert_equal("arm of graph " + std::to_string(n), n % tuner_t::N_ARMS, arm)) {
+                break;
+            }
+            tuner.observe(key, arm, 10.0);
+        }
+        t.assert_true("decided after " + std::to_string(trial) + " samples", tuner.decided(key));
+        t.assert_equal("equal arms keep no split", 0u, tuner.arm(key));
+    });
+
+    t.test("share tuner keeps no split unless a share beats it by the margin", [](testing & t) {
+        struct verdict_case {
+            const char * name;
+            double arm2_ms;
+            uint32_t verdict;
+        };
+        const verdict_case cases[] = {
+            { "equal arms",           100.0, 0 },
+            { "one percent better",    99.0, 0 },
+            { "three percent better",  97.0, 2 },
+        };
+        const ggml_cuda_kv_stream_share_key key = { 1, 8 };
+        for (const verdict_case & tc : cases) {
+            ggml_cuda_kv_stream_share_tuner tuner;
+            const uint32_t verdict = run_share_trial(tuner, key, [&](uint32_t arm, uint32_t) {
+                return arm == 2 ? tc.arm2_ms : 100.0;
+            });
+            t.assert_true(std::string(tc.name) + " decides", tuner.decided(key));
+            t.assert_equal(tc.name, tc.verdict, verdict);
+        }
+    });
+
+    t.test("share tuner takes the smallest share within the margin of the best", [](testing & t) {
+        ggml_cuda_kv_stream_share_tuner tuner;
+        const ggml_cuda_kv_stream_share_key key = { 1, 8 };
+        const uint32_t verdict = run_share_trial(tuner, key, [](uint32_t arm, uint32_t n) {
+            const double ms[] = { 100.0, n % 2 ? 98.0 : 97.0, 96.0, 95.9 };
+            return ms[arm];
+        });
+        t.assert_true("trial decides", tuner.decided(key));
+        t.assert_equal("median of an even count", 97.5, tuner.median_ms(key, 1));
+        t.assert_equal("97.5 ms is within 2% of 95.9 ms", 1u, verdict);
+    });
+
+    t.test("one outlier does not move a share verdict", [](testing & t) {
+        ggml_cuda_kv_stream_share_tuner tuner;
+        const ggml_cuda_kv_stream_share_key key = { 1, 8 };
+        const uint32_t verdict = run_share_trial(tuner, key, [](uint32_t arm, uint32_t n) {
+            return arm != 2 ? 100.0 : n == 3 ? 450.0 : 90.0;
+        });
+        t.assert_true("trial decides", tuner.decided(key));
+        t.assert_equal(2u, verdict);
+    });
+
+    t.test("share tuner keys are independent", [](testing & t) {
+        using tuner_t = ggml_cuda_kv_stream_share_tuner;
+        tuner_t tuner;
+        const ggml_cuda_kv_stream_share_key narrow = { 1, 8 };
+        const ggml_cuda_kv_stream_share_key wide   = { 4, 8 };
+        const uint32_t trial = tuner_t::N_ARMS*(1 + 8);
+        for (uint32_t n = 0; n < trial + 2; ++n) {
+            if (n < trial) {
+                const uint32_t arm = tuner.arm(narrow);
+                if (!t.assert_equal("narrow graph " + std::to_string(n), n % tuner_t::N_ARMS, arm)) {
+                    break;
+                }
+                tuner.observe(narrow, arm, arm == 0 ? 10.0 : 12.0);
+            }
+            if (n >= 2) {
+                const uint32_t arm = tuner.arm(wide);
+                if (!t.assert_equal("wide graph " + std::to_string(n - 2), (n - 2) % tuner_t::N_ARMS, arm)) {
+                    break;
+                }
+                tuner.observe(wide, arm, arm == 2 ? 10.0 : 12.0);
+            }
+        }
+        t.assert_true("both keys decide", tuner.decided(narrow) && tuner.decided(wide));
+        t.assert_equal("narrow verdict", 0u, tuner.arm(narrow));
+        t.assert_equal("wide verdict", 2u, tuner.arm(wide));
+    });
+
+    t.test("share tuner ignores invalid samples and holds its verdict", [](testing & t) {
+        using tuner_t = ggml_cuda_kv_stream_share_tuner;
+        tuner_t tuner;
+        const ggml_cuda_kv_stream_share_key key = { 1, 8 };
+        for (uint32_t arm = 0; arm < tuner_t::N_ARMS; ++arm) {
+            for (const double ms : { std::nan(""), 0.0, -1.0 }) {
+                tuner.observe(key, arm, ms);
+            }
+        }
+        tuner.observe(key, tuner_t::N_ARMS, 10.0);
+
+        uint32_t samples = 0;
+        const uint32_t verdict = run_share_trial(tuner, key, [&](uint32_t arm, uint32_t) {
+            ++samples;
+            return arm == 1 ? 90.0 : 100.0;
+        });
+        t.assert_equal("invalid samples do not count", tuner_t::N_ARMS*(1 + 8), samples);
+        t.assert_equal(1u, verdict);
+
+        for (uint32_t n = 0; n < 40; ++n) {
+            tuner.observe(key, 0, 1.0);
+            tuner.observe(key, 3, 1.0);
+        }
+        t.assert_true("verdict stays decided", tuner.decided(key));
+        t.assert_equal("later samples do not move the verdict", 1u, tuner.arm(key));
+
+        tuner.reset();
+        t.assert_true("reset clears the verdict", !tuner.decided(key));
+        t.assert_equal("reset restarts the rotation", 0u, tuner.arm(key));
     });
 
     t.test("cpu page selection takes the highest immutable streamed pages", [](testing & t) {
@@ -2729,15 +2867,20 @@ int main() {
 
         struct test_case {
             const char * name;
-            const char * share;
+            const char * share;     // "" means no CPU_SHARE in the environment
             std::vector<uint32_t> dead_pages;
             uint64_t cpu_pages;
             uint64_t streamed_pages;
+            uint64_t cpu_jobs;
         };
+        const uint64_t default_cpu_pages =
+            uint64_t(std::llround(GGML_CUDA_KV_STREAM_CPU_DEFAULT_SHARE*40.0f));
         const test_case cases[] = {
-            { "cpu tail",                     "0.2", {},        8, 32 },
-            { "even split",                   "0.5", {},       20, 20 },
-            { "whole streamed set with hole", "1",   {20, 40}, 38,  0 },
+            { "cpu tail",                     "0.2", {},          8,                    32, 1 },
+            { "even split",                   "0.5", {},         20,                    20, 1 },
+            { "whole streamed set with hole", "1",   {20, 40},   38,                     0, 1 },
+            { "shipped default",              "",    {},         default_cpu_pages, 40 - default_cpu_pages, 1 },
+            { "share zero",                   "0",   {},          0,                    40, 0 },
         };
         for (const int64_t n_batch : {1, 3, 32}) {
             const attention_inputs inputs = make_page_inputs(n_kv, n_batch);
@@ -2768,7 +2911,7 @@ int main() {
 
                 t.assert_equal(uint64_t(0), stats[0].cpu_pages);
                 t.assert_equal(tc.cpu_pages, stats[1].cpu_pages);
-                t.assert_equal(uint64_t(1), stats[1].cpu_jobs);
+                t.assert_equal(tc.cpu_jobs, stats[1].cpu_jobs);
                 t.assert_equal(tc.streamed_pages, stats[1].streamed_pages);
                 t.assert_equal(uint64_t(41), stats[1].resident_pages_attended + stats[1].skipped_pages +
                     stats[1].streamed_pages_attended + stats[1].cpu_pages);
@@ -3107,17 +3250,21 @@ int main() {
             const char * pages;
             uint64_t cpu_pages;
         };
-        // 40 streamed pages, the last one included
+        // 40 streamed pages, the last one included; an absent or unreadable knob falls back to the
+        // shipped default share, so only a valid 0 turns the split off
+        const uint64_t default_pages =
+            uint64_t(std::llround(GGML_CUDA_KV_STREAM_CPU_DEFAULT_SHARE*40.0f));
         const step steps[] = {
             { "0.5",  "",           20 },
             { "1",    "",           39 },
             { "0.26", "",           10 },
+            { "0",    "",            0 },
             { "0.5",  "3",           3 },
-            { "",     "-1",          0 },
-            { "",     "5000000000",  0 },
-            { "",     "12x",         0 },
-            { "0.5x", "",            0 },
-            { "",     "",            0 },
+            { "",     "",  default_pages },
+            { "",     "-1", default_pages },
+            { "",     "5000000000", default_pages },
+            { "",     "12x", default_pages },
+            { "0.5x", "",  default_pages },
         };
         const attention_inputs inputs = make_inputs(n_kv, n_batch, n_kv);
         uint64_t previous = 0;
@@ -3133,7 +3280,7 @@ int main() {
         }
     });
 
-    t.test("a zero or unset cpu share leaves every counter and the output unchanged", [](testing & t) {
+    t.test("a zero cpu share leaves every counter and the output unchanged", [](testing & t) {
         if (!ggml_cuda_kv_stream_cpu_attn_supported()) {
             t.skip("CPU attention needs AVX-512 F, DQ, VNNI, F16C and FMA");
             return;
@@ -3153,9 +3300,8 @@ int main() {
             const char * share;
         };
         const run runs[] = {
-            { "no split",    false, ""  },
-            { "share unset", true,  ""  },
-            { "share 0",     true,  "0" },
+            { "no split", false, ""  },
+            { "share 0",  true,  "0" },
         };
         const attention_inputs inputs = make_inputs(n_kv, n_batch, n_kv);
         std::vector<float> baseline;

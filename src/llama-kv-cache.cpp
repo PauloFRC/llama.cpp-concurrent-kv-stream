@@ -85,7 +85,8 @@ llama_kv_cache::llama_kv_cache(
     const  layer_share_cb & share,
              const char *   name_tag,
                      size_t kv_stream_stage_bytes,
-                   uint32_t kv_stream_cpu_threads) :
+                   uint32_t kv_stream_cpu_threads,
+                      float kv_stream_cpu_share) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
@@ -247,7 +248,8 @@ llama_kv_cache::llama_kv_cache(
                     kv_stream_buft = kv_stream_init_runtime(
                         dev, kv_stream_stage_bytes, kv_stream_layer_count, type_k, type_v, kv_stream_cpu_threads, il);
                     kv_stream_dev = dev;
-                    kv_stream_init_cpu_split(dev, kv_stream_n_head, (kv_size + page_tokens - 1)/page_tokens, kv_stream_cpu_threads);
+                    kv_stream_init_cpu_split(dev, kv_stream_n_head, (kv_size + page_tokens - 1)/page_tokens,
+                        kv_stream_cpu_threads, kv_stream_cpu_share);
                 }
 
                 buft = kv_stream_buft;
@@ -1649,7 +1651,8 @@ ggml_backend_buffer_type_t llama_kv_cache::kv_stream_init_runtime(
     return buft;
 }
 
-void llama_kv_cache::kv_stream_init_cpu_split(ggml_backend_dev_t dev, uint32_t n_head, uint32_t context_pages, uint32_t n_threads) {
+void llama_kv_cache::kv_stream_init_cpu_split(
+        ggml_backend_dev_t dev, uint32_t n_head, uint32_t context_pages, uint32_t n_threads, float share) {
     if (n_threads == 0) {
         return;
     }
@@ -1668,14 +1671,18 @@ void llama_kv_cache::kv_stream_init_cpu_split(ggml_backend_dev_t dev, uint32_t n
             "(libllama and ggml-cuda builds do not match); the split stays off\n", __func__);
         return;
     }
-    if (!set_cpu_split_fn(kv_stream_runtime.runtime, n_threads_eff, n_head, context_pages, -1.0f)) {
+    if (!set_cpu_split_fn(kv_stream_runtime.runtime, n_threads_eff, n_head, context_pages, share)) {
         return; // the ggml side warns when the scratch allocation fails
     }
     if (n_threads_eff != n_threads) {
         LLAMA_LOG_WARN("%s: %u CPU attention threads requested, clamped to this machine's %u\n",
             __func__, n_threads, n_threads_eff);
     }
-    LLAMA_LOG_INFO("%s: CPU split on, %u threads\n", __func__, n_threads_eff);
+    if (share < 0.0f) {
+        LLAMA_LOG_INFO("%s: CPU split on, %u threads, share auto\n", __func__, n_threads_eff);
+    } else {
+        LLAMA_LOG_INFO("%s: CPU split on, %u threads, share %.2f\n", __func__, n_threads_eff, share);
+    }
 }
 
 bool llama_kv_cache::get_has_shift() const {

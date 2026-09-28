@@ -1753,6 +1753,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_v = params.cache_type_v;
     cparams.kv_stream_stage_mib = params.kv_stream_stage_mib;
     cparams.kv_stream_cpu_threads = params.kv_stream_cpu_threads;
+    cparams.kv_stream_cpu_share = params.kv_stream_cpu_share;
 
     return cparams;
 }

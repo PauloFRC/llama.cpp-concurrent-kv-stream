@@ -1,6 +1,9 @@
 #include "llama-kv-stream-config.h"
 #include "testing.h"
 
+#include <limits>
+#include <string>
+
 int main() {
     testing t;
 
@@ -88,6 +91,56 @@ int main() {
         config = base;
         config.stage_bytes = config.minimum_stage_bytes - 1;
         expect_invalid("stage smaller than one page", config);
+    });
+
+    t.test("cpu share is auto or a number in [0, 1]", [](testing & t) {
+        llama_kv_stream_config base;
+        base.stage_bytes         = 64ULL*1024ULL*1024ULL;
+        base.minimum_stage_bytes = 1664ULL*256ULL;
+        base.arch_qwen35         = true;
+        base.context_default     = true;
+        base.single_sequence     = true;
+        base.flash_attention     = true;
+        base.kv_offload          = true;
+        base.cpu_threads         = 4;
+        t.assert_equal(-1.0f, base.cpu_share);
+
+        auto config = base;
+        config.cpu_share = 1.5f;
+        auto result = llama_kv_stream_config_validate(config);
+        t.assert_true("1.5 is invalid", !result.valid && !result.enabled);
+        t.assert_true("the error names the share", result.error.find("share") != std::string::npos);
+
+        config.cpu_share = std::numeric_limits<float>::quiet_NaN();
+        result = llama_kv_stream_config_validate(config);
+        t.assert_true("NaN is invalid", !result.valid && !result.enabled && !result.error.empty());
+
+        for (const float share : { -1.0f, 0.4f }) {
+            config.cpu_share = share;
+            result = llama_kv_stream_config_validate(config);
+            t.assert_true("auto and 0.4 are valid", result.valid && result.enabled && result.warning.empty());
+        }
+    });
+
+    t.test("a cpu share without cpu attention threads warns", [](testing & t) {
+        llama_kv_stream_config config;
+        config.stage_bytes         = 64ULL*1024ULL*1024ULL;
+        config.minimum_stage_bytes = 1664ULL*256ULL;
+        config.arch_qwen35         = true;
+        config.context_default     = true;
+        config.single_sequence     = true;
+        config.flash_attention     = true;
+        config.kv_offload          = true;
+
+        config.cpu_share = 0.4f;
+        auto result = llama_kv_stream_config_validate(config);
+        t.assert_true("0.4 with no threads is valid", result.valid && result.enabled);
+        t.assert_true("0.4 with no threads warns", result.warning.find("share") != std::string::npos);
+
+        config.cpu_share = -1.0f;
+        result = llama_kv_stream_config_validate(config);
+        t.assert_true("auto with no threads is valid", result.valid && result.enabled);
+        t.assert_true("auto with no threads does not warn", result.warning.empty());
     });
 
     t.test("cpu attention threads clamp to the machine and keep zero off", [](testing & t) {

@@ -2484,6 +2484,7 @@ common_params common_base_params_to_speculative(const common_params & params) {
     // MTP keeps its ordinary cache until both contexts can share one pool.
     result.kv_stream_stage_mib = 0;
     result.kv_stream_cpu_threads = 0;
+    result.kv_stream_cpu_share = -1.0f;
     result.n_outputs_max = params.n_parallel;
     result.n_outputs_max_per_seq = 1;
 

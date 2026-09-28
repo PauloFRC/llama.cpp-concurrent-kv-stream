@@ -41,7 +41,8 @@ public:
     const layer_filter_cb & filter_attn = nullptr,
     const layer_filter_cb & filter_recr = nullptr,
                      size_t kv_stream_stage_bytes = 0,
-                   uint32_t kv_stream_cpu_threads = 0);
+                   uint32_t kv_stream_cpu_threads = 0,
+                      float kv_stream_cpu_share = -1.0f);
 
     ~llama_memory_hybrid() = default;
 

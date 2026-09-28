@@ -2623,7 +2623,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr),
                             /* kv stream stage   */ arch == LLM_ARCH_QWEN35 ? params.kv_stream_stage_bytes : 0,
-                            /* kv stream threads */ arch == LLM_ARCH_QWEN35 ? params.kv_stream_cpu_threads : 0);
+                            /* kv stream threads */ arch == LLM_ARCH_QWEN35 ? params.kv_stream_cpu_threads : 0,
+                            /* kv stream share   */ params.kv_stream_cpu_share);
                     }
                 } else {
                     llama_kv_cache::layer_filter_cb filter = nullptr;

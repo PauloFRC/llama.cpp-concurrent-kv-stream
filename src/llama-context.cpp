@@ -122,6 +122,7 @@ llama_context::llama_context(
     cparams.offload_kqv             = params.offload_kqv;
     cparams.kv_stream_stage_mib     = params.kv_stream_stage_mib;
     cparams.kv_stream_cpu_threads   = params.kv_stream_cpu_threads;
+    cparams.kv_stream_cpu_share     = params.kv_stream_cpu_share;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
 
@@ -411,6 +412,7 @@ llama_context::llama_context(
             /*.flash_attention     =*/ cparams.flash_attn,
             /*.kv_offload          =*/ cparams.offload_kqv,
             /*.cpu_threads         =*/ cparams.kv_stream_cpu_threads,
+            /*.cpu_share           =*/ cparams.kv_stream_cpu_share,
         };
         const auto stream_validation = llama_kv_stream_config_validate(stream_config);
         if (!stream_validation.valid) {
@@ -429,6 +431,7 @@ llama_context::llama_context(
             /*.type_v                =*/ params.type_v,
             /*.kv_stream_stage_bytes =*/ kv_stream_stage_bytes,
             /*.kv_stream_cpu_threads =*/ cparams.kv_stream_cpu_threads,
+            /*.kv_stream_cpu_share   =*/ cparams.kv_stream_cpu_share,
             /*.swa_full              =*/ params.swa_full,
             /*.ctx_type              =*/ cparams.ctx_type,
             /*.mem_other             =*/ llama_get_memory(cparams.ctx_other),
@@ -3698,6 +3701,7 @@ llama_context_params llama_context_default_params() {
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.kv_stream_stage_mib         =*/ 0,
         /*.kv_stream_cpu_threads       =*/ 0,
+        /*.kv_stream_cpu_share         =*/ -1.0f,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

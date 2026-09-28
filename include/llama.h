@@ -390,6 +390,7 @@ extern "C" {
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
         uint32_t kv_stream_stage_mib; // block-streaming staging budget, 0 = disabled [EXPERIMENTAL]
         uint32_t kv_stream_cpu_threads; // CPU attention threads over streamed KV pages, 0 = disabled [EXPERIMENTAL]
+        float    kv_stream_cpu_share;   // share of streamed KV pages the CPU attends, negative = auto [EXPERIMENTAL]
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted

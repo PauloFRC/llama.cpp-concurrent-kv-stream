@@ -15,6 +15,7 @@ struct llama_kv_stream_config {
     bool kv_offload      = false;
 
     uint32_t cpu_threads = 0;
+    float    cpu_share   = -1.0f;
 };
 
 struct llama_kv_stream_config_result {

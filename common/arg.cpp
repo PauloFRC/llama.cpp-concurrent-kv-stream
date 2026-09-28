@@ -2441,6 +2441,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_STREAM_CPU_THREADS"));
     add_opt(common_arg(
+        {"--kv-stream-cpu-share"}, "auto|F",
+        string_format("share of streamed KV pages the CPU computes attention on, in [0, 1], or auto to measure it per decode step (default: %s)",
+            params.kv_stream_cpu_share < 0.0f ? "auto" : string_format("%.2f", (double) params.kv_stream_cpu_share).c_str()),
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.kv_stream_cpu_share = -1.0f;
+                return;
+            }
+            const float share = std::stof(value);
+            if (!(share >= 0.0f && share <= 1.0f)) {
+                throw std::invalid_argument("KV stream CPU share must be auto or a number in [0, 1]");
+            }
+            params.kv_stream_cpu_share = share;
+        }
+    ).set_env("LLAMA_ARG_KV_STREAM_CPU_SHARE"));
+    add_opt(common_arg(
         {"--repack"},
         {"-nr", "--no-repack"},
         string_format("whether to enable weight repacking (default: %s)", params.no_extra_bufts ? "disabled" : "enabled"),

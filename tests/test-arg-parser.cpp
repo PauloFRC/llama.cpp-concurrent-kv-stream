@@ -97,12 +97,14 @@ static void test(void) {
         base.n_outputs_max_per_seq = 8;
         base.kv_stream_stage_mib = 64;
         base.kv_stream_cpu_threads = 4;
+        base.kv_stream_cpu_share = 0.4f;
 
         const auto draft = common_base_params_to_speculative(base);
         assert(draft.n_outputs_max == 4);
         assert(draft.n_outputs_max_per_seq == 1);
         assert(draft.kv_stream_stage_mib == 0);
         assert(draft.kv_stream_cpu_threads == 0);
+        assert(draft.kv_stream_cpu_share == -1.0f);
     }
 
     printf("test-arg-parser: make sure there is no duplicated arguments in any examples\n\n");
@@ -213,6 +215,27 @@ static void test(void) {
         argv = {"binary_name", "-m", "model_file.gguf", "--kv-stream-cpu-threads", "-1"};
         assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), cpu_params, LLAMA_EXAMPLE_COMMON));
         assert(cpu_params.kv_stream_cpu_threads == 1);
+    }
+
+    {
+        common_params share_params;
+        assert(share_params.kv_stream_cpu_share == -1.0f);
+
+        for (const char * value : {"0", "1", "0.4"}) {
+            argv = {"binary_name", "-m", "model_file.gguf", "--kv-stream-cpu-share", value};
+            assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), share_params, LLAMA_EXAMPLE_COMMON));
+            assert(share_params.kv_stream_cpu_share == std::stof(value));
+        }
+
+        for (const char * value : {"-0.1", "1.5", "abc"}) {
+            argv = {"binary_name", "-m", "model_file.gguf", "--kv-stream-cpu-share", value};
+            assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), share_params, LLAMA_EXAMPLE_COMMON));
+            assert(share_params.kv_stream_cpu_share == 0.4f);
+        }
+
+        argv = {"binary_name", "-m", "model_file.gguf", "--kv-stream-cpu-share", "auto"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), share_params, LLAMA_EXAMPLE_COMMON));
+        assert(share_params.kv_stream_cpu_share == -1.0f);
     }
 
     {
@@ -383,6 +406,17 @@ static void test(void) {
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.kv_stream_cpu_threads == 3);
     unsetenv("LLAMA_ARG_KV_STREAM_CPU_THREADS");
+
+    setenv("LLAMA_ARG_KV_STREAM_CPU_SHARE", "0.25", true);
+    argv = {"binary_name"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.kv_stream_cpu_share == 0.25f);
+
+    setenv("LLAMA_ARG_KV_STREAM_CPU_SHARE", "abc", true);
+    argv = {"binary_name"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.kv_stream_cpu_share == 0.25f);
+    unsetenv("LLAMA_ARG_KV_STREAM_CPU_SHARE");
 
     printf("test-arg-parser: test negated environment variables\n\n");
 

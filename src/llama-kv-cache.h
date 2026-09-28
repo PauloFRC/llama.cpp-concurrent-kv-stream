@@ -117,7 +117,8 @@ public:
         // a model can hold more than one cache, so the tensor names have to stay unique
                  const char *   name_tag = "",
                          size_t kv_stream_stage_bytes = 0,
-                       uint32_t kv_stream_cpu_threads = 0);
+                       uint32_t kv_stream_cpu_threads = 0,
+                          float kv_stream_cpu_share = -1.0f);
 
     ~llama_kv_cache() = default;
 
@@ -384,7 +385,8 @@ private:
                       uint32_t cpu_threads,
                       uint32_t il);
 
-    void kv_stream_init_cpu_split(ggml_backend_dev_t dev, uint32_t n_head, uint32_t context_pages, uint32_t n_threads);
+    void kv_stream_init_cpu_split(
+            ggml_backend_dev_t dev, uint32_t n_head, uint32_t context_pages, uint32_t n_threads, float share);
 
     ggml_tensor * build_rope_shift(
             const llama_cparams & cparams,

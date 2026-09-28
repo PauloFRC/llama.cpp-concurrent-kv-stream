@@ -1,9 +1,13 @@
 #include "llama-kv-stream-config.h"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 
 llama_kv_stream_config_result llama_kv_stream_config_validate(const llama_kv_stream_config & config) {
+    if (std::isnan(config.cpu_share) || config.cpu_share > 1.0f) {
+        return { false, false, "block KV streaming CPU share must be auto (negative) or a number in [0, 1]", {} };
+    }
     if (config.stage_bytes == 0) {
         if (config.cpu_threads > 0) {
             return { true, false, {}, "CPU attention threads are set but block KV streaming is off; the CPU split stays off" };
@@ -32,6 +36,9 @@ llama_kv_stream_config_result llama_kv_stream_config_validate(const llama_kv_str
     }
     if (config.minimum_stage_bytes == 0 || config.stage_bytes < config.minimum_stage_bytes) {
         return invalid("block KV streaming stage is too small for one 256-token cache page");
+    }
+    if (config.cpu_threads == 0 && config.cpu_share >= 0.0f) {
+        return { true, true, {}, "a CPU share is set but CPU attention threads are 0; the CPU split stays off" };
     }
 
     return { true, true, {}, {} };

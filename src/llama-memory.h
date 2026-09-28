@@ -20,6 +20,7 @@ struct llama_memory_params {
     ggml_type type_v;
     uint64_t kv_stream_stage_bytes;
     uint32_t kv_stream_cpu_threads;
+    float    kv_stream_cpu_share;
 
     // use full-size SWA cache
     bool swa_full;

@@ -267,6 +267,14 @@ feedback_fn_t query_feedback_fn(ggml_backend_t backend) {
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_kv_stream_feedback"));
 }
 
+using set_cpu_split_fn_t = bool (*)(void *, uint32_t, uint32_t, uint32_t, float);
+
+set_cpu_split_fn_t query_set_cpu_split_fn(ggml_backend_t backend) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+    return reinterpret_cast<set_cpu_split_fn_t>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_kv_stream_set_cpu_split"));
+}
+
 size_t query_conversion_bytes(ggml_backend_t backend, ggml_type type_k, ggml_type type_v) {
     using workspace_fn_t = bool (*)(
         ggml_type, ggml_type, uint32_t, uint32_t, uint32_t, uint32_t, size_t *);
@@ -1135,7 +1143,7 @@ int main() {
             return;
         }
         t.assert_true("cpu split scratch allocates",
-            ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 1, N_Q_HEAD, 8));
+            ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 1, N_Q_HEAD, 8, -1.0f));
 
         const std::vector<attention_inputs> inputs(layers, make_inputs(n_kv, n_batch, n_kv));
         {
@@ -1176,7 +1184,7 @@ int main() {
             return;
         }
         t.assert_true("cpu split scratch allocates",
-            ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 1, N_Q_HEAD, 8));
+            ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 1, N_Q_HEAD, 8, -1.0f));
 
         const std::vector<attention_inputs> inputs(layers, make_inputs(n_kv, n_batch, n_kv));
         {
@@ -2620,10 +2628,12 @@ int main() {
             return;
         }
 
-        t.assert_true("a null runtime is rejected", !ggml_backend_cuda_kv_stream_set_cpu_split(nullptr, 1, N_Q_HEAD, 41));
-        t.assert_true("zero threads are rejected", !ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 0, N_Q_HEAD, 41));
-        t.assert_true("zero heads are rejected", !ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 1, 0, 41));
-        t.assert_true("zero context pages are rejected", !ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 1, N_Q_HEAD, 0));
+        t.assert_true("a null runtime is rejected", !ggml_backend_cuda_kv_stream_set_cpu_split(nullptr, 1, N_Q_HEAD, 41, -1.0f));
+        t.assert_true("zero threads are rejected", !ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 0, N_Q_HEAD, 41, -1.0f));
+        t.assert_true("zero heads are rejected", !ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 1, 0, 41, -1.0f));
+        t.assert_true("zero context pages are rejected", !ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 1, N_Q_HEAD, 0, -1.0f));
+        t.assert_true("a share above one is rejected", !ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 1, N_Q_HEAD, 41, 1.5f));
+        t.assert_true("a NaN share is rejected", !ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 1, N_Q_HEAD, 41, NAN));
 
         const attention_inputs inputs = make_inputs(n_kv, n_batch, n_kv);
         const std::vector<float> expected = run_attention(
@@ -2683,7 +2693,7 @@ int main() {
         {
             scoped_env env{{"GGML_CUDA_KV_STREAM_CPU_CPUS", std::to_string(outside)}};
             log_capture log("outside the process affinity mask");
-            allocated = ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 2, N_Q_HEAD, 41);
+            allocated = ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 2, N_Q_HEAD, 41, -1.0f);
             warned = !log.snapshot().empty();
         }
         t.assert_true("the split is created anyway", allocated);
@@ -2738,7 +2748,7 @@ int main() {
                 return;
             }
             t.assert_true("cpu split scratch allocates",
-                ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 1, N_Q_HEAD, 41));
+                ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 1, N_Q_HEAD, 41, -1.0f));
             std::vector<uint8_t> live(41, 1);
             live[40] = tc.last_page_live;
             t.assert_true("live pages accepted",
@@ -2786,7 +2796,7 @@ int main() {
             return;
         }
         t.assert_true("cpu split scratch allocates",
-            ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 1, N_Q_HEAD, 41));
+            ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 1, N_Q_HEAD, 41, -1.0f));
 
         // multi-sequence decode writes one row per sequence in batch order, not page order
         const int64_t rows[] = {35*PAGE_TOKENS + 3, 20*PAGE_TOKENS + 1};
@@ -2834,7 +2844,7 @@ int main() {
         if (!t.assert_true("runtime initializes", runtime != nullptr)) {
             return;
         }
-        t.assert_true("cpu split scratch allocates", ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 1, N_Q_HEAD, 8));
+        t.assert_true("cpu split scratch allocates", ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 1, N_Q_HEAD, 8, -1.0f));
 
         // run_attention_layers gives every layer its own mask tensor
         const std::vector<attention_inputs> inputs(3, make_inputs(n_kv, n_batch, n_kv));
@@ -2899,7 +2909,7 @@ int main() {
                     }
                     if (split) {
                         t.assert_true("cpu split scratch allocates",
-                            ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 4, N_Q_HEAD, context_pages));
+                            ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 4, N_Q_HEAD, context_pages, -1.0f));
                     }
                     t.assert_true("live pages accepted",
                         ggml_backend_cuda_kv_stream_set_live_pages(runtime.get(), live.data(), live.size()));
@@ -2962,7 +2972,7 @@ int main() {
             }
             if (split) {
                 t.assert_true("cpu split scratch allocates",
-                    ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 4, N_Q_HEAD, context_pages));
+                    ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 4, N_Q_HEAD, context_pages, -1.0f));
             }
             if (!t.assert_true("decode layout keeps one layer resident",
                     ggml_backend_cuda_kv_stream_set_decode_layout(runtime.get(), 39))) {
@@ -3013,7 +3023,7 @@ int main() {
                 return;
             }
             t.assert_true("cpu split scratch allocates",
-                ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), threads, N_Q_HEAD, 41));
+                ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), threads, N_Q_HEAD, 41, -1.0f));
             std::vector<float> actual;
             {
                 scoped_env env{
@@ -3067,7 +3077,7 @@ int main() {
             return;
         }
         t.assert_true("cpu split scratch allocates",
-            ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 2, N_Q_HEAD, 41));
+            ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 2, N_Q_HEAD, 41, -1.0f));
         std::vector<float> actual;
         std::vector<std::string> lines;
         {
@@ -3140,7 +3150,7 @@ int main() {
                 return;
             }
             t.assert_true("cpu split scratch allocates",
-                ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 2, N_Q_HEAD, 41));
+                ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 2, N_Q_HEAD, 41, -1.0f));
             if (tc.only_live_page >= 0) {
                 std::vector<uint8_t> live(41, 0);
                 live[size_t(tc.only_live_page)] = 1;
@@ -3204,7 +3214,7 @@ int main() {
         if (!t.assert_true("runtime initializes", runtime != nullptr)) {
             return;
         }
-        t.assert_true("cpu split scratch allocates", ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 3, N_Q_HEAD, 8));
+        t.assert_true("cpu split scratch allocates", ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 3, N_Q_HEAD, 8, -1.0f));
         std::vector<float> actual;
         {
             scoped_env env{
@@ -3243,7 +3253,7 @@ int main() {
         if (!t.assert_true("runtime initializes", runtime != nullptr)) {
             return;
         }
-        t.assert_true("cpu split scratch allocates", ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 2, N_Q_HEAD, 41));
+        t.assert_true("cpu split scratch allocates", ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 2, N_Q_HEAD, 41, -1.0f));
 
         struct step {
             const char * share;
@@ -3280,6 +3290,58 @@ int main() {
         }
     });
 
+    t.test("a pinned cpu share argument selects like the env knob, and the env knob wins", [](testing & t) {
+        if (!ggml_cuda_kv_stream_cpu_attn_supported()) {
+            t.skip("CPU attention needs AVX-512 F, DQ, VNNI, F16C and FMA");
+            return;
+        }
+        constexpr int64_t n_kv = 41*256;
+        constexpr int64_t n_batch = 1;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+
+        const set_cpu_split_fn_t set_cpu_split_fn = query_set_cpu_split_fn(backend.get());
+        if (!t.assert_true("cpu split proc address resolves", set_cpu_split_fn != nullptr)) {
+            return;
+        }
+
+        const auto params = make_stream_params(backend.get(), 40, 41, 1, 32);
+        struct run {
+            const char * name;
+            float share;
+            const char * env_share;
+            uint64_t cpu_pages;
+        };
+        const uint64_t default_pages =
+            uint64_t(std::llround(GGML_CUDA_KV_STREAM_CPU_DEFAULT_SHARE*40.0f));
+        const run runs[] = {
+            { "argument 0.5",               0.5f, "",     20 },
+            { "argument 0",                 0.0f, "",      0 },
+            { "argument 0.5 under env 0.26", 0.5f, "0.26", 10 },
+            { "auto",                      -1.0f, "",     default_pages },
+        };
+        const attention_inputs inputs = make_inputs(n_kv, n_batch, n_kv);
+        for (const run & r : runs) {
+            auto runtime = make_runtime(params);
+            if (!t.assert_true("runtime initializes", runtime != nullptr)) {
+                return;
+            }
+            t.assert_true(std::string(r.name) + ": cpu split scratch allocates",
+                set_cpu_split_fn(runtime.get(), 2, N_Q_HEAD, 41, r.share));
+            {
+                scoped_env env{{"GGML_CUDA_KV_STREAM_CPU_SHARE", r.env_share}};
+                run_attention(backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime.get()), n_kv, n_batch);
+            }
+            const auto s = ggml_backend_cuda_kv_stream_get_stats(runtime.get());
+            t.assert_equal(std::string(r.name) + ": cpu pages", r.cpu_pages, s.cpu_pages);
+            t.assert_equal(std::string(r.name) + ": cpu jobs", uint64_t(r.cpu_pages != 0), s.cpu_jobs);
+            t.assert_equal(std::string(r.name) + ": cpu declines", uint64_t(0),
+                s.cpu_decline_prefill + s.cpu_decline_no_eligible_pages + s.cpu_decline_below_min_pages);
+        }
+    });
+
     t.test("a zero cpu share leaves every counter and the output unchanged", [](testing & t) {
         if (!ggml_cuda_kv_stream_cpu_attn_supported()) {
             t.skip("CPU attention needs AVX-512 F, DQ, VNNI, F16C and FMA");
@@ -3313,7 +3375,7 @@ int main() {
             }
             if (r.split) {
                 t.assert_true("cpu split scratch allocates",
-                    ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 2, N_Q_HEAD, 41));
+                    ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 2, N_Q_HEAD, 41, -1.0f));
             }
             std::vector<float> actual;
             {
@@ -3383,7 +3445,7 @@ int main() {
                 return;
             }
             t.assert_true("cpu split scratch allocates",
-                ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 2, N_Q_HEAD, 41));
+                ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 2, N_Q_HEAD, 41, -1.0f));
 
             std::vector<float> actual;
             {
@@ -3448,7 +3510,7 @@ int main() {
             return;
         }
         t.assert_true("cpu split scratch allocates",
-            ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 1, N_Q_HEAD, 41));
+            ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 1, N_Q_HEAD, 41, -1.0f));
 
         std::vector<float> actual;
         {
@@ -3503,7 +3565,7 @@ int main() {
             return;
         }
         t.assert_true("cpu split scratch allocates",
-            ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 2, N_Q_HEAD, 60));
+            ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 2, N_Q_HEAD, 60, -1.0f));
 
         std::vector<float> actual;
         {
@@ -3566,7 +3628,7 @@ int main() {
             return;
         }
         t.assert_true("cpu split scratch allocates",
-            ggml_backend_cuda_kv_stream_set_cpu_split(split_runtime, 2, N_Q_HEAD, 4));
+            ggml_backend_cuda_kv_stream_set_cpu_split(split_runtime, 2, N_Q_HEAD, 4, -1.0f));
         std::vector<float> split_actual;
         {
             // a share, so a prefill that reaches the planner takes pages
@@ -3611,7 +3673,7 @@ int main() {
             return;
         }
         t.assert_true("cpu split scratch allocates",
-            ggml_backend_cuda_kv_stream_set_cpu_split(streamed_runtime, 2, N_Q_HEAD, 8));
+            ggml_backend_cuda_kv_stream_set_cpu_split(streamed_runtime, 2, N_Q_HEAD, 8, -1.0f));
         std::vector<float> streamed_split;
         {
             scoped_env env{{"GGML_CUDA_KV_STREAM_CPU_SHARE", "0.5"}};

@@ -1660,7 +1660,7 @@ void llama_kv_cache::kv_stream_init_cpu_split(ggml_backend_dev_t dev, uint32_t n
             __func__);
         return;
     }
-    using set_cpu_split_fn_t = bool (*)(void *, uint32_t, uint32_t, uint32_t);
+    using set_cpu_split_fn_t = bool (*)(void *, uint32_t, uint32_t, uint32_t, float);
     auto * set_cpu_split_fn = (set_cpu_split_fn_t) ggml_backend_reg_get_proc_address(
         ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_kv_stream_set_cpu_split");
     if (set_cpu_split_fn == nullptr) {
@@ -1668,7 +1668,7 @@ void llama_kv_cache::kv_stream_init_cpu_split(ggml_backend_dev_t dev, uint32_t n
             "(libllama and ggml-cuda builds do not match); the split stays off\n", __func__);
         return;
     }
-    if (!set_cpu_split_fn(kv_stream_runtime.runtime, n_threads_eff, n_head, context_pages)) {
+    if (!set_cpu_split_fn(kv_stream_runtime.runtime, n_threads_eff, n_head, context_pages, -1.0f)) {
         return; // the ggml side warns when the scratch allocation fails
     }
     if (n_threads_eff != n_threads) {

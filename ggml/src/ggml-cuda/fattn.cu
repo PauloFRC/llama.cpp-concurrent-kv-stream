@@ -224,6 +224,7 @@ struct kv_stream_layer_plan {
 struct kv_stream_cpu_knobs {
     uint32_t pages_per_layer = 0;
     float share = GGML_CUDA_KV_STREAM_CPU_DEFAULT_SHARE;
+    bool auto_share = false;
     int delay_thread = -1;
     int64_t delay_ns = 0;
 };
@@ -274,6 +275,7 @@ struct kv_stream_cpu_split {
     // set once, by set_cpu_split
     size_t max_rows = 0;
     uint32_t context_pages = 0;
+    float share = -1.0f;
     cudaStream_t side_stream = nullptr;
     float * q = nullptr;
     uint16_t * mask = nullptr;
@@ -419,14 +421,22 @@ static void kv_stream_cpu_read_delay(const char * text, int & thread, int64_t & 
     }
 }
 
-static kv_stream_cpu_knobs kv_stream_cpu_read_knobs() {
+static kv_stream_cpu_knobs kv_stream_cpu_read_knobs(float share) {
     kv_stream_cpu_knobs knobs;
+    knobs.auto_share = share < 0.0f;
+    if (!knobs.auto_share) {
+        knobs.share = share;
+    }
     double value = 0.0;
     if (kv_stream_cpu_env_number("GGML_CUDA_KV_STREAM_CPU_PAGES", value) && value >= 0.0 && value <= double(UINT32_MAX)) {
         knobs.pages_per_layer = uint32_t(value);
     }
     if (kv_stream_cpu_env_number("GGML_CUDA_KV_STREAM_CPU_SHARE", value) && value >= 0.0) {
         knobs.share = std::min(float(value), 1.0f);
+        knobs.auto_share = false;
+    }
+    if (knobs.pages_per_layer > 0) {
+        knobs.auto_share = false;
     }
     if (const char * delay = getenv("GGML_CUDA_KV_STREAM_CPU_DELAY")) {
         kv_stream_cpu_read_delay(delay, knobs.delay_thread, knobs.delay_ns);
@@ -650,8 +660,8 @@ void ggml_cuda_kv_stream_transfer_ring_set_live_pages(
 }
 
 bool ggml_cuda_kv_stream_transfer_ring_set_cpu_split(
-        ggml_cuda_kv_stream_transfer_ring * ring, uint32_t n_threads, uint32_t n_head, uint32_t context_pages) {
-    if (ring == nullptr || n_threads == 0 || n_head == 0 || context_pages == 0) {
+        ggml_cuda_kv_stream_transfer_ring * ring, uint32_t n_threads, uint32_t n_head, uint32_t context_pages, float share) {
+    if (ring == nullptr || n_threads == 0 || n_head == 0 || context_pages == 0 || std::isnan(share) || share > 1.0f) {
         return false;
     }
     GGML_ASSERT(ggml_cuda_kv_stream_cpu_attn_supported());
@@ -666,6 +676,7 @@ bool ggml_cuda_kv_stream_transfer_ring_set_cpu_split(
     auto split = std::make_unique<kv_stream_cpu_split>();
     split->max_rows = rows;
     split->context_pages = context_pages;
+    split->share = share;
     if (cudaStreamCreateWithFlags(&split->side_stream, cudaStreamNonBlocking) != cudaSuccess ||
         cudaHostAlloc(reinterpret_cast<void **>(&split->q), row_bytes, cudaHostAllocDefault) != cudaSuccess ||
         cudaHostAlloc(reinterpret_cast<void **>(&split->mask), mask_bytes, cudaHostAllocDefault) != cudaSuccess ||
@@ -1982,7 +1993,7 @@ void ggml_cuda_kv_stream_graph_begin(ggml_cuda_kv_stream_transfer_ring * ring) {
         kv_stream_cpu_split & split = *ring->cpu_split;
         GGML_ASSERT(ggml_cuda_kv_stream_cpu_pool_idle(ring) && "cpu pool busy between graphs");
         split.graph = {};
-        split.graph.knobs = kv_stream_cpu_read_knobs();
+        split.graph.knobs = kv_stream_cpu_read_knobs(split.share);
     }
     ring->graph_layer_count = 0;
     ring->current_layer = KV_STREAM_NO_LAYER;

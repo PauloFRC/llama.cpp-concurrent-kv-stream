@@ -481,6 +481,7 @@ struct ggml_cuda_kv_stream_transfer_ring {
     bool feedback_seen = false;
     ggml_cuda_kv_stream_share_key graph_share_key = {};
     uint32_t graph_share_arm = ggml_cuda_kv_stream_share_tuner::N_ARMS; // N_ARMS: no key
+    bool graph_share_trial = false;
     uint32_t graph_layer_count = 0;
     uint32_t current_layer = KV_STREAM_NO_LAYER;
     size_t next_request = 0;
@@ -513,6 +514,7 @@ struct ggml_cuda_kv_stream_transfer_ring {
     bool last_graph_copy_batch_greedy = false;
     ggml_cuda_kv_stream_share_key last_graph_share_key = {};
     uint32_t last_graph_share_arm = ggml_cuda_kv_stream_share_tuner::N_ARMS;
+    bool last_graph_share_trial = false;
     bool last_graph_streamed = false;
     bool copy_sample_recorded = false;
 };
@@ -727,7 +729,7 @@ bool ggml_cuda_kv_stream_transfer_ring_observe_decode_latency(
     if (ring == nullptr) {
         return false;
     }
-    if (ring->forced_decode_span_pages == 0) {
+    if (ring->forced_decode_span_pages == 0 && !ring->last_graph_share_trial) {
         const bool was_selected = ring->span_tuner.selected();
         ring->span_tuner.observe(
             elapsed_ms, ring->last_graph_decode && ring->last_graph_streamed,
@@ -750,10 +752,15 @@ bool ggml_cuda_kv_stream_transfer_ring_observe_decode_latency(
             auto & tuner = ring->share_tuner;
             GGML_LOG_WARN(
                 "%s: selected cpu share %.1f for %u-token decodes at %u-%llu streamed pages from end-to-end latency "
-                "(median share 0 %.3f ms, 0.2 %.3f ms, 0.4 %.3f ms, 0.6 %.3f ms)\n",
+                "(median share 0 %.3f ms%s, 0.2 %.3f ms%s, 0.4 %.3f ms%s, 0.6 %.3f ms%s; %u samples)\n",
                 __func__, ggml_cuda_kv_stream_share_tuner::SHARES[tuner.arm(key)],
                 key.width, 1u << key.bucket, (2ull << key.bucket) - 1,
-                tuner.median_ms(key, 0), tuner.median_ms(key, 1), tuner.median_ms(key, 2), tuner.median_ms(key, 3));
+                tuner.median_ms(key, 0), tuner.dropped(key, 0) ? " dropped" : "",
+                tuner.median_ms(key, 1), tuner.dropped(key, 1) ? " dropped" : "",
+                tuner.median_ms(key, 2), tuner.dropped(key, 2) ? " dropped" : "",
+                tuner.median_ms(key, 3), tuner.dropped(key, 3) ? " dropped" : "",
+                tuner.samples(key));
+            ggml_cuda_kv_stream_transfer_ring_reset_span_tuner(ring);
         }
     }
     return true;
@@ -2002,11 +2009,17 @@ static void kv_stream_pick_share(
         ggml_cuda_kv_stream_transfer_ring * ring, kv_stream_cpu_knobs & knobs, uint32_t width, uint32_t streamed) {
     knobs.auto_share = false;
     const ggml_cuda_kv_stream_share_key key = { width, ggml_cuda_kv_stream_share_tuner::bucket(streamed) };
-    const bool span_settled = ring->forced_decode_span_pages != 0 || ring->span_tuner.selected();
-    if ((span_settled && ring->feedback_seen) || ring->share_tuner.decided(key)) {
+    const bool decided = ring->share_tuner.decided(key);
+    if (ring->feedback_seen || decided) {
         ring->graph_share_key = key;
         ring->graph_share_arm = ring->share_tuner.arm(key);
         knobs.share = ggml_cuda_kv_stream_share_tuner::SHARES[ring->graph_share_arm];
+        if (!decided) {
+            // a trial graph runs in fixed copy batches
+            ring->graph_share_trial = true;
+            ring->graph_copy_batch_greedy = false;
+            ring->graph_copy_batch_pages = KV_STREAM_COPY_BATCH_PAGES;
+        }
     }
 }
 
@@ -2023,6 +2036,7 @@ void ggml_cuda_kv_stream_graph_begin(ggml_cuda_kv_stream_transfer_ring * ring) {
     ring->graph_copy_batch_pages = ring->graph_copy_batch_greedy ?
         ring->active_slots : KV_STREAM_COPY_BATCH_PAGES;
     ring->graph_share_arm = ggml_cuda_kv_stream_share_tuner::N_ARMS;
+    ring->graph_share_trial = false;
     if (ring->cpu_split != nullptr) {
         kv_stream_cpu_split & split = *ring->cpu_split;
         GGML_ASSERT(ggml_cuda_kv_stream_cpu_pool_idle(ring) && "cpu pool busy between graphs");
@@ -2189,6 +2203,7 @@ void ggml_cuda_kv_stream_graph_finalize(
     ring->last_graph_copy_batch_greedy = ring->graph_copy_batch_greedy;
     ring->last_graph_share_key = ring->graph_share_key;
     ring->last_graph_share_arm = ring->graph_share_arm;
+    ring->last_graph_share_trial = ring->graph_share_trial;
     ring->last_graph_streamed = !ring->graph_requests.empty();
     if (ring->graph_requests.empty()) {
         ring->timing_current = false;

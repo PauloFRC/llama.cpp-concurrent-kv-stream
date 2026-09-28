@@ -864,20 +864,34 @@ uint32_t run_share_trial(ggml_cuda_kv_stream_share_tuner & tuner, const ggml_cud
     return tuner.arm(key);
 }
 
+struct share_graph_stats {
+    std::vector<uint64_t> pages;
+    std::vector<uint64_t> copy_commands;
+};
+
+template <typename F>
+share_graph_stats run_share_graphs_stats(
+        ggml_backend_t backend, ggml_backend_cuda_kv_stream_runtime_t runtime, observe_latency_fn_t observe,
+        const attention_inputs & inputs, int64_t n_kv, int64_t n_batch, size_t graphs, F ms) {
+    share_graph_stats stats;
+    for (size_t graph = 0; graph < graphs; ++graph) {
+        const auto before = ggml_backend_cuda_kv_stream_get_stats(runtime);
+        run_attention(backend, inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime), n_kv, n_batch);
+        const auto after = ggml_backend_cuda_kv_stream_get_stats(runtime);
+        stats.pages.push_back(after.cpu_pages - before.cpu_pages);
+        stats.copy_commands.push_back(after.host_to_device_copy_commands - before.host_to_device_copy_commands);
+        if (observe != nullptr) {
+            GGML_ASSERT(observe(runtime, ms(stats.pages.back())));
+        }
+    }
+    return stats;
+}
+
 template <typename F>
 std::vector<uint64_t> run_share_graphs(
         ggml_backend_t backend, ggml_backend_cuda_kv_stream_runtime_t runtime, observe_latency_fn_t observe,
         const attention_inputs & inputs, int64_t n_kv, int64_t n_batch, size_t graphs, F ms) {
-    std::vector<uint64_t> pages;
-    for (size_t graph = 0; graph < graphs; ++graph) {
-        const uint64_t before = ggml_backend_cuda_kv_stream_get_stats(runtime).cpu_pages;
-        run_attention(backend, inputs, ggml_backend_cuda_kv_stream_buffer_type(runtime), n_kv, n_batch);
-        pages.push_back(ggml_backend_cuda_kv_stream_get_stats(runtime).cpu_pages - before);
-        if (observe != nullptr) {
-            GGML_ASSERT(observe(runtime, ms(pages.back())));
-        }
-    }
-    return pages;
+    return run_share_graphs_stats(backend, runtime, observe, inputs, n_kv, n_batch, graphs, ms).pages;
 }
 
 std::string pages_text(const std::vector<uint64_t> & pages) {
@@ -1010,7 +1024,7 @@ int main() {
         ggml_cuda_kv_stream_share_tuner tuner;
         const ggml_cuda_kv_stream_share_key key = { 1, 8 };
         const uint32_t verdict = run_share_trial(tuner, key, [](uint32_t arm, uint32_t n) {
-            return arm != 2 ? 100.0 : n == 3 ? 450.0 : 90.0;
+            return arm != 2 ? 100.0 : n == 3 ? 450.0 : 95.0;
         });
         t.assert_true("trial decides", tuner.decided(key));
         t.assert_equal(2u, verdict);
@@ -1028,14 +1042,14 @@ int main() {
                 if (!t.assert_equal("narrow graph " + std::to_string(n), n % tuner_t::N_ARMS, arm)) {
                     break;
                 }
-                tuner.observe(narrow, arm, arm == 0 ? 10.0 : 12.0);
+                tuner.observe(narrow, arm, arm == 0 ? 10.0 : 10.5);
             }
             if (n >= 2) {
                 const uint32_t arm = tuner.arm(wide);
                 if (!t.assert_equal("wide graph " + std::to_string(n - 2), (n - 2) % tuner_t::N_ARMS, arm)) {
                     break;
                 }
-                tuner.observe(wide, arm, arm == 2 ? 10.0 : 12.0);
+                tuner.observe(wide, arm, arm == 2 ? 10.0 : 10.5);
             }
         }
         t.assert_true("both keys decide", tuner.decided(narrow) && tuner.decided(wide));
@@ -1057,7 +1071,7 @@ int main() {
         uint32_t samples = 0;
         const uint32_t verdict = run_share_trial(tuner, key, [&](uint32_t arm, uint32_t) {
             ++samples;
-            return arm == 1 ? 90.0 : 100.0;
+            return arm == 1 ? 95.0 : 100.0;
         });
         t.assert_equal("invalid samples do not count", tuner_t::N_ARMS*(1 + 8), samples);
         t.assert_equal(1u, verdict);
@@ -1068,6 +1082,77 @@ int main() {
         }
         t.assert_true("verdict stays decided", tuner.decided(key));
         t.assert_equal("later samples do not move the verdict", 1u, tuner.arm(key));
+    });
+
+    t.test("share tuner drops an arm that is clearly behind after two samples", [](testing & t) {
+        ggml_cuda_kv_stream_share_tuner tuner;
+        const ggml_cuda_kv_stream_share_key key = { 1, 8 };
+        const uint32_t verdict = run_share_trial(tuner, key, [](uint32_t arm, uint32_t) {
+            return arm == 1 ? 150.0 : 100.0;
+        });
+        t.assert_true("trial decides", tuner.decided(key));
+        t.assert_true("the slow arm is dropped", tuner.dropped(key, 1));
+        t.assert_true("the other arms stay",
+            !tuner.dropped(key, 0) && !tuner.dropped(key, 2) && !tuner.dropped(key, 3));
+        t.assert_equal("30 samples", 30u, tuner.samples(key));
+        t.assert_equal("no share beats 0 by the margin", 0u, verdict);
+    });
+
+    t.test("one slow sample does not drop an arm", [](testing & t) {
+        ggml_cuda_kv_stream_share_tuner tuner;
+        const ggml_cuda_kv_stream_share_key key = { 1, 8 };
+        run_share_trial(tuner, key, [](uint32_t arm, uint32_t n) {
+            return arm == 2 && n == 1 ? 450.0 : 100.0;
+        });
+        t.assert_true("trial decides", tuner.decided(key));
+        t.assert_equal("36 samples", 36u, tuner.samples(key));
+        t.assert_true("nothing is dropped",
+            !tuner.dropped(key, 0) && !tuner.dropped(key, 1) && !tuner.dropped(key, 2) && !tuner.dropped(key, 3));
+    });
+
+    t.test("arms inside the drop margin stay in the trial", [](testing & t) {
+        ggml_cuda_kv_stream_share_tuner tuner;
+        const ggml_cuda_kv_stream_share_key key = { 1, 8 };
+        const double ms[] = { 100.0, 105.0, 100.0, 108.0 };
+        const uint32_t verdict = run_share_trial(tuner, key, [&](uint32_t arm, uint32_t) { return ms[arm]; });
+        t.assert_true("trial decides", tuner.decided(key));
+        t.assert_equal("36 samples", 36u, tuner.samples(key));
+        t.assert_true("nothing is dropped",
+            !tuner.dropped(key, 0) && !tuner.dropped(key, 1) && !tuner.dropped(key, 2) && !tuner.dropped(key, 3));
+        t.assert_equal("equal arms keep no split", 0u, verdict);
+    });
+
+    t.test("a trial with one arm left decides at once", [](testing & t) {
+        struct case_t {
+            const char * name;
+            double ms[4];
+            uint32_t verdict;
+        };
+        const case_t cases[] = {
+            { "arm 0 is the fastest", { 100.0, 150.0, 150.0, 150.0 }, 0 },
+            { "arm 2 is the fastest", { 150.0, 150.0, 100.0, 150.0 }, 2 },
+        };
+        const ggml_cuda_kv_stream_share_key key = { 1, 8 };
+        for (const case_t & tc : cases) {
+            ggml_cuda_kv_stream_share_tuner tuner;
+            const uint32_t verdict = run_share_trial(tuner, key, [&](uint32_t arm, uint32_t) { return tc.ms[arm]; });
+            t.assert_true(std::string(tc.name) + " decides", tuner.decided(key));
+            t.assert_equal(std::string(tc.name) + ": 12 samples", 12u, tuner.samples(key));
+            t.assert_equal(std::string(tc.name) + ": verdict", tc.verdict, verdict);
+        }
+    });
+
+    t.test("a dropped share 0 is never the verdict", [](testing & t) {
+        ggml_cuda_kv_stream_share_tuner tuner;
+        const ggml_cuda_kv_stream_share_key key = { 1, 8 };
+        // share 0 is dropped at the probe, then the other arms slow past its two samples
+        const uint32_t verdict = run_share_trial(tuner, key, [](uint32_t arm, uint32_t n) {
+            return arm == 0 ? 150.0 : n < 3 ? 100.0 : 160.0;
+        });
+        t.assert_true("trial decides", tuner.decided(key));
+        t.assert_true("share 0 is dropped", tuner.dropped(key, 0));
+        t.assert_equal("30 samples", 30u, tuner.samples(key));
+        t.assert_equal("the lowest share within the margin of the best", 1u, verdict);
     });
 
     t.test("cpu page selection takes the highest immutable streamed pages", [](testing & t) {
@@ -3454,7 +3539,7 @@ int main() {
             log_capture log("selected cpu share");
             const std::vector<uint64_t> pages = run_share_graphs(
                 backend.get(), runtime.get(), observe_fn, inputs, n_kv, n_batch, expected.size(),
-                [&](uint64_t p) { return p == r.fastest ? 10.0 : 12.0; });
+                [&](uint64_t p) { return p == r.fastest ? 10.0 : 10.5; });
             const std::string name = r.name;
             t.assert_equal(name + ": cpu pages per graph", pages_text(expected), pages_text(pages));
             const auto lines = log.snapshot();
@@ -3462,6 +3547,62 @@ int main() {
             t.assert_true(name + ": the line names the share",
                 !lines.empty() && lines[0].find(r.verdict) != std::string::npos);
         }
+    });
+
+    t.test("an arm far behind leaves the share trial", [](testing & t) {
+        if (!ggml_cuda_kv_stream_cpu_attn_supported()) {
+            t.skip("CPU attention needs AVX-512 F, DQ, VNNI, F16C and FMA");
+            return;
+        }
+        constexpr int64_t n_kv = 41*256;
+        constexpr int64_t n_batch = 1;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+        const observe_latency_fn_t observe_fn = query_observe_latency_fn(backend.get());
+        if (!t.assert_true("observe latency proc address resolves", observe_fn != nullptr)) {
+            return;
+        }
+
+        auto runtime = make_runtime(make_stream_params(backend.get(), 40, 41, 1, 32));
+        if (!t.assert_true("runtime initializes", runtime != nullptr)) {
+            return;
+        }
+        t.assert_true("cpu split scratch allocates",
+            ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 2, N_Q_HEAD, 41, -1.0f));
+
+        const uint64_t default_pages =
+            uint64_t(std::llround(GGML_CUDA_KV_STREAM_CPU_DEFAULT_SHARE*40.0f));
+        const attention_inputs inputs = make_inputs(n_kv, n_batch, n_kv);
+
+        // three rotations, then share 0 is dropped and the three remaining arms take six more each
+        std::vector<uint64_t> expected = { default_pages };
+        for (uint32_t rotation = 0; rotation < 3; ++rotation) {
+            for (uint64_t pages : { uint64_t(0), uint64_t(8), uint64_t(16), uint64_t(24) }) {
+                expected.push_back(pages);
+            }
+        }
+        for (uint32_t rotation = 0; rotation < 6; ++rotation) {
+            for (uint64_t pages : { uint64_t(8), uint64_t(16), uint64_t(24) }) {
+                expected.push_back(pages);
+            }
+        }
+        expected.push_back(16);
+
+        log_capture log("selected cpu share");
+        const std::vector<uint64_t> pages = run_share_graphs(
+            backend.get(), runtime.get(), observe_fn, inputs, n_kv, n_batch, expected.size(),
+            [](uint64_t p) { return p == 0 ? 20.0 : p == 16 ? 10.0 : 10.5; });
+        t.assert_equal("cpu pages per graph", pages_text(expected), pages_text(pages));
+        const auto lines = log.snapshot();
+        t.assert_equal("one verdict line", size_t(1), lines.size());
+        t.assert_true("the verdict is share 0.4",
+            !lines.empty() && lines[0].find("cpu share 0.4") != std::string::npos);
+        t.assert_true("share 0 is marked dropped",
+            !lines.empty() && lines[0].find("median share 0 20.000 ms dropped") != std::string::npos);
+        t.assert_true("the line counts 30 samples",
+            !lines.empty() && lines[0].find("; 30 samples") != std::string::npos);
     });
 
     t.test("a pinned or diagnostic share does not rotate", [](testing & t) {
@@ -3555,7 +3696,7 @@ int main() {
         const attention_inputs inputs = make_inputs(n_kv, n_batch, n_kv);
         const auto graphs = [&](size_t n) {
             return pages_text(run_share_graphs(backend.get(), runtime.get(), observe_fn, inputs, n_kv, n_batch, n,
-                [](uint64_t p) { return p == 8 ? 10.0 : 12.0; }));
+                [](uint64_t p) { return p == 8 ? 10.0 : 10.5; }));
         };
 
         std::vector<uint64_t> expected = { default_pages };
@@ -3581,7 +3722,7 @@ int main() {
         t.assert_equal("a ring reconfigure keeps the verdict", std::string("8 8"), graphs(2));
     });
 
-    t.test("the span tuner's trial runs before the share tuner's, and a share verdict outlives a span re-trial", [](testing & t) {
+    t.test("the share trial runs first in fixed batches, then the span tuner trials at the verdict", [](testing & t) {
         if (!ggml_cuda_kv_stream_cpu_attn_supported()) {
             t.skip("CPU attention needs AVX-512 F, DQ, VNNI, F16C and FMA");
             return;
@@ -3607,21 +3748,213 @@ int main() {
         const uint64_t default_pages =
             uint64_t(std::llround(GGML_CUDA_KV_STREAM_CPU_DEFAULT_SHARE*40.0f));
         const attention_inputs inputs = make_inputs(n_kv, n_batch, n_kv);
-        const auto graphs = [&](size_t n) {
-            return pages_text(run_share_graphs(backend.get(), runtime.get(), observe_fn, inputs, n_kv, n_batch, n,
-                [](uint64_t p) { return p == 8 ? 10.0 : 12.0; }));
-        };
+        const auto ms = [](uint64_t p) { return p == 8 ? 10.0 : 10.5; };
 
-        // the span tuner keeps one warm-up and 16 samples per copy batch mode
-        std::vector<uint64_t> expected(34, default_pages);
+        std::vector<uint64_t> expected = { default_pages };
         const std::vector<uint64_t> trial = share_trial_pages();
         expected.insert(expected.end(), trial.begin(), trial.end());
-        expected.push_back(8);
-        t.assert_equal("the share trial follows the span trial", pages_text(expected), graphs(expected.size()));
+        expected.insert(expected.end(), 32, uint64_t(8));
 
-        // the span tuner trials again
-        t.assert_true("decode layout changes", ggml_backend_cuda_kv_stream_reconfigure(runtime.get(), 41, 40));
-        t.assert_equal("the verdict holds through the span trial", std::string("8 8"), graphs(2));
+        log_capture log("selected");
+        const auto first = run_share_graphs_stats(
+            backend.get(), runtime.get(), observe_fn, inputs, n_kv, n_batch, 69, ms);
+        t.assert_equal("cpu pages per graph", pages_text(expected), pages_text(first.pages));
+        for (size_t graph = 1; graph <= 36; graph += 4) {
+            t.assert_equal("a share 0 trial graph runs fixed copy batches",
+                uint64_t(8), first.copy_commands[graph]);
+        }
+        t.assert_equal("only the share verdict is logged so far", size_t(1), log.snapshot().size());
+        t.assert_true("the verdict line names the share",
+            !log.snapshot().empty() && log.snapshot()[0].find("cpu share 0.2") != std::string::npos);
+
+        const auto before_selection = run_share_graphs_stats(
+            backend.get(), runtime.get(), observe_fn, inputs, n_kv, n_batch, 1, ms);
+        t.assert_equal("the span trial is not over yet", uint64_t(8), before_selection.pages[0]);
+        t.assert_equal("the span selection waits for its last sample", size_t(1), log.snapshot().size());
+
+        const auto at_selection = run_share_graphs_stats(
+            backend.get(), runtime.get(), observe_fn, inputs, n_kv, n_batch, 1, ms);
+        t.assert_equal("later graphs keep the verdict", uint64_t(8), at_selection.pages[0]);
+        const auto lines = log.snapshot();
+        t.assert_equal("the share verdict and the span selection", size_t(2), lines.size());
+        t.assert_true("the share verdict comes first",
+            !lines.empty() && lines[0].find("cpu share 0.2") != std::string::npos);
+        t.assert_true("the span tuner then trials at the verdict's share",
+            lines.size() == 2 && lines[1].find("selected fixed decode copy batches") != std::string::npos);
+        t.assert_true("the span trial saw only the verdict's share",
+            lines.size() == 2 &&
+            lines[1].find("fixed 32-page 10.000 ms") != std::string::npos &&
+            lines[1].find("greedy 40-page 10.000 ms") != std::string::npos);
+
+        t.assert_true("reconfigure changes the ring and the layout",
+            ggml_backend_cuda_kv_stream_reconfigure(runtime.get(), 41, 40));
+        t.assert_equal("the verdict holds through the span re-trial", std::string("8 8"),
+            pages_text(run_share_graphs(
+                backend.get(), runtime.get(), observe_fn, inputs, n_kv, n_batch, 2, ms)));
+    });
+
+    t.test("a new key trials in fixed batches after the span tuner chose greedy", [](testing & t) {
+        if (!ggml_cuda_kv_stream_cpu_attn_supported()) {
+            t.skip("CPU attention needs AVX-512 F, DQ, VNNI, F16C and FMA");
+            return;
+        }
+        constexpr int64_t n_kv = 41*256;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+        const observe_latency_fn_t observe_fn = query_observe_latency_fn(backend.get());
+        if (!t.assert_true("observe latency proc address resolves", observe_fn != nullptr)) {
+            return;
+        }
+
+        auto runtime = make_runtime(make_stream_params(backend.get(), 40, 41, 1, 0));
+        if (!t.assert_true("runtime initializes", runtime != nullptr)) {
+            return;
+        }
+        t.assert_true("cpu split scratch allocates",
+            ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 2, N_Q_HEAD, 41, -1.0f));
+
+        const uint64_t default_pages =
+            uint64_t(std::llround(GGML_CUDA_KV_STREAM_CPU_DEFAULT_SHARE*40.0f));
+        const attention_inputs one = make_inputs(n_kv, 1, n_kv);
+        const attention_inputs two = make_inputs(n_kv, 2, n_kv);
+        size_t graph_index = 0;
+        const auto ms = [&](uint64_t p) {
+            const size_t graph = graph_index++;
+            if (graph == 0) return 12.0;                  // default share, span fixed warm-up
+            if (graph <= 36) return p == 0 ? 10.0 : 10.5; // the 1-token share trial
+            if (graph <= 53) return 12.0;                 // span fixed block
+            if (graph <= 70) return 10.0;                 // span greedy block
+            if (graph <= 107) return p == 0 ? 10.0 : 10.5; // the 2-token share trial
+            if (graph <= 124) return 12.0;                // span fixed block
+            return 10.0;                                  // span greedy block
+        };
+
+        log_capture log("selected");
+        std::vector<uint64_t> expected = { default_pages };
+        const std::vector<uint64_t> trial = share_trial_pages();
+        expected.insert(expected.end(), trial.begin(), trial.end());
+        const auto settled = run_share_graphs_stats(
+            backend.get(), runtime.get(), observe_fn, one, n_kv, 1, 37, ms);
+        t.assert_equal("the 1-token share trial", pages_text(expected), pages_text(settled.pages));
+
+        // the span tuner trials at share 0, and the greedy block is faster
+        const auto span = run_share_graphs_stats(
+            backend.get(), runtime.get(), observe_fn, one, n_kv, 1, 34, ms);
+        t.assert_equal("the span trial keeps the verdict", pages_text(std::vector<uint64_t>(34, 0)),
+            pages_text(span.pages));
+        const auto selected = log.snapshot();
+        t.assert_equal("the share verdict and the span selection", size_t(2), selected.size());
+        t.assert_true("the span tuner chooses greedy",
+            selected.size() == 2 &&
+            selected[1].find("selected greedy decode copy batches") != std::string::npos);
+
+        // a decided 1-token graph runs the greedy batches the span tuner chose
+        const auto greedy = run_share_graphs_stats(
+            backend.get(), runtime.get(), observe_fn, one, n_kv, 1, 1, ms);
+        t.assert_equal("a 1-token graph runs greedy batches", uint64_t(6), greedy.copy_commands[0]);
+
+        // the 2-token key is new: its trial runs in fixed batches, whatever the span tuner chose
+        const auto fresh = run_share_graphs_stats(
+            backend.get(), runtime.get(), observe_fn, two, n_kv, 2, 1, ms);
+        t.assert_equal("the 2-token trial starts at no split", uint64_t(0), fresh.pages[0]);
+        t.assert_equal("a new key trials in fixed batches", uint64_t(8), fresh.copy_commands[0]);
+
+        const auto rest = run_share_graphs_stats(
+            backend.get(), runtime.get(), observe_fn, two, n_kv, 2, 35, ms);
+        t.assert_equal("the 2-token share trial", pages_text(std::vector<uint64_t>(trial.begin() + 1, trial.end())),
+            pages_text(rest.pages));
+        const auto decided = log.snapshot();
+        t.assert_equal("the second share verdict", size_t(3), decided.size());
+        t.assert_true("the second verdict line names the share",
+            decided.size() == 3 && decided[2].find("cpu share 0.0") != std::string::npos);
+
+        // the second verdict re-trials the span tuner
+        const auto again = run_share_graphs_stats(
+            backend.get(), runtime.get(), observe_fn, two, n_kv, 2, 34, ms);
+        t.assert_equal("the 2-token graphs keep the verdict", pages_text(std::vector<uint64_t>(34, 0)),
+            pages_text(again.pages));
+        const auto lines = log.snapshot();
+        t.assert_equal("the second span selection", size_t(4), lines.size());
+        t.assert_true("the second span line chooses greedy",
+            lines.size() == 4 && lines[3].find("selected greedy decode copy batches") != std::string::npos);
+    });
+
+    t.test("a trial graph feeds no sample to the span tuner", [](testing & t) {
+        if (!ggml_cuda_kv_stream_cpu_attn_supported()) {
+            t.skip("CPU attention needs AVX-512 F, DQ, VNNI, F16C and FMA");
+            return;
+        }
+        constexpr int64_t n_kv = 41*256;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+        const observe_latency_fn_t observe_fn = query_observe_latency_fn(backend.get());
+        if (!t.assert_true("observe latency proc address resolves", observe_fn != nullptr)) {
+            return;
+        }
+
+        auto runtime = make_runtime(make_stream_params(backend.get(), 40, 41, 1, 0));
+        if (!t.assert_true("runtime initializes", runtime != nullptr)) {
+            return;
+        }
+        t.assert_true("cpu split scratch allocates",
+            ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 2, N_Q_HEAD, 41, -1.0f));
+
+        const uint64_t default_pages =
+            uint64_t(std::llround(GGML_CUDA_KV_STREAM_CPU_DEFAULT_SHARE*40.0f));
+        const attention_inputs one = make_inputs(n_kv, 1, n_kv);
+        const attention_inputs two = make_inputs(n_kv, 2, n_kv);
+        size_t graph_index = 0;
+        size_t one_token_samples = 0;
+        const auto ms = [&](uint64_t p) {
+            const size_t graph = graph_index++;
+            if (graph == 0) return 12.0;                  // span fixed warm-up
+            if (graph <= 36) return p == 0 ? 10.0 : 10.5; // the 1-token share trial
+            if (((graph - 37) % 2) == 0) {                // a decided 1-token graph
+                return ++one_token_samples <= 17 ? 12.0 : 10.0;
+            }
+            return 8.0;                                   // a 2-token trial graph
+        };
+
+        log_capture log("selected");
+        std::vector<uint64_t> expected = { default_pages };
+        const std::vector<uint64_t> trial = share_trial_pages();
+        expected.insert(expected.end(), trial.begin(), trial.end());
+        const auto settled = run_share_graphs_stats(
+            backend.get(), runtime.get(), observe_fn, one, n_kv, 1, 37, ms);
+        t.assert_equal("the 1-token share trial", pages_text(expected), pages_text(settled.pages));
+        t.assert_equal("the verdict is logged once", size_t(1), log.snapshot().size());
+
+        // a new 2-token key trials in the middle of the span trial
+        std::vector<uint64_t> trial_pages;
+        for (size_t position = 0; position < 66; ++position) {
+            const bool one_token = (position % 2) == 0;
+            const auto run = run_share_graphs_stats(backend.get(), runtime.get(), observe_fn,
+                one_token ? one : two, n_kv, one_token ? 1 : 2, 1, ms);
+            if (!one_token) {
+                trial_pages.push_back(run.pages[0]);
+            }
+        }
+        t.assert_equal("the 2-token trial rotates its arms",
+            pages_text(std::vector<uint64_t>(trial.begin(), trial.begin() + 33)), pages_text(trial_pages));
+        t.assert_equal("the span tuner has not selected", size_t(1), log.snapshot().size());
+
+        const auto last_one = run_share_graphs_stats(
+            backend.get(), runtime.get(), observe_fn, one, n_kv, 1, 1, ms);
+        const auto last_two = run_share_graphs_stats(
+            backend.get(), runtime.get(), observe_fn, two, n_kv, 2, 1, ms);
+        t.assert_equal("the decided graph keeps the verdict", uint64_t(0), last_one.pages[0]);
+        t.assert_equal("the 2-token trial keeps rotating", trial[33], last_two.pages[0]);
+        const auto lines = log.snapshot();
+        t.assert_equal("the share verdict and the span selection", size_t(2), lines.size());
+        t.assert_true("the span selection saw no trial sample",
+            lines.size() == 2 &&
+            lines[1].find("selected greedy decode copy batches") != std::string::npos &&
+            lines[1].find("fixed 32-page 12.000 ms") != std::string::npos &&
+            lines[1].find("greedy 40-page 10.000 ms") != std::string::npos);
     });
 
     t.test("each decode width and page bucket keeps its own share verdict", [](testing & t) {
@@ -3652,7 +3985,7 @@ int main() {
         const attention_inputs two = make_inputs(n_kv, 2, n_kv);
         const auto graphs = [&](const attention_inputs & inputs, int64_t n_batch, size_t n) {
             return pages_text(run_share_graphs(backend.get(), runtime.get(), observe_fn, inputs, n_kv, n_batch, n,
-                [](uint64_t p) { return p == 8 ? 10.0 : 12.0; }));
+                [](uint64_t p) { return p == 8 ? 10.0 : 10.5; }));
         };
 
         std::vector<uint64_t> expected = { default_pages };

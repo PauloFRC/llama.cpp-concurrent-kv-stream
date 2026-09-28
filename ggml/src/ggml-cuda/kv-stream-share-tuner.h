@@ -99,8 +99,6 @@ public:
         return it == table_.end() || arm >= N_ARMS ? 0.0 : median(it->second.kept[arm]);
     }
 
-    void reset() { table_.clear(); }
-
 private:
     struct entry {
         std::array<std::vector<double>, N_ARMS> kept;

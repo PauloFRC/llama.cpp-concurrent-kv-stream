@@ -646,7 +646,6 @@ bool ggml_cuda_kv_stream_transfer_ring_set_active_slots(
     }
     if (ring->active_slots != stage_slots) {
         ring->span_tuner.reset();
-        ring->share_tuner.reset();
         ring->timing_pending = false;
         ring->timing_current = false;
     }
@@ -720,13 +719,6 @@ void ggml_cuda_kv_stream_transfer_ring_reset_span_tuner(
         ring->span_tuner.reset();
         ring->timing_pending = false;
         ring->timing_current = false;
-    }
-}
-
-void ggml_cuda_kv_stream_transfer_ring_reset_share_tuner(
-        ggml_cuda_kv_stream_transfer_ring * ring) {
-    if (ring != nullptr) {
-        ring->share_tuner.reset();
     }
 }
 

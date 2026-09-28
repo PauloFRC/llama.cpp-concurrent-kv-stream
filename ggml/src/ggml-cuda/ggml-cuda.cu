@@ -1703,7 +1703,6 @@ bool ggml_backend_cuda_kv_stream_reconfigure(
     if (layout_changed && !ring_changed) {
         ggml_cuda_kv_stream_transfer_ring_reset_span_tuner(runtime->transfer_ring);
     }
-    ggml_cuda_kv_stream_transfer_ring_reset_share_tuner(runtime->transfer_ring);
 
     runtime->stage_slots = stage_slots;
     runtime->dirty_rows.clear();

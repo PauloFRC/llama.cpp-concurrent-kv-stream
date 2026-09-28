@@ -1068,10 +1068,6 @@ int main() {
         }
         t.assert_true("verdict stays decided", tuner.decided(key));
         t.assert_equal("later samples do not move the verdict", 1u, tuner.arm(key));
-
-        tuner.reset();
-        t.assert_true("reset clears the verdict", !tuner.decided(key));
-        t.assert_equal("reset restarts the rotation", 0u, tuner.arm(key));
     });
 
     t.test("cpu page selection takes the highest immutable streamed pages", [](testing & t) {
@@ -3531,7 +3527,7 @@ int main() {
         }
     });
 
-    t.test("repartition and reconfigure restart the share trial, a decode layout change does not", [](testing & t) {
+    t.test("a share verdict survives decode layout and slot changes", [](testing & t) {
         if (!ggml_cuda_kv_stream_cpu_attn_supported()) {
             t.skip("CPU attention needs AVX-512 F, DQ, VNNI, F16C and FMA");
             return;
@@ -3571,13 +3567,18 @@ int main() {
         t.assert_true("decode layout changes", ggml_backend_cuda_kv_stream_set_decode_layout(runtime.get(), 41));
         t.assert_equal("a decode layout change keeps the verdict", std::string("8 8"), graphs(2));
 
+        t.assert_true("reconfigure changes the decode layout",
+            ggml_backend_cuda_kv_stream_reconfigure(runtime.get(), 30, 40));
+        t.assert_equal("a layout-only reconfigure keeps the verdict", std::string("8 8"), graphs(2));
+
         // 39 streamed pages from here
         t.assert_true("ring repartitions", ggml_backend_cuda_kv_stream_repartition(runtime.get(), 39));
-        t.assert_equal("repartition restarts the rotation", std::string("0 8"), graphs(2));
+        t.assert_equal("repartition keeps the verdict", std::string("8 8"), graphs(2));
 
-        t.assert_true("reconfigure changes the decode layout",
-            ggml_backend_cuda_kv_stream_reconfigure(runtime.get(), 30, 39));
-        t.assert_equal("reconfigure restarts the rotation", std::string("0"), graphs(1));
+        // 38 streamed pages from here
+        t.assert_true("reconfigure changes the ring and the layout",
+            ggml_backend_cuda_kv_stream_reconfigure(runtime.get(), 41, 38));
+        t.assert_equal("a ring reconfigure keeps the verdict", std::string("8 8"), graphs(2));
     });
 
     t.test("the span tuner's trial runs before the share tuner's, and a share verdict outlives a span re-trial", [](testing & t) {
@@ -3619,7 +3620,7 @@ int main() {
         t.assert_equal("the share trial follows the span trial", pages_text(expected), graphs(expected.size()));
 
         // the span tuner trials again
-        t.assert_true("decode layout changes", ggml_backend_cuda_kv_stream_set_decode_layout(runtime.get(), 41));
+        t.assert_true("decode layout changes", ggml_backend_cuda_kv_stream_reconfigure(runtime.get(), 41, 40));
         t.assert_equal("the verdict holds through the span trial", std::string("8 8"), graphs(2));
     });
 

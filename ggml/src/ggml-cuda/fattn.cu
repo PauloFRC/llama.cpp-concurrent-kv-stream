@@ -9,6 +9,7 @@
 #include "kv-stream-cpu-pages.h"
 #include "kv-stream-cpu-pool.h"
 #include "kv-stream-geometry.h"
+#include "kv-stream-share-tuner.h"
 #include "kv-stream-span-tuner.h"
 
 #include <algorithm>
@@ -476,6 +477,10 @@ struct ggml_cuda_kv_stream_transfer_ring {
     bool graph_active = false;
     bool graph_decode = true;
     ggml_cuda_kv_stream_span_tuner span_tuner;
+    ggml_cuda_kv_stream_share_tuner share_tuner;
+    bool feedback_seen = false;
+    ggml_cuda_kv_stream_share_key graph_share_key = {};
+    uint32_t graph_share_arm = ggml_cuda_kv_stream_share_tuner::N_ARMS; // N_ARMS: no key
     uint32_t graph_layer_count = 0;
     uint32_t current_layer = KV_STREAM_NO_LAYER;
     size_t next_request = 0;
@@ -506,6 +511,8 @@ struct ggml_cuda_kv_stream_transfer_ring {
     bool timing_current = false;
     bool last_graph_decode = false;
     bool last_graph_copy_batch_greedy = false;
+    ggml_cuda_kv_stream_share_key last_graph_share_key = {};
+    uint32_t last_graph_share_arm = ggml_cuda_kv_stream_share_tuner::N_ARMS;
     bool last_graph_streamed = false;
     bool copy_sample_recorded = false;
 };
@@ -639,6 +646,7 @@ bool ggml_cuda_kv_stream_transfer_ring_set_active_slots(
     }
     if (ring->active_slots != stage_slots) {
         ring->span_tuner.reset();
+        ring->share_tuner.reset();
         ring->timing_pending = false;
         ring->timing_current = false;
     }
@@ -715,25 +723,46 @@ void ggml_cuda_kv_stream_transfer_ring_reset_span_tuner(
     }
 }
 
+void ggml_cuda_kv_stream_transfer_ring_reset_share_tuner(
+        ggml_cuda_kv_stream_transfer_ring * ring) {
+    if (ring != nullptr) {
+        ring->share_tuner.reset();
+    }
+}
+
 bool ggml_cuda_kv_stream_transfer_ring_observe_decode_latency(
         ggml_cuda_kv_stream_transfer_ring * ring, double elapsed_ms) {
     if (ring == nullptr) {
         return false;
     }
-    if (ring->forced_decode_span_pages != 0) {
-        return true;
+    if (ring->forced_decode_span_pages == 0) {
+        const bool was_selected = ring->span_tuner.selected();
+        ring->span_tuner.observe(
+            elapsed_ms, ring->last_graph_decode && ring->last_graph_streamed,
+            ring->last_graph_copy_batch_greedy);
+        if (!was_selected && ring->span_tuner.selected()) {
+            GGML_LOG_WARN(
+                "%s: selected %s decode copy batches from end-to-end latency "
+                "(fixed %u-page %.3f ms, greedy %u-page %.3f ms)\n",
+                __func__, ring->span_tuner.use_greedy_batch() ? "greedy" : "fixed",
+                KV_STREAM_COPY_BATCH_PAGES, ring->span_tuner.fixed_average_ms(),
+                ring->active_slots, ring->span_tuner.greedy_average_ms());
+        }
     }
-    const bool was_selected = ring->span_tuner.selected();
-    ring->span_tuner.observe(
-        elapsed_ms, ring->last_graph_decode && ring->last_graph_streamed,
-        ring->last_graph_copy_batch_greedy);
-    if (!was_selected && ring->span_tuner.selected()) {
-        GGML_LOG_WARN(
-            "%s: selected %s decode copy batches from end-to-end latency "
-            "(fixed %u-page %.3f ms, greedy %u-page %.3f ms)\n",
-            __func__, ring->span_tuner.use_greedy_batch() ? "greedy" : "fixed",
-            KV_STREAM_COPY_BATCH_PAGES, ring->span_tuner.fixed_average_ms(),
-            ring->active_slots, ring->span_tuner.greedy_average_ms());
+    ring->feedback_seen = true;
+    if (ring->last_graph_share_arm < ggml_cuda_kv_stream_share_tuner::N_ARMS) {
+        const ggml_cuda_kv_stream_share_key key = ring->last_graph_share_key;
+        const bool was_decided = ring->share_tuner.decided(key);
+        ring->share_tuner.observe(key, ring->last_graph_share_arm, elapsed_ms);
+        if (!was_decided && ring->share_tuner.decided(key)) {
+            auto & tuner = ring->share_tuner;
+            GGML_LOG_WARN(
+                "%s: selected cpu share %.1f for %u-token decodes at %u-%llu streamed pages from end-to-end latency "
+                "(median share 0 %.3f ms, 0.2 %.3f ms, 0.4 %.3f ms, 0.6 %.3f ms)\n",
+                __func__, ggml_cuda_kv_stream_share_tuner::SHARES[tuner.arm(key)],
+                key.width, 1u << key.bucket, (2ull << key.bucket) - 1,
+                tuner.median_ms(key, 0), tuner.median_ms(key, 1), tuner.median_ms(key, 2), tuner.median_ms(key, 3));
+        }
     }
     return true;
 }
@@ -1977,6 +2006,18 @@ static void kv_stream_graph_release(
     --ring->current_occupancy;
 }
 
+static void kv_stream_pick_share(
+        ggml_cuda_kv_stream_transfer_ring * ring, kv_stream_cpu_knobs & knobs, uint32_t width, uint32_t streamed) {
+    knobs.auto_share = false;
+    const ggml_cuda_kv_stream_share_key key = { width, ggml_cuda_kv_stream_share_tuner::bucket(streamed) };
+    const bool span_settled = ring->forced_decode_span_pages != 0 || ring->span_tuner.selected();
+    if ((span_settled && ring->feedback_seen) || ring->share_tuner.decided(key)) {
+        ring->graph_share_key = key;
+        ring->graph_share_arm = ring->share_tuner.arm(key);
+        knobs.share = ggml_cuda_kv_stream_share_tuner::SHARES[ring->graph_share_arm];
+    }
+}
+
 } // namespace
 
 void ggml_cuda_kv_stream_graph_begin(ggml_cuda_kv_stream_transfer_ring * ring) {
@@ -1989,6 +2030,7 @@ void ggml_cuda_kv_stream_graph_begin(ggml_cuda_kv_stream_transfer_ring * ring) {
     ring->graph_copy_batch_greedy = ring->span_tuner.use_greedy_batch();
     ring->graph_copy_batch_pages = ring->graph_copy_batch_greedy ?
         ring->active_slots : KV_STREAM_COPY_BATCH_PAGES;
+    ring->graph_share_arm = ggml_cuda_kv_stream_share_tuner::N_ARMS;
     if (ring->cpu_split != nullptr) {
         kv_stream_cpu_split & split = *ring->cpu_split;
         GGML_ASSERT(ggml_cuda_kv_stream_cpu_pool_idle(ring) && "cpu pool busy between graphs");
@@ -2093,10 +2135,13 @@ bool ggml_cuda_kv_stream_graph_add_attention(
             ring->cpu_split->warn_block(block);
         } else {
             n_cpu = cpu_graph->knobs.pages_per_layer;
-            if (n_cpu == 0 && cpu_graph->knobs.share > 0.0f) {
+            if (n_cpu == 0 && (cpu_graph->knobs.share > 0.0f || cpu_graph->knobs.auto_share)) {
                 uint32_t streamed = 0;
                 for (uint32_t page = resident_pages; page < uint32_t(nchunks); ++page) {
                     streamed += page_state.live(page);
+                }
+                if (cpu_graph->knobs.auto_share && streamed > 0) {
+                    kv_stream_pick_share(ring, cpu_graph->knobs, uint32_t(dst->src[0]->ne[1]), streamed);
                 }
                 n_cpu = uint32_t(std::lround(cpu_graph->knobs.share*float(streamed)));
             }
@@ -2150,6 +2195,8 @@ void ggml_cuda_kv_stream_graph_finalize(
     GGML_ASSERT(ring != nullptr);
     ring->last_graph_decode = ring->graph_decode;
     ring->last_graph_copy_batch_greedy = ring->graph_copy_batch_greedy;
+    ring->last_graph_share_key = ring->graph_share_key;
+    ring->last_graph_share_arm = ring->graph_share_arm;
     ring->last_graph_streamed = !ring->graph_requests.empty();
     if (ring->graph_requests.empty()) {
         ring->timing_current = false;

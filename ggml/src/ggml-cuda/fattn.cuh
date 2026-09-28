@@ -85,6 +85,7 @@ void ggml_cuda_kv_stream_transfer_ring_set_live_pages(
 bool ggml_cuda_kv_stream_transfer_ring_set_cpu_split(
     ggml_cuda_kv_stream_transfer_ring * ring, uint32_t n_threads, uint32_t n_head, uint32_t context_pages, float share);
 void ggml_cuda_kv_stream_transfer_ring_reset_span_tuner(ggml_cuda_kv_stream_transfer_ring * ring);
+void ggml_cuda_kv_stream_transfer_ring_reset_share_tuner(ggml_cuda_kv_stream_transfer_ring * ring);
 bool ggml_cuda_kv_stream_transfer_ring_observe_decode_latency(
     ggml_cuda_kv_stream_transfer_ring * ring, double elapsed_ms);
 ggml_cuda_kv_stream_transfer_stats ggml_cuda_kv_stream_transfer_ring_get_stats(

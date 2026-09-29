@@ -1469,23 +1469,24 @@ static void * ggml_backend_cuda_kv_stream_buffer_base(ggml_backend_buffer_t buff
     return context->host_data;
 }
 
+static void ggml_backend_cuda_kv_stream_runtime_invalidate(ggml_backend_cuda_kv_stream_runtime_t runtime) {
+    GGML_ASSERT(ggml_cuda_kv_stream_cpu_pool_idle(runtime->transfer_ring) &&
+        "cpu pool busy while the arena is rewritten");
+    ggml_cuda_kv_stream_resident_cache_reset(runtime->resident_cache);
+    ++runtime->generation;
+}
+
 static void ggml_backend_cuda_kv_stream_buffer_memset(
         ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     auto * context = static_cast<ggml_backend_cuda_kv_stream_buffer_context *>(buffer->context);
-    GGML_ASSERT(ggml_cuda_kv_stream_cpu_pool_idle(context->runtime->transfer_ring) &&
-        "cpu pool busy while the arena is rewritten");
-    ggml_cuda_kv_stream_resident_cache_reset(context->runtime->resident_cache);
-    ++context->runtime->generation;
+    ggml_backend_cuda_kv_stream_runtime_invalidate(context->runtime);
     memset(static_cast<char *>(tensor->data) + offset, value, size);
 }
 
 static void ggml_backend_cuda_kv_stream_buffer_set(
         ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     auto * context = static_cast<ggml_backend_cuda_kv_stream_buffer_context *>(buffer->context);
-    GGML_ASSERT(ggml_cuda_kv_stream_cpu_pool_idle(context->runtime->transfer_ring) &&
-        "cpu pool busy while the arena is rewritten");
-    ggml_cuda_kv_stream_resident_cache_reset(context->runtime->resident_cache);
-    ++context->runtime->generation;
+    ggml_backend_cuda_kv_stream_runtime_invalidate(context->runtime);
     memcpy(static_cast<char *>(tensor->data) + offset, data, size);
 }
 
@@ -1497,10 +1498,7 @@ static void ggml_backend_cuda_kv_stream_buffer_get(
 
 static void ggml_backend_cuda_kv_stream_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     auto * context = static_cast<ggml_backend_cuda_kv_stream_buffer_context *>(buffer->context);
-    GGML_ASSERT(ggml_cuda_kv_stream_cpu_pool_idle(context->runtime->transfer_ring) &&
-        "cpu pool busy while the arena is rewritten");
-    ggml_cuda_kv_stream_resident_cache_reset(context->runtime->resident_cache);
-    ++context->runtime->generation;
+    ggml_backend_cuda_kv_stream_runtime_invalidate(context->runtime);
     memset(context->host_data, value, buffer->size);
 }
 
@@ -6692,6 +6690,14 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
         return (void *) +[](void * runtime, const int64_t * rows, size_t count) -> bool {
             return ggml_backend_cuda_kv_stream_mark_dirty_rows(
                 static_cast<ggml_backend_cuda_kv_stream_runtime_t>(runtime), rows, count);
+        };
+    }
+    if (strcmp(name, "ggml_backend_cuda_kv_stream_invalidate") == 0) {
+        return (void *) +[](void * runtime) {
+            if (runtime != nullptr) {
+                ggml_backend_cuda_kv_stream_runtime_invalidate(
+                    static_cast<ggml_backend_cuda_kv_stream_runtime_t>(runtime));
+            }
         };
     }
     if (strcmp(name, "ggml_backend_cuda_kv_stream_set_live_pages") == 0) {

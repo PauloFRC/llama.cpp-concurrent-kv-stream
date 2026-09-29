@@ -21,6 +21,7 @@
 #include <cstring>
 #include <cstdint>
 #include <cfloat>
+#include <functional>
 #include <mutex>
 #include <random>
 #include <stdexcept>
@@ -281,6 +282,14 @@ observe_latency_fn_t query_observe_latency_fn(ggml_backend_t backend) {
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
     return reinterpret_cast<observe_latency_fn_t>(
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_kv_stream_observe_decode_latency"));
+}
+
+using invalidate_fn_t = void (*)(void *);
+
+invalidate_fn_t query_invalidate_fn(ggml_backend_t backend) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+    return reinterpret_cast<invalidate_fn_t>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_kv_stream_invalidate"));
 }
 
 size_t query_conversion_bytes(ggml_backend_t backend, ggml_type type_k, ggml_type type_v) {
@@ -557,7 +566,8 @@ std::vector<float> run_attention(
         bool change_indices = false,
         bool replace_cache = false,
         uint64_t graph_uid = 0,
-        const int64_t * custom_rows = nullptr) {
+        const int64_t * custom_rows = nullptr,
+        const std::function<void(ggml_tensor *)> & before_repeat = {}) {
     constexpr size_t N_TENSORS = 32;
     const size_t context_bytes = ggml_tensor_overhead()*N_TENSORS + ggml_graph_overhead_custom(N_TENSORS, false);
 
@@ -658,6 +668,9 @@ std::vector<float> run_attention(
     }
     GGML_ASSERT(ggml_backend_supports_op(backend, out));
     for (int repeat = 0; repeat < repeats; ++repeat) {
+        if (repeat > 0 && before_repeat) {
+            before_repeat(k_storage);
+        }
         if (replace_cache && repeat == 3) {
             std::vector<uint8_t> zero_k(inputs.k.size(), 0);
             std::vector<uint8_t> zero_v(inputs.v.size(), 0);
@@ -2642,6 +2655,43 @@ int main() {
         t.assert_equal(uint64_t(2), stats.resident_misses);
         t.assert_equal(expected.size(), actual.size());
         t.assert_true("reloaded resident output is bit-identical", expected == actual);
+    });
+
+    t.test("resident pages reload after the arena changes behind the buffer hooks", [](testing & t) {
+        constexpr int64_t n_kv = 512;
+        constexpr int64_t n_batch = 1;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+        const invalidate_fn_t invalidate_fn = query_invalidate_fn(backend.get());
+        if (!t.assert_true("invalidate proc address resolves", invalidate_fn != nullptr)) {
+            return;
+        }
+
+        const attention_inputs before = make_inputs(n_kv, n_batch, n_kv);
+        attention_inputs after = before;
+        after.k = make_inputs(n_kv, n_batch, n_kv, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 1.0f).k;
+        const std::vector<float> expected = run_attention(
+            backend.get(), after, ggml_backend_get_default_buffer_type(backend.get()),
+            n_kv, n_batch, 2, 1, false, GGML_TYPE_I64, false, nullptr, false, false, 1);
+
+        // two resident pages hold the whole context
+        auto runtime = make_runtime(make_stream_params(backend.get(), 1, 3, 1));
+        if (!t.assert_true("resident runtime initializes", runtime != nullptr)) {
+            return;
+        }
+        const std::vector<float> actual = run_attention(
+            backend.get(), before, ggml_backend_cuda_kv_stream_buffer_type(runtime.get()),
+            n_kv, n_batch, 2, 1, false, GGML_TYPE_I64, false, runtime.get(), false, false, 1, nullptr,
+            [&](ggml_tensor * k_storage) {
+                // the K-shift runs on the CPU backend and writes the arena directly
+                memcpy(k_storage->data, after.k.data(), after.k.size());
+                invalidate_fn(runtime.get());
+            });
+
+        t.assert_equal(expected.size(), actual.size());
+        t.assert_true("attention reads the rewritten K", expected == actual);
     });
 
     t.test("decode batches contiguous streamed pages without changing logits", [](testing & t) {

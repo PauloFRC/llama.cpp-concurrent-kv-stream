@@ -30,6 +30,7 @@ UVM_ENV_NAMES = (
     "GGML_CUDA_KV_ACCESSED_BY_GPU",
 )
 KV_STREAM_ENV_PREFIXES = ("GGML_CUDA_KV_STREAM_", "LLAMA_ARG_KV_STREAM_")
+BENCHMARK_VERSION = 2  # 1 pre-scrub, 2 scrubs the server environment
 
 KV_STREAM_TRACE_RE = re.compile(
     r"kv_stream_adapt: active (\d+), resident (\d+), ring (\d+), "
@@ -580,6 +581,18 @@ def resume_signature(args: argparse.Namespace, capacities: list[int]) -> dict:
 def validate_resume(metadata: dict | None, signature: dict, path: Path) -> None:
     if metadata is None:
         raise SystemExit(f"existing result file has no metadata record: {path}")
+    stored_version = metadata.get("benchmark_version")
+    if stored_version != BENCHMARK_VERSION:
+        if stored_version in (None, 1):
+            reason = "the file predates server-environment scrubbing; re-measure it or migrate"
+        elif stored_version == 2:
+            reason = "version 2 used the removed server_env signature while version 3 records kv_stream_cpu_cpus; re-measure it or migrate"
+        else:
+            reason = "the metadata schemas are incompatible"
+        raise SystemExit(
+            f"cannot resume {path}: it was written by benchmark version {stored_version!r}, "
+            f"this harness writes {BENCHMARK_VERSION!r}; {reason}"
+        )
     mismatches = [
         key for key, value in signature.items() if metadata.get(key) != value
     ]
@@ -1118,6 +1131,7 @@ def main(argv: list[str] | None = None) -> int:
                 "type": "metadata",
                 "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
                 "revision": git_revision(),
+                "benchmark_version": BENCHMARK_VERSION,
                 **signature,
                 "cache_type_k": args.cache_type_k,
                 "cache_type_v": args.cache_type_v,

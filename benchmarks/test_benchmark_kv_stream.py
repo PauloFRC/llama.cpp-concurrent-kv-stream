@@ -285,15 +285,64 @@ class BenchmarkKvStreamTest(unittest.TestCase):
 
 
     def test_resume_rejects_changed_settings(self) -> None:
-
         signature = {"model": "/tmp/model.gguf", "max_context": 16384}
-        BENCHMARK.validate_resume(signature.copy(), signature, Path("results.jsonl"))
+        metadata = dict(signature, benchmark_version=BENCHMARK.BENCHMARK_VERSION)
+        BENCHMARK.validate_resume(metadata, signature, Path("results.jsonl"))
         with self.assertRaisesRegex(SystemExit, "different settings"):
             BENCHMARK.validate_resume(
-                {"model": "/tmp/other.gguf", "max_context": 16384},
+                dict(metadata, model="/tmp/other.gguf"),
                 signature,
                 Path("results.jsonl"),
             )
+
+    def test_resume_compares_cpu_list_verbatim(self) -> None:
+        signature = {"kv_stream_cpu_cpus": "2,3,4,5,6,7"}
+        metadata = {
+            "benchmark_version": BENCHMARK.BENCHMARK_VERSION,
+            "kv_stream_cpu_cpus": "2-7",
+        }
+        with self.assertRaisesRegex(SystemExit, "kv_stream_cpu_cpus"):
+            BENCHMARK.validate_resume(metadata, signature, Path("results.jsonl"))
+
+    def test_resume_rejects_pre_scrub_results(self) -> None:
+        signature = {"model": "/tmp/model.gguf", "max_context": 16384}
+        legacy = {"model": "/tmp/model.gguf", "max_context": 16384}
+        with self.assertRaisesRegex(SystemExit, "predates server-environment scrubbing"):
+            BENCHMARK.validate_resume(legacy, signature, Path("results.jsonl"))
+        migrated = dict(legacy, benchmark_version=BENCHMARK.BENCHMARK_VERSION)
+        BENCHMARK.validate_resume(migrated, signature, Path("results.jsonl"))
+
+    def test_resume_rejects_legacy_split_on_results(self) -> None:
+        legacy = {
+            "model": "/tmp/model.gguf", "max_context": 16384,
+            "stream_total_cpu_pages": 282854,
+        }
+        args = BENCHMARK.parse_args([
+            "--model", "/tmp/model.gguf", "--server", "/tmp/llama-server",
+            "--max-context", "64K", "--min-context", "8K",
+        ])
+        signature = BENCHMARK.resume_signature(args, [8192])
+        with self.assertRaisesRegex(SystemExit, "predates server-environment scrubbing"):
+            BENCHMARK.validate_resume(legacy, signature, Path("results.jsonl"))
+
+    def test_resume_rejects_version_2_signature(self) -> None:
+        signature = {"kv_stream_cpu_cpus": None}
+        metadata = {
+            "benchmark_version": 2,
+            "server_env": {"GGML_CUDA_KV_STREAM_CPU_CPUS": "2-7"},
+        }
+        with self.assertRaisesRegex(SystemExit, "version 2 used the removed server_env signature"):
+            BENCHMARK.validate_resume(metadata, signature, Path("results.jsonl"))
+
+    def test_resume_rejects_unknown_metadata_version(self) -> None:
+        signature = {"model": "/tmp/model.gguf"}
+        metadata = {
+            "benchmark_version": BENCHMARK.BENCHMARK_VERSION + 1,
+            "model": "/tmp/model.gguf",
+        }
+        with self.assertRaisesRegex(SystemExit, "metadata schemas are incompatible"):
+            BENCHMARK.validate_resume(metadata, signature, Path("results.jsonl"))
+
 
     def test_csv_and_plot_accept_partial_sweep(self) -> None:
         rows = {

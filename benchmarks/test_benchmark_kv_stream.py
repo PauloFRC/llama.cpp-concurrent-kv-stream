@@ -133,6 +133,8 @@ class BenchmarkKvStreamTest(unittest.TestCase):
             parallel=1,
             kv_unified="auto",
             n_gpu_layers="all",
+            kv_stream_cpu_threads=None,
+            kv_stream_cpu_share=None,
         )
         command = BENCHMARK.server_command(args, 131072, 2304)
         self.assertEqual(command[0], "/tmp/llama-server")
@@ -160,6 +162,8 @@ class BenchmarkKvStreamTest(unittest.TestCase):
             parallel=6,
             kv_unified="on",
             n_gpu_layers="20",
+            kv_stream_cpu_threads=None,
+            kv_stream_cpu_share=None,
         )
         command = BENCHMARK.server_command(args, 262144, 512)
         self.assertEqual(command[command.index("-np") + 1], "6")
@@ -266,6 +270,9 @@ class BenchmarkKvStreamTest(unittest.TestCase):
         self.assertEqual(parsed["stream_zero_sample_windows"], 1)
         self.assertEqual(parsed["stream_total_cpu_pages"], 440)
         self.assertEqual(parsed["stream_max_copy_busy"], 25.0)
+        self.assertEqual(parsed["stream_total_cpu_decline_prefill"], 17)
+        self.assertEqual(parsed["stream_total_cpu_decline_no_eligible"], 1)
+        self.assertEqual(parsed["stream_total_cpu_decline_below_min"], 2)
         busy = [window for window in parsed["stream_windows"] if window["active_tokens"] == 65792]
         self.assertEqual(len(busy), 1)
         self.assertEqual(busy[0]["samples"], 2)
@@ -318,6 +325,102 @@ class BenchmarkKvStreamTest(unittest.TestCase):
             self.assertTrue((output / "results.csv").is_file())
             self.assertTrue((output / "kv-stream-sweep.png").is_file())
             self.assertTrue((output / "kv-stream-sweep.svg").is_file())
+
+    def test_clean_server_env_removes_kv_stream_knobs(self) -> None:
+        inherited = {
+            "GGML_CUDA_KV_STREAM_CPU_SHARE": "0.6",
+            "GGML_CUDA_KV_STREAM_CPU_CPUS": "0-3",
+            "GGML_CUDA_KV_STREAM_PARTS": "4",
+            "LLAMA_ARG_KV_STREAM_CPU_THREADS": "6",
+            "LLAMA_ARG_KV_STREAM_CPU_SHARE": "auto",
+            "LLAMA_ARG_CTX_SIZE": "4096",
+        }
+        with mock.patch.dict(os.environ, inherited, clear=True):
+            env = BENCHMARK.clean_server_env(None)
+            pinned = BENCHMARK.clean_server_env(
+                None, server_env=["GGML_CUDA_KV_STREAM_CPU_CPUS=2-7"])
+        for name in inherited:
+            if name != "LLAMA_ARG_CTX_SIZE":
+                self.assertNotIn(name, env)
+        self.assertEqual(env["LLAMA_ARG_CTX_SIZE"], "4096")
+        self.assertEqual(pinned["GGML_CUDA_KV_STREAM_CPU_CPUS"], "2-7")
+        self.assertNotIn("GGML_CUDA_KV_STREAM_CPU_SHARE", pinned)
+
+    def test_server_command_passes_cpu_split_options(self) -> None:
+        args = argparse.Namespace(
+            server=Path("/tmp/llama-server"),
+            model=Path("/tmp/model.gguf"),
+            port=12355,
+            extra_server_arg=[],
+            cache_type_k="q8_0",
+            cache_type_v="q4_0",
+            batch_size=256,
+            ubatch_size=256,
+            parallel=1,
+            kv_unified="auto",
+            n_gpu_layers="all",
+            kv_stream_cpu_threads=None,
+            kv_stream_cpu_share=None,
+        )
+        command = BENCHMARK.server_command(args, 131072, 512)
+        self.assertNotIn("--kv-stream-cpu-threads", command)
+        self.assertNotIn("--kv-stream-cpu-share", command)
+        args.kv_stream_cpu_threads = 6
+        args.kv_stream_cpu_share = "auto"
+        command = BENCHMARK.server_command(args, 131072, 512)
+        self.assertEqual(command[command.index("--kv-stream-cpu-threads") + 1], "6")
+        self.assertEqual(command[command.index("--kv-stream-cpu-share") + 1], "auto")
+
+    def test_cpu_split_options_are_validated_and_recorded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model = root / "model.gguf"
+            server = root / "llama-server"
+            model.touch()
+            server.touch(mode=0o755)
+            base = [
+                "--model", str(model), "--server", str(server),
+                "--max-context", "64K", "--min-context", "8K",
+            ]
+            for extra, message in (
+                (["--kv-stream-cpu-threads", "-1"], "CPU threads"),
+                (["--kv-stream-cpu-share", "1.5"], "CPU share"),
+                (["--kv-stream-cpu-share", "fast"], "CPU share"),
+                (["--server-env", "NOVALUE"], "server-env"),
+            ):
+                with self.assertRaisesRegex(SystemExit, message):
+                    BENCHMARK.validate_args(BENCHMARK.parse_args(base + extra))
+            args = BENCHMARK.parse_args(base + [
+                "--kv-stream-cpu-threads", "6", "--kv-stream-cpu-share", "0.4",
+                "--server-env", "GGML_CUDA_KV_STREAM_CPU_CPUS=2-7",
+            ])
+            BENCHMARK.validate_args(args)
+            signature = BENCHMARK.resume_signature(args, [8192])
+        self.assertEqual(signature["kv_stream_cpu_threads"], 6)
+        self.assertEqual(signature["kv_stream_cpu_share"], "0.4")
+        self.assertEqual(signature["server_env"], ["GGML_CUDA_KV_STREAM_CPU_CPUS=2-7"])
+
+    def test_csv_lists_cpu_split_columns(self) -> None:
+        rows = {
+            8192: {
+                "context_capacity": 8192,
+                "stream_total_cpu_pages": 440,
+                "stream_total_cpu_decline_below_min": 2,
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "results.csv"
+            BENCHMARK.write_csv(path, rows)
+            header, row = path.read_text().splitlines()[:2]
+        for field in (
+            "stream_max_copy_busy",
+            "stream_total_cpu_pages",
+            "stream_total_cpu_decline_prefill",
+            "stream_total_cpu_decline_no_eligible",
+            "stream_total_cpu_decline_below_min",
+        ):
+            self.assertIn(field, header.split(","))
+        self.assertIn("440", row.split(","))
 
 
 if __name__ == "__main__":

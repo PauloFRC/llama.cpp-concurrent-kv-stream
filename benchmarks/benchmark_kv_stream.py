@@ -29,6 +29,7 @@ UVM_ENV_NAMES = (
     "GGML_CUDA_PREFER_KV_HOST",
     "GGML_CUDA_KV_ACCESSED_BY_GPU",
 )
+KV_STREAM_ENV_PREFIXES = ("GGML_CUDA_KV_STREAM_", "LLAMA_ARG_KV_STREAM_")
 
 KV_STREAM_TRACE_RE = re.compile(
     r"kv_stream_adapt: active (\d+), resident (\d+), ring (\d+), "
@@ -139,6 +140,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         help="pin GGML_CUDA_KV_STREAM_FIXED_RING_SLOTS for the server; "
         "the pin is read at runtime creation, so the mode is per process",
+    )
+    parser.add_argument(
+        "--kv-stream-cpu-threads", type=int,
+        help="pass --kv-stream-cpu-threads to the server (default: not passed)",
+    )
+    parser.add_argument(
+        "--kv-stream-cpu-share",
+        help="pass --kv-stream-cpu-share to the server: auto or a number in [0, 1] (default: not passed)",
+    )
+    parser.add_argument(
+        "--server-env", action="append", default=[], metavar="NAME=VALUE",
+        help="set a server environment variable after GGML_CUDA_KV_STREAM_* and "
+        "LLAMA_ARG_KV_STREAM_* are cleared (repeat)",
     )
     parser.add_argument(
         "--parallel", type=int, default=1,
@@ -271,11 +285,13 @@ def clean_server_env(
     cuda_visible_devices: str | None,
     trace_kv_stream: bool = False,
     fixed_ring_slots: int | None = None,
+    server_env: list[str] | tuple[str, ...] = (),
 ) -> dict[str, str]:
     env = os.environ.copy()
     for name in UVM_ENV_NAMES:
         env.pop(name, None)
-    env.pop("GGML_CUDA_KV_STREAM_FIXED_RING_SLOTS", None)
+    for name in [name for name in env if name.startswith(KV_STREAM_ENV_PREFIXES)]:
+        env.pop(name)
     env.pop("LLAMA_KV_STREAM_TRACE", None)
     if fixed_ring_slots is not None:
         env["GGML_CUDA_KV_STREAM_FIXED_RING_SLOTS"] = str(fixed_ring_slots)
@@ -283,6 +299,9 @@ def clean_server_env(
         env["LLAMA_KV_STREAM_TRACE"] = "1"
     if cuda_visible_devices is not None:
         env["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
+    for pair in server_env:
+        name, value = pair.split("=", 1)
+        env[name] = value
     return env
 
 
@@ -339,6 +358,10 @@ def server_command(
         "--kv-stream-stage-mib",
         str(pool_mib),
     ]
+    if args.kv_stream_cpu_threads is not None:
+        command.extend(["--kv-stream-cpu-threads", str(args.kv_stream_cpu_threads)])
+    if args.kv_stream_cpu_share is not None:
+        command.extend(["--kv-stream-cpu-share", args.kv_stream_cpu_share])
     if args.kv_unified != "auto":
         command.append(
             "--kv-unified" if args.kv_unified == "on" else "--no-kv-unified"
@@ -367,6 +390,7 @@ class Server:
                     args.cuda_visible_devices,
                     args.trace_kv_stream,
                     args.fixed_ring_slots,
+                    args.server_env,
                 ),
                 stdout=self.log_file,
                 stderr=subprocess.STDOUT,
@@ -528,6 +552,9 @@ def resume_signature(args: argparse.Namespace, capacities: list[int]) -> dict:
         "cache_type_v": args.cache_type_v,
         "fixed_pool_mib": args.fixed_pool_mib,
         "fixed_ring_slots": args.fixed_ring_slots,
+        "kv_stream_cpu_threads": args.kv_stream_cpu_threads,
+        "kv_stream_cpu_share": args.kv_stream_cpu_share,
+        "server_env": args.server_env or None,
         "parallel": args.parallel,
         "kv_unified": args.kv_unified,
         "n_gpu_layers": args.n_gpu_layers,
@@ -678,6 +705,15 @@ def parse_kv_stream_trace(log_path: Path) -> dict:
         ),
         "stream_total_cpu_pages": sum(
             sample["cpu_pages"] for sample in samples
+        ),
+        "stream_total_cpu_decline_prefill": sum(
+            sample["cpu_decline_prefill"] for sample in samples
+        ),
+        "stream_total_cpu_decline_no_eligible": sum(
+            sample["cpu_decline_no_eligible"] for sample in samples
+        ),
+        "stream_total_cpu_decline_below_min": sum(
+            sample["cpu_decline_below_min"] for sample in samples
         ),
         "stream_repartitions": text.count("adaptive KV partition:"),
     }
@@ -885,6 +921,11 @@ def write_csv(path: Path, rows: dict[tuple[int, tuple[int, ...]], dict]) -> None
         "stream_min_resident_pages",
         "stream_max_ring_slots",
         "stream_repartitions",
+        "stream_max_copy_busy",
+        "stream_total_cpu_pages",
+        "stream_total_cpu_decline_prefill",
+        "stream_total_cpu_decline_no_eligible",
+        "stream_total_cpu_decline_below_min",
     ]
     with path.open("w", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields)
@@ -997,6 +1038,18 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("fixed pool must not be negative")
     if args.fixed_ring_slots is not None and args.fixed_ring_slots < 1:
         raise SystemExit("fixed ring slots must be positive")
+    if args.kv_stream_cpu_threads is not None and args.kv_stream_cpu_threads < 0:
+        raise SystemExit("KV stream CPU threads must not be negative")
+    if args.kv_stream_cpu_share is not None and args.kv_stream_cpu_share != "auto":
+        try:
+            share = float(args.kv_stream_cpu_share)
+        except ValueError:
+            share = -1.0
+        if not 0.0 <= share <= 1.0:
+            raise SystemExit("KV stream CPU share must be auto or a number in [0, 1]")
+    for pair in args.server_env:
+        if "=" not in pair or not pair.split("=", 1)[0]:
+            raise SystemExit(f"--server-env needs NAME=VALUE, got {pair!r}")
     if (
         args.pool_retries < 0
         or args.release_slack_mib < 0

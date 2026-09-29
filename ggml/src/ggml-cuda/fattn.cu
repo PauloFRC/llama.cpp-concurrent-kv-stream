@@ -292,6 +292,7 @@ struct kv_stream_cpu_split {
     kv_stream_cpu_graph graph;
 
     uint32_t warned_blocks = 0;
+    bool warned_delay = false;
     void warn_block(ggml_cuda_kv_stream_cpu_split_block block) {
         static_assert(GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_COUNT <= 32, "block reasons must fit the warned bitmask");
         const uint32_t bit = 1u << uint32_t(block);
@@ -2060,6 +2061,11 @@ void ggml_cuda_kv_stream_graph_begin(ggml_cuda_kv_stream_transfer_ring * ring) {
         GGML_ASSERT(ggml_cuda_kv_stream_cpu_pool_idle(ring) && "cpu pool busy between graphs");
         split.graph = {};
         split.graph.knobs = kv_stream_cpu_read_knobs(split.share);
+        if (split.graph.knobs.delay_ns > 0 && !split.warned_delay) {
+            split.warned_delay = true;
+            GGML_LOG_WARN("kv stream cpu split: test hook GGML_CUDA_KV_STREAM_CPU_DELAY is set, worker %d sleeps %.0f us in every job\n",
+                split.graph.knobs.delay_thread, split.graph.knobs.delay_ns/1e3);
+        }
     }
     ring->graph_layer_count = 0;
     ring->current_layer = KV_STREAM_NO_LAYER;

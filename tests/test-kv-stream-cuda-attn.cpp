@@ -3300,6 +3300,32 @@ int main() {
         }
     });
 
+    t.test("the cpu delay test hook warns once per runtime", [](testing & t) {
+        if (!ggml_cuda_kv_stream_cpu_attn_supported()) {
+            t.skip("CPU attention needs AVX-512 F, DQ, VNNI, F16C and FMA");
+            return;
+        }
+        constexpr int64_t n_kv = 41*256;
+        constexpr int64_t n_batch = 1;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+        auto runtime = make_runtime(make_stream_params(backend.get(), 40, 41, 1, 32));
+        if (!t.assert_true("runtime initializes", runtime != nullptr)) {
+            return;
+        }
+        t.assert_true("cpu split scratch allocates",
+            ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 2, N_Q_HEAD, 41, 0.4f));
+
+        log_capture log("test hook GGML_CUDA_KV_STREAM_CPU_DELAY");
+        scoped_env env{{"GGML_CUDA_KV_STREAM_CPU_DELAY", "0:1"}};
+        const attention_inputs inputs = make_inputs(n_kv, n_batch, n_kv);
+        run_share_graphs(backend.get(), runtime.get(), nullptr, inputs, n_kv, n_batch, 2,
+            [](uint64_t) { return 10.0; });
+        t.assert_equal("one warning for two graphs", size_t(1), log.snapshot().size());
+    });
+
     t.test("a cpu job below the minimum size keeps its pages on the gpu", [](testing & t) {
         if (!ggml_cuda_kv_stream_cpu_attn_supported()) {
             t.skip("CPU attention needs AVX-512 F, DQ, VNNI, F16C and FMA");

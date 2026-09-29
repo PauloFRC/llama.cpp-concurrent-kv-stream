@@ -492,6 +492,39 @@ class BenchmarkKvStreamTest(unittest.TestCase):
             self.assertIn(field, header.split(","))
         self.assertIn("440", row.split(","))
 
+    def test_top2_swap_rule(self) -> None:
+        spec = importlib.util.spec_from_file_location(
+            "test_kv_stream_serial_server", Path(__file__).with_name("test_kv_stream_serial_server.py"))
+        assert spec is not None and spec.loader is not None
+        serial = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(serial)
+
+        def probs(*tokens) -> dict:
+            return {
+                "content": "".join(t[0] for t in tokens),
+                "completion_probabilities": [
+                    {"token": t[0], "bytes": t[1], "id": t[2], "top_logprobs": [{"id": x} for x in t[3:]]}
+                    for t in tokens
+                ],
+            }
+
+        identical = probs(("a", [97], 1, 1, 2), ("b", [98], 3, 3, 4))
+        self.assertFalse(serial.top2_swap_ok(identical, identical))
+        self.assertEqual(serial.completion_match_rule(identical, identical, True), "exact")
+
+        first_swap = probs(("a", [97], 1, 1, 2), ("b", [98], 3, 3, 4))
+        first_swapped = probs(("b", [98], 2, 2, 1), ("b", [98], 3, 3, 4))
+        self.assertTrue(serial.top2_swap_ok(first_swap, first_swapped))
+        self.assertEqual(serial.completion_match_rule(first_swap, first_swapped, True), "top2")
+        self.assertEqual(serial.completion_match_rule(first_swap, first_swapped, False), "mismatch")
+
+        self.assertTrue(serial.top2_swap_ok(first_swap, probs(("a", [97], 1, 1, 2), ("c", [99], 4, 4, 3))))
+        self.assertFalse(serial.top2_swap_ok(probs(("", [194], 1, 1, 2)), probs(("", [195], 9, 8, 9))))
+        self.assertFalse(serial.top2_swap_ok(first_swap, probs(("d", [100], 9, 8, 9), ("b", [98], 3, 3, 4))))
+        self.assertFalse(serial.top2_swap_ok(first_swap, probs(("a", [97], 1, 1, 2), ("c", [99], 4, 3))))
+        self.assertFalse(serial.top2_swap_ok(first_swap, probs(("a", [97], 1, 1, 2))))
+        self.assertFalse(serial.top2_swap_ok({"completion_probabilities": []}, first_swap))
+
 
 if __name__ == "__main__":
     unittest.main()

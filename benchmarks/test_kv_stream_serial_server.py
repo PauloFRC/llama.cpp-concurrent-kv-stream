@@ -65,8 +65,9 @@ class Server:
         self.log_file.close()
 
 
-def completion(server: Server, prompt: list[int], cache_prompt: bool, n_predict: int = 16) -> dict:
-    return request(server.port, "/completion", {
+def completion(server: Server, prompt: list[int], cache_prompt: bool, n_predict: int = 16,
+               n_probs: int = 0) -> dict:
+    payload = {
         "prompt": prompt,
         "n_predict": n_predict,
         "ignore_eos": True,
@@ -74,7 +75,10 @@ def completion(server: Server, prompt: list[int], cache_prompt: bool, n_predict:
         "temperature": 0,
         "seed": 1,
         "reasoning_format": "none",
-    })
+    }
+    if n_probs:
+        payload["n_probs"] = n_probs
+    return request(server.port, "/completion", payload)
 
 
 def patterned(size: int, tokens: tuple[int, ...]) -> list[int]:
@@ -154,17 +158,32 @@ def mixed_pages(log: bytes) -> list[bytes]:
     return [page for page in CELL_PAGE.findall(log) if len(set(page) - {ord(".")}) > 1]
 
 
-def split_cpu_threads() -> int:
-    text = os.environ.get("LLAMA_ARG_KV_STREAM_CPU_THREADS", "0") or "0"
-    try:
-        return int(text)
-    except ValueError:
-        return 0
+def top2_swap_ok(expected: dict, restored: dict) -> bool:
+    left = expected.get("completion_probabilities") or []
+    right = restored.get("completion_probabilities") or []
+    if len(left) != len(right) or not left:
+        return False
+    for a, b in zip(left, right):
+        if a.get("bytes") is None or b.get("bytes") is None:
+            return False
+        if a["bytes"] == b["bytes"]:
+            continue
+        top_a, top_b = a.get("top_logprobs") or [], b.get("top_logprobs") or []
+        return (len(top_a) >= 2 and len(top_b) >= 2 and
+                top_a[1]["id"] == b["id"] and top_b[1]["id"] == a["id"])
+    return False
+
+
+def completion_match_rule(expected: dict, restored: dict, split_on: bool) -> str:
+    if restored["content"] == expected["content"]:
+        return "exact"
+    if split_on and top2_swap_ok(expected, restored):
+        return "top2"
+    return "mismatch"
 
 
 def run_parked_slots(binary: Path, model: Path, port: int, output: Path, args):
     parked_n, active_n = args.fill
-    split_on = split_cpu_threads() > 0
     # unified cache holds the parked sequence, both active ones and their decode tokens
     ctx_size = max(12288, (parked_n + 2 * active_n + 1024 + 255) // 256 * 256)
     cache_ram = args.cache_ram or max(2048, (parked_n + 2 * active_n) * 64 // 1024 + 2048)
@@ -175,6 +194,7 @@ def run_parked_slots(binary: Path, model: Path, port: int, output: Path, args):
                     n_parallel=2, ctx_size=ctx_size,
                     extra=["--kv-unified", "--cache-idle-slots", "-lv", "5", *args.extra_server_arg],
                     env=env, stage_mib=args.stage_mib)
+    split_on = b"CPU split on," in server.log_path.read_bytes()
     t0 = time.monotonic()
     marks = []
 
@@ -187,18 +207,18 @@ def run_parked_slots(binary: Path, model: Path, port: int, output: Path, args):
         active_b = patterned(active_n, (23066, 7200, 8200, 9200))
 
         mark("prefill-parked")
-        expected = completion(server, parked, True)
+        expected = completion(server, parked, True, n_probs=2)
         mark("active-concurrent")
         with ThreadPoolExecutor(max_workers=2) as pool:
-            fut_a = pool.submit(completion, server, active_a, True, 64)
+            fut_a = pool.submit(completion, server, active_a, True, 64, n_probs=2)
             fut_b = pool.submit(completion, server, active_b, True, 256)
             result_a = fut_a.result()
             mark("restore-parked")
-            restored = completion(server, parked, True)
+            restored = completion(server, parked, True, n_probs=2)
             mark("active-tail")
             result_b = fut_b.result()
         mark("restore-active")
-        restored_a = completion(server, active_a, True, 64)
+        restored_a = completion(server, active_a, True, 64, n_probs=2)
         mark("end")
 
         details = {
@@ -210,9 +230,10 @@ def run_parked_slots(binary: Path, model: Path, port: int, output: Path, args):
             "restored_timings": restored["timings"],
         }
 
-        parked_match = restored["content"] == expected["content"]
-        if not parked_match and not split_on:
-            raise RuntimeError(f"parked-slot restore output changed: {json.dumps(details)}")
+        parked_rule = completion_match_rule(expected, restored, split_on)
+        active_rule = completion_match_rule(result_a, restored_a, split_on)
+        parked_match = parked_rule != "mismatch"
+        active_match = active_rule != "mismatch"
         cache_n = restored["timings"].get("cache_n", 0)
         if cache_n < parked_n - 256:
             raise RuntimeError(f"parked-slot restore reused only {cache_n} tokens: {json.dumps(details)}")
@@ -237,10 +258,6 @@ def run_parked_slots(binary: Path, model: Path, port: int, output: Path, args):
             if mixed:
                 raise RuntimeError(
                     f"{len(mixed)} page(s) held cells of more than one sequence, first: {mixed[0].decode()}")
-        active_match = restored_a["content"] == result_a["content"]
-        if not active_match and not split_on:
-            raise RuntimeError("active restore output changed: "
-                               f"{json.dumps([result_a['content'], restored_a['content']])}")
         if runs_a != 1:
             raise RuntimeError(f"active restore landed in {runs_a} runs, the idle sequence was not parked first")
 
@@ -249,14 +266,20 @@ def run_parked_slots(binary: Path, model: Path, port: int, output: Path, args):
                       "cache_ram_mib": cache_ram, "stage_mib": args.stage_mib},
             "split_on": split_on,
             "content_match": {"parked": parked_match, "active": active_match},
+            "match_rule": {"parked": parked_rule, "active": active_rule},
             "requests": {name: {"id_slot": r["id_slot"], "timings": r["timings"]} for name, r in (
                 ("parked", expected), ("active_a", result_a), ("active_b", result_b),
                 ("parked_resumed", restored), ("active_a_resumed", restored_a))},
             "windows": windows,
         }
         (output / "parked-slots-summary.json").write_text(json.dumps(summary, indent=2))
-        content = "PASS" if (parked_match and active_match) else (
-            "MISMATCH (split on)" if split_on else "FAIL")
+        if not parked_match:
+            raise RuntimeError(f"parked-slot restore output changed: {json.dumps(details)}")
+        if not active_match:
+            raise RuntimeError(f"active restore output changed: "
+                               f"{json.dumps([result_a['content'], restored_a['content']])}")
+
+        content = "PASS" if parked_rule == "exact" and active_rule == "exact" else "PASS (top-2)"
         print(f"parked-slot restore test: {content} (cache_n={cache_n}, slot {expected['id_slot']} -> "
               f"{restored['id_slot']}, {cells} cells in {runs} runs, "
               f"prompt_ms={restored['timings']['prompt_ms']:.1f}, "

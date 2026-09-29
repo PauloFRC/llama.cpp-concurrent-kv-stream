@@ -2856,6 +2856,26 @@ int main() {
         t.assert_true("every page stays on the GPU", max_abs_error(expected, actual) <= 1e-6f);
     });
 
+    t.test("set_cpu_split refuses a second split and a CPU without the kernel", [](testing & t) {
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+        auto runtime = make_runtime(make_stream_params(backend.get(), 40, 41, 1, 32));
+        if (!t.assert_true("runtime initializes", runtime != nullptr)) {
+            return;
+        }
+        if (!ggml_cuda_kv_stream_cpu_attn_supported()) {
+            t.assert_true("a CPU without the kernel is refused",
+                !ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 1, N_Q_HEAD, 41, -1.0f));
+            return;
+        }
+        t.assert_true("the first split is set",
+            ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 1, N_Q_HEAD, 41, -1.0f));
+        t.assert_true("a second split on the same runtime is refused",
+            !ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 1, N_Q_HEAD, 41, -1.0f));
+    });
+
     t.test("a cpu list outside the process affinity mask warns and runs unpinned", [](testing & t) {
 #if defined(__linux__)
         if (!ggml_cuda_kv_stream_cpu_attn_supported()) {

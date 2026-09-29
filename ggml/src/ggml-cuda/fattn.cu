@@ -672,11 +672,10 @@ void ggml_cuda_kv_stream_transfer_ring_set_live_pages(
 
 bool ggml_cuda_kv_stream_transfer_ring_set_cpu_split(
         ggml_cuda_kv_stream_transfer_ring * ring, uint32_t n_threads, uint32_t n_head, uint32_t context_pages, float share) {
-    if (ring == nullptr || n_threads == 0 || n_head == 0 || context_pages == 0 || std::isnan(share) || share > 1.0f) {
+    if (ring == nullptr || n_threads == 0 || n_head == 0 || context_pages == 0 || std::isnan(share) || share > 1.0f ||
+            ring->cpu_split != nullptr || !ggml_cuda_kv_stream_cpu_attn_supported()) {
         return false;
     }
-    GGML_ASSERT(ggml_cuda_kv_stream_cpu_attn_supported());
-    GGML_ASSERT(ring->cpu_split == nullptr);
 
     const size_t rows = size_t(GGML_CUDA_KV_STREAM_MAX_DECODE_QUERY_TOKENS)*n_head;
     const size_t row_bytes = rows*GGML_CUDA_KV_STREAM_HEAD_DIM*sizeof(float);
@@ -696,23 +695,29 @@ bool ggml_cuda_kv_stream_transfer_ring_set_cpu_split(
         cudaHostGetDevicePointer(reinterpret_cast<void **>(&split->result_device), split->result, 0) != cudaSuccess ||
         cudaHostGetDevicePointer(reinterpret_cast<void **>(&split->result_meta_device), split->result_meta, 0) != cudaSuccess) {
         const cudaError_t error = cudaGetLastError();
-        GGML_LOG_WARN("%s: allocating %.2f MiB of pinned CPU split scratch failed, streamed pages stay on the GPU: %s\n",
+        GGML_LOG_WARN("%s: allocating %.2f MiB of pinned CPU split scratch failed, the CPU split stays off: %s\n",
             __func__, (2*row_bytes + mask_bytes + meta_bytes)/1024.0/1024.0, cudaGetErrorString(error));
         return false;
     }
-    split->workers.resize(n_threads);
-    for (kv_stream_cpu_worker & worker : split->workers) {
-        worker.part.resize(rows*GGML_CUDA_KV_STREAM_HEAD_DIM);
-        worker.part_meta.resize(rows*2);
-        worker.q_workspace.resize(rows*GGML_CUDA_KV_STREAM_CPU_ATTN_ROW_WSIZE/sizeof(kv_stream_cpu_line));
+    try {
+        split->workers.resize(n_threads);
+        for (kv_stream_cpu_worker & worker : split->workers) {
+            worker.part.resize(rows*GGML_CUDA_KV_STREAM_HEAD_DIM);
+            worker.part_meta.resize(rows*2);
+            worker.q_workspace.resize(rows*GGML_CUDA_KV_STREAM_CPU_ATTN_ROW_WSIZE/sizeof(kv_stream_cpu_line));
+        }
+        const std::vector<int> cpus = kv_stream_cpu_env_cpus();
+        kv_stream_cpu_split * body_split = split.get();
+        // blocking join: one job in flight
+        split->pool = std::make_unique<kv_stream_cpu_pool>(int(n_threads), 1,
+            [body_split](const kv_stream_cpu_job & job, int thread, int n) {
+                kv_stream_cpu_job_run(*body_split, job, thread, n);
+            }, cpus);
+    } catch (const std::exception & e) {
+        GGML_LOG_WARN("%s: starting %u CPU split threads failed, the CPU split stays off: %s\n",
+            __func__, n_threads, e.what());
+        return false;
     }
-    const std::vector<int> cpus = kv_stream_cpu_env_cpus();
-    kv_stream_cpu_split * body_split = split.get();
-    // blocking join: one job in flight
-    split->pool = std::make_unique<kv_stream_cpu_pool>(int(n_threads), 1,
-        [body_split](const kv_stream_cpu_job & job, int thread, int n) {
-            kv_stream_cpu_job_run(*body_split, job, thread, n);
-        }, cpus);
     ring->cpu_split = std::move(split);
     return true;
 }

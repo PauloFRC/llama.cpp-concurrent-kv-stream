@@ -2433,7 +2433,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--kv-stream-cpu-threads"}, "N",
         string_format("CPU attention threads over streamed KV pages; 0 disables it. Needs a CUDA build for x86-64 with AVX-512, "
-            "-ctk q8_0 -ctv q4_0 and head dim 256 (default: %u)", params.kv_stream_cpu_threads),
+            "-ctk q8_0 -ctv q4_0 and head dim 256, otherwise the context fails to start (default: %u)", params.kv_stream_cpu_threads),
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("KV stream CPU thread count must be non-negative");

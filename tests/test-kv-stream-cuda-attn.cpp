@@ -4610,30 +4610,32 @@ int main() {
         const auto stats = ggml_backend_cuda_kv_stream_get_stats(runtime);
         ggml_backend_cuda_kv_stream_runtime_free(runtime);
 
-        auto split_runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
-        if (!t.assert_true("split runtime initializes", split_runtime != nullptr)) {
-            return;
-        }
-        t.assert_true("cpu split scratch allocates",
-            ggml_backend_cuda_kv_stream_set_cpu_split(split_runtime, 2, N_Q_HEAD, 4, -1.0f));
-        std::vector<float> split_actual;
-        {
-            // a share, so a prefill that reaches the planner takes pages
-            scoped_env env{{"GGML_CUDA_KV_STREAM_CPU_SHARE", "0.5"}};
-            split_actual = run_attention_layers(
-                backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(split_runtime),
-                n_kv, n_batch, 1, 2, GGML_TYPE_I64, split_runtime, 0, nullptr, /* graph_per_layer = */ true);
-        }
-        const auto split_stats = ggml_backend_cuda_kv_stream_get_stats(split_runtime);
-        ggml_backend_cuda_kv_stream_runtime_free(split_runtime);
+        if (ggml_cuda_kv_stream_cpu_attn_supported()) {
+            auto split_runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+            if (!t.assert_true("split runtime initializes", split_runtime != nullptr)) {
+                return;
+            }
+            t.assert_true("cpu split scratch allocates",
+                ggml_backend_cuda_kv_stream_set_cpu_split(split_runtime, 2, N_Q_HEAD, 4, -1.0f));
+            std::vector<float> split_actual;
+            {
+                // a share, so a prefill that reaches the planner takes pages
+                scoped_env env{{"GGML_CUDA_KV_STREAM_CPU_SHARE", "0.5"}};
+                split_actual = run_attention_layers(
+                    backend.get(), inputs, ggml_backend_cuda_kv_stream_buffer_type(split_runtime),
+                    n_kv, n_batch, 1, 2, GGML_TYPE_I64, split_runtime, 0, nullptr, /* graph_per_layer = */ true);
+            }
+            const auto split_stats = ggml_backend_cuda_kv_stream_get_stats(split_runtime);
+            ggml_backend_cuda_kv_stream_runtime_free(split_runtime);
 
-        t.assert_equal(uint64_t(0), split_stats.cpu_pages);
-        t.assert_equal(uint64_t(0), split_stats.cpu_jobs);
-        // one attention node per graph
-        t.assert_equal(uint64_t(4), split_stats.cpu_decline_prefill);
-        t.assert_true("the prefill output is bit-identical with the split on",
-            split_actual.size() == actual.size() &&
-            std::memcmp(split_actual.data(), actual.data(), actual.size()*sizeof(float)) == 0);
+            t.assert_equal(uint64_t(0), split_stats.cpu_pages);
+            t.assert_equal(uint64_t(0), split_stats.cpu_jobs);
+            // one attention node per graph
+            t.assert_equal(uint64_t(4), split_stats.cpu_decline_prefill);
+            t.assert_true("the prefill output is bit-identical with the split on",
+                split_actual.size() == actual.size() &&
+                std::memcmp(split_actual.data(), actual.data(), actual.size()*sizeof(float)) == 0);
+        }
 
         constexpr int64_t streamed_kv = 8*PAGE_TOKENS;
         std::vector<attention_inputs> streamed_inputs;
@@ -4653,35 +4655,41 @@ int main() {
             backend.get(), streamed_inputs, ggml_backend_cuda_kv_stream_buffer_type(streamed_off_runtime),
             streamed_kv, n_batch, 1, 2, GGML_TYPE_I64, streamed_off_runtime, 0, nullptr,
             /* graph_per_layer = */ true);
+        const auto streamed_off_stats = ggml_backend_cuda_kv_stream_get_stats(streamed_off_runtime);
         ggml_backend_cuda_kv_stream_runtime_free(streamed_off_runtime);
+        t.assert_true("the GPU-only streaming prefill really streams", streamed_off_stats.streamed_pages > 0);
+        t.assert_true("the GPU-only streaming prefill stays equivalent to ordinary attention",
+            is_finite(streamed_off) && max_abs_error(streamed_expected, streamed_off) <= 3e-4f);
 
-        auto streamed_runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
-        if (!t.assert_true("split streamed runtime initializes", streamed_runtime != nullptr)) {
-            return;
-        }
-        t.assert_true("cpu split scratch allocates",
-            ggml_backend_cuda_kv_stream_set_cpu_split(streamed_runtime, 2, N_Q_HEAD, 8, -1.0f));
-        std::vector<float> streamed_split;
-        {
-            scoped_env env{{"GGML_CUDA_KV_STREAM_CPU_SHARE", "0.5"}};
-            streamed_split = run_attention_layers(
-                backend.get(), streamed_inputs, ggml_backend_cuda_kv_stream_buffer_type(streamed_runtime),
-                streamed_kv, n_batch, 1, 2, GGML_TYPE_I64, streamed_runtime, 0, nullptr,
-                /* graph_per_layer = */ true);
-        }
-        const auto streamed_stats = ggml_backend_cuda_kv_stream_get_stats(streamed_runtime);
-        ggml_backend_cuda_kv_stream_runtime_free(streamed_runtime);
+        if (ggml_cuda_kv_stream_cpu_attn_supported()) {
+            auto streamed_runtime = ggml_backend_cuda_kv_stream_runtime_new(params);
+            if (!t.assert_true("split streamed runtime initializes", streamed_runtime != nullptr)) {
+                return;
+            }
+            t.assert_true("cpu split scratch allocates",
+                ggml_backend_cuda_kv_stream_set_cpu_split(streamed_runtime, 2, N_Q_HEAD, 8, -1.0f));
+            std::vector<float> streamed_split;
+            {
+                scoped_env env{{"GGML_CUDA_KV_STREAM_CPU_SHARE", "0.5"}};
+                streamed_split = run_attention_layers(
+                    backend.get(), streamed_inputs, ggml_backend_cuda_kv_stream_buffer_type(streamed_runtime),
+                    streamed_kv, n_batch, 1, 2, GGML_TYPE_I64, streamed_runtime, 0, nullptr,
+                    /* graph_per_layer = */ true);
+            }
+            const auto streamed_stats = ggml_backend_cuda_kv_stream_get_stats(streamed_runtime);
+            ggml_backend_cuda_kv_stream_runtime_free(streamed_runtime);
 
-        t.assert_true("the streaming prefill really streams", streamed_stats.streamed_pages > 0);
-        t.assert_equal(uint64_t(0), streamed_stats.cpu_pages);
-        t.assert_equal(uint64_t(0), streamed_stats.cpu_jobs);
-        t.assert_equal(uint64_t(4), streamed_stats.cpu_decline_prefill);
-        t.assert_true("the streaming prefill output is bit-identical with the split on",
-            streamed_split.size() == streamed_off.size() &&
-            std::memcmp(streamed_split.data(), streamed_off.data(),
-                streamed_off.size()*sizeof(float)) == 0);
-        t.assert_true("the streaming prefill stays equivalent to ordinary attention",
-            is_finite(streamed_split) && max_abs_error(streamed_expected, streamed_split) <= 3e-4f);
+            t.assert_true("the streaming prefill really streams", streamed_stats.streamed_pages > 0);
+            t.assert_equal(uint64_t(0), streamed_stats.cpu_pages);
+            t.assert_equal(uint64_t(0), streamed_stats.cpu_jobs);
+            t.assert_equal(uint64_t(4), streamed_stats.cpu_decline_prefill);
+            t.assert_true("the streaming prefill output is bit-identical with the split on",
+                streamed_split.size() == streamed_off.size() &&
+                std::memcmp(streamed_split.data(), streamed_off.data(),
+                    streamed_off.size()*sizeof(float)) == 0);
+            t.assert_true("the streaming prefill stays equivalent to ordinary attention",
+                is_finite(streamed_split) && max_abs_error(streamed_expected, streamed_split) <= 3e-4f);
+        }
 
         // the pool holds every page, so each layer attends four resident pages and streams none
         t.assert_equal(uint64_t(8), stats.staged_set_rows);

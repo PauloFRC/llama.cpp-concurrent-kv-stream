@@ -30,7 +30,7 @@ UVM_ENV_NAMES = (
     "GGML_CUDA_KV_ACCESSED_BY_GPU",
 )
 KV_STREAM_ENV_PREFIXES = ("GGML_CUDA_KV_STREAM_", "LLAMA_ARG_KV_STREAM_")
-BENCHMARK_VERSION = 2  # 1 pre-scrub, 2 scrubs the server environment
+BENCHMARK_VERSION = 3
 
 KV_STREAM_TRACE_RE = re.compile(
     r"kv_stream_adapt: active (\d+), resident (\d+), ring (\d+), "
@@ -151,9 +151,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="pass --kv-stream-cpu-share to the server: auto or a number in [0, 1] (default: not passed)",
     )
     parser.add_argument(
-        "--server-env", action="append", default=[], metavar="NAME=VALUE",
-        help="set a server environment variable after GGML_CUDA_KV_STREAM_* and "
-        "LLAMA_ARG_KV_STREAM_* are cleared (repeat)",
+        "--kv-stream-cpu-cpus",
+        help="pin GGML_CUDA_KV_STREAM_CPU_CPUS for the server: a list like 2-7 or 1,3,5-7; "
+        "the pin is read when the CPU split starts, so the mode is per process",
     )
     parser.add_argument(
         "--parallel", type=int, default=1,
@@ -286,7 +286,7 @@ def clean_server_env(
     cuda_visible_devices: str | None,
     trace_kv_stream: bool = False,
     fixed_ring_slots: int | None = None,
-    server_env: list[str] | tuple[str, ...] = (),
+    kv_stream_cpu_cpus: str | None = None,
 ) -> dict[str, str]:
     env = os.environ.copy()
     for name in UVM_ENV_NAMES:
@@ -300,9 +300,8 @@ def clean_server_env(
         env["LLAMA_KV_STREAM_TRACE"] = "1"
     if cuda_visible_devices is not None:
         env["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
-    for pair in server_env:
-        name, value = pair.split("=", 1)
-        env[name] = value
+    if kv_stream_cpu_cpus:
+        env["GGML_CUDA_KV_STREAM_CPU_CPUS"] = kv_stream_cpu_cpus
     return env
 
 
@@ -391,7 +390,7 @@ class Server:
                     args.cuda_visible_devices,
                     args.trace_kv_stream,
                     args.fixed_ring_slots,
-                    args.server_env,
+                    args.kv_stream_cpu_cpus,
                 ),
                 stdout=self.log_file,
                 stderr=subprocess.STDOUT,
@@ -555,7 +554,7 @@ def resume_signature(args: argparse.Namespace, capacities: list[int]) -> dict:
         "fixed_ring_slots": args.fixed_ring_slots,
         "kv_stream_cpu_threads": args.kv_stream_cpu_threads,
         "kv_stream_cpu_share": args.kv_stream_cpu_share,
-        "server_env": args.server_env or None,
+        "kv_stream_cpu_cpus": args.kv_stream_cpu_cpus,
         "parallel": args.parallel,
         "kv_unified": args.kv_unified,
         "n_gpu_layers": args.n_gpu_layers,
@@ -1060,9 +1059,18 @@ def validate_args(args: argparse.Namespace) -> None:
             share = -1.0
         if not 0.0 <= share <= 1.0:
             raise SystemExit("KV stream CPU share must be auto or a number in [0, 1]")
-    for pair in args.server_env:
-        if "=" not in pair or not pair.split("=", 1)[0]:
-            raise SystemExit(f"--server-env needs NAME=VALUE, got {pair!r}")
+    if args.kv_stream_cpu_cpus is not None:
+        value = args.kv_stream_cpu_cpus
+        parts_ok = re.fullmatch(r"\d{1,4}(-\d{1,4})?(,\d{1,4}(-\d{1,4})?)*", value)
+        ranges_ok = parts_ok and all(
+            int(first) <= int(last)
+            for first, last in (
+                (part.split("-")[0], part.split("-")[-1]) for part in value.split(",")
+            )
+        )
+        caps_ok = ranges_ok and all(int(part) < 1024 for part in re.findall(r"\d{1,4}", value))
+        if not caps_ok:
+            raise SystemExit("KV stream CPU cpus: --kv-stream-cpu-cpus needs a list like 2-7 or 1,3,5-7")
     if (
         args.pool_retries < 0
         or args.release_slack_mib < 0

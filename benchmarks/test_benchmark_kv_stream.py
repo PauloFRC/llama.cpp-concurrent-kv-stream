@@ -387,7 +387,7 @@ class BenchmarkKvStreamTest(unittest.TestCase):
         with mock.patch.dict(os.environ, inherited, clear=True):
             env = BENCHMARK.clean_server_env(None)
             pinned = BENCHMARK.clean_server_env(
-                None, server_env=["GGML_CUDA_KV_STREAM_CPU_CPUS=2-7"])
+                None, kv_stream_cpu_cpus="2-7")
         for name in inherited:
             if name != "LLAMA_ARG_CTX_SIZE":
                 self.assertNotIn(name, env)
@@ -435,19 +435,40 @@ class BenchmarkKvStreamTest(unittest.TestCase):
                 (["--kv-stream-cpu-threads", "-1"], "CPU threads"),
                 (["--kv-stream-cpu-share", "1.5"], "CPU share"),
                 (["--kv-stream-cpu-share", "fast"], "CPU share"),
-                (["--server-env", "NOVALUE"], "server-env"),
             ):
                 with self.assertRaisesRegex(SystemExit, message):
                     BENCHMARK.validate_args(BENCHMARK.parse_args(base + extra))
             args = BENCHMARK.parse_args(base + [
                 "--kv-stream-cpu-threads", "6", "--kv-stream-cpu-share", "0.4",
-                "--server-env", "GGML_CUDA_KV_STREAM_CPU_CPUS=2-7",
+                "--kv-stream-cpu-cpus", "2-7",
             ])
             BENCHMARK.validate_args(args)
             signature = BENCHMARK.resume_signature(args, [8192])
         self.assertEqual(signature["kv_stream_cpu_threads"], 6)
         self.assertEqual(signature["kv_stream_cpu_share"], "0.4")
-        self.assertEqual(signature["server_env"], ["GGML_CUDA_KV_STREAM_CPU_CPUS=2-7"])
+        self.assertEqual(signature["kv_stream_cpu_cpus"], "2-7")
+
+    def test_cpu_cpus_is_validated_and_recorded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            model = root / "model.gguf"
+            server = root / "llama-server"
+            model.touch()
+            server.touch(mode=0o755)
+            base = [
+                "--model", str(model), "--server", str(server),
+                "--max-context", "64K", "--min-context", "8K",
+            ]
+            for extra in ("2-7-3", "1024", "7-2", "a", "", "1,2,", "1, 2"):
+                with self.assertRaisesRegex(SystemExit, "CPU cpus"):
+                    BENCHMARK.validate_args(
+                        BENCHMARK.parse_args(base + ["--kv-stream-cpu-cpus", extra]))
+            args = BENCHMARK.parse_args(base + ["--kv-stream-cpu-cpus", "1,3,5-7"])
+            BENCHMARK.validate_args(args)
+            signature = BENCHMARK.resume_signature(args, [8192])
+        self.assertEqual(signature["kv_stream_cpu_cpus"], "1,3,5-7")
+        args = BENCHMARK.parse_args(base)
+        self.assertIsNone(BENCHMARK.resume_signature(args, [8192])["kv_stream_cpu_cpus"])
 
     def test_csv_lists_cpu_split_columns(self) -> None:
         rows = {

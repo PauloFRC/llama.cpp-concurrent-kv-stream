@@ -1168,6 +1168,32 @@ int main() {
         t.assert_equal("the lowest share within the margin of the best", 1u, verdict);
     });
 
+    t.test("a share arm declined for no cpu pages leaves the trial", [](testing & t) {
+        ggml_cuda_kv_stream_share_tuner tuner;
+        const ggml_cuda_kv_stream_share_key key = { 1, 2 };
+        tuner.decline(key, 0);
+        t.assert_true("share 0 is never declined", !tuner.dropped(key, 0));
+        tuner.decline(key, 1);
+        t.assert_true("share 0.2 is dropped", tuner.dropped(key, 1));
+        t.assert_true("three arms left, no verdict", !tuner.decided(key));
+        const uint32_t verdict = run_share_trial(tuner, key, [](uint32_t arm, uint32_t) {
+            return arm == 2 ? 10.0 : 10.5;
+        });
+        t.assert_equal(uint32_t(2), verdict);
+        t.assert_true("share 0.2 stays dropped", tuner.dropped(key, 1));
+    });
+
+    t.test("declines that leave one arm decide share 0 at once", [](testing & t) {
+        ggml_cuda_kv_stream_share_tuner tuner;
+        const ggml_cuda_kv_stream_share_key key = { 1, 0 };
+        tuner.decline(key, 1);
+        tuner.decline(key, 2);
+        t.assert_true("two arms left, no verdict", !tuner.decided(key));
+        tuner.decline(key, 3);
+        t.assert_true("one arm left decides", tuner.decided(key));
+        t.assert_equal(uint32_t(0), tuner.arm(key));
+    });
+
     t.test("cpu page selection takes the highest immutable streamed pages", [](testing & t) {
         using pages = std::vector<uint32_t>;
         using page_state = ggml_cuda_kv_stream_page_state;
@@ -3653,6 +3679,49 @@ int main() {
             !lines.empty() && lines[0].find("median share 0 20.000 ms dropped") != std::string::npos);
         t.assert_true("the line counts 30 samples",
             !lines.empty() && lines[0].find("; 30 samples") != std::string::npos);
+    });
+
+    t.test("a share arm that places no cpu pages leaves the trial", [](testing & t) {
+        if (!ggml_cuda_kv_stream_cpu_attn_supported()) {
+            t.skip("CPU attention needs AVX-512 F, DQ, VNNI, F16C and FMA");
+            return;
+        }
+        constexpr int64_t n_kv = 6*256;
+        constexpr int64_t n_batch = 1;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+        const observe_latency_fn_t observe_fn = query_observe_latency_fn(backend.get());
+        if (!t.assert_true("observe latency proc address resolves", observe_fn != nullptr)) {
+            return;
+        }
+        auto runtime = make_runtime(make_stream_params(backend.get(), 5, 6, 1, 32));
+        if (!t.assert_true("runtime initializes", runtime != nullptr)) {
+            return;
+        }
+        t.assert_true("cpu split scratch allocates",
+            ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 2, N_Q_HEAD, 6, -1.0f));
+
+        // no feedback yet, then 0.2 runs once and leaves; 0, 0.4 and 0.6 each take one warm-up and 8 samples
+        std::vector<uint64_t> expected = { 2, 0, 0, 2, 3 };
+        for (int rotation = 0; rotation < 8; ++rotation) {
+            expected.insert(expected.end(), { 0, 2, 3 });
+        }
+        expected.insert(expected.end(), 4, 2);
+
+        log_capture log("selected cpu share");
+        const attention_inputs inputs = make_inputs(n_kv, n_batch, n_kv);
+        const std::vector<uint64_t> pages = run_share_graphs(
+            backend.get(), runtime.get(), observe_fn, inputs, n_kv, n_batch, expected.size(),
+            [](uint64_t p) { return p == 2 ? 10.0 : 10.5; });
+        t.assert_equal("cpu pages per graph", pages_text(expected), pages_text(pages));
+        const auto lines = log.snapshot();
+        t.assert_equal("one verdict line", size_t(1), lines.size());
+        t.assert_true("the verdict is share 0.4",
+            !lines.empty() && lines[0].find("cpu share 0.4") != std::string::npos);
+        t.assert_true("share 0.2 is marked dropped",
+            !lines.empty() && lines[0].find("0.2 0.000 ms dropped") != std::string::npos);
     });
 
     t.test("a pinned or diagnostic share does not rotate", [](testing & t) {

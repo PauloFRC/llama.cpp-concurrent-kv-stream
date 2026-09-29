@@ -76,6 +76,36 @@ public:
         }
     }
 
+    void decline(const ggml_cuda_kv_stream_share_key & key, uint32_t arm) {
+        if (arm == 0 || arm >= N_ARMS) {
+            return;
+        }
+        entry & e = table_[pack(key)];
+        if (e.decided || e.dropped[arm]) {
+            return;
+        }
+        e.dropped[arm] = true;
+        uint32_t left = 0;
+        uint32_t last = 0;
+        for (uint32_t i = 0; i < N_ARMS; ++i) {
+            if (!e.dropped[i]) {
+                ++left;
+                last = i;
+            }
+        }
+        if (left == 1) {
+            e.verdict = last;
+            e.decided = true;
+            return;
+        }
+        if (!e.probed) {
+            probe(e);
+        }
+        if (!e.decided) {
+            decide(e);
+        }
+    }
+
     bool decided(const ggml_cuda_kv_stream_share_key & key) const {
         const auto it = table_.find(pack(key));
         return it != table_.end() && it->second.decided;

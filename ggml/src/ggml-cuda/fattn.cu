@@ -482,6 +482,7 @@ struct ggml_cuda_kv_stream_transfer_ring {
     ggml_cuda_kv_stream_share_key graph_share_key = {};
     uint32_t graph_share_arm = ggml_cuda_kv_stream_share_tuner::N_ARMS; // N_ARMS: no key
     bool graph_share_trial = false;
+    bool graph_cpu_work = false;
     uint32_t graph_layer_count = 0;
     uint32_t current_layer = KV_STREAM_NO_LAYER;
     size_t next_request = 0;
@@ -515,6 +516,7 @@ struct ggml_cuda_kv_stream_transfer_ring {
     ggml_cuda_kv_stream_share_key last_graph_share_key = {};
     uint32_t last_graph_share_arm = ggml_cuda_kv_stream_share_tuner::N_ARMS;
     bool last_graph_share_trial = false;
+    bool last_graph_cpu_work = false;
     bool last_graph_streamed = false;
     bool copy_sample_recorded = false;
 };
@@ -747,7 +749,11 @@ bool ggml_cuda_kv_stream_transfer_ring_observe_decode_latency(
     if (ring->last_graph_share_arm < ggml_cuda_kv_stream_share_tuner::N_ARMS) {
         const ggml_cuda_kv_stream_share_key key = ring->last_graph_share_key;
         const bool was_decided = ring->share_tuner.decided(key);
-        ring->share_tuner.observe(key, ring->last_graph_share_arm, elapsed_ms);
+        if (ring->last_graph_share_arm != 0 && !ring->last_graph_cpu_work) {
+            ring->share_tuner.decline(key, ring->last_graph_share_arm);
+        } else {
+            ring->share_tuner.observe(key, ring->last_graph_share_arm, elapsed_ms);
+        }
         if (!was_decided && ring->share_tuner.decided(key)) {
             auto & tuner = ring->share_tuner;
             GGML_LOG_WARN(
@@ -2037,6 +2043,7 @@ void ggml_cuda_kv_stream_graph_begin(ggml_cuda_kv_stream_transfer_ring * ring) {
         ring->active_slots : KV_STREAM_COPY_BATCH_PAGES;
     ring->graph_share_arm = ggml_cuda_kv_stream_share_tuner::N_ARMS;
     ring->graph_share_trial = false;
+    ring->graph_cpu_work = false;
     if (ring->cpu_split != nullptr) {
         kv_stream_cpu_split & split = *ring->cpu_split;
         GGML_ASSERT(ggml_cuda_kv_stream_cpu_pool_idle(ring) && "cpu pool busy between graphs");
@@ -2192,6 +2199,7 @@ bool ggml_cuda_kv_stream_graph_add_attention(
         cpu_graph->mask_page_begin = std::min(cpu_graph->mask_page_begin, cpu_pages.front());
         cpu_graph->mask_page_end = std::max(cpu_graph->mask_page_end, cpu_pages.back() + 1);
         plan.cpu_pages = std::move(cpu_pages);
+        ring->graph_cpu_work = true;
     }
     return true;
 }
@@ -2204,6 +2212,7 @@ void ggml_cuda_kv_stream_graph_finalize(
     ring->last_graph_share_key = ring->graph_share_key;
     ring->last_graph_share_arm = ring->graph_share_arm;
     ring->last_graph_share_trial = ring->graph_share_trial;
+    ring->last_graph_cpu_work = ring->graph_cpu_work;
     ring->last_graph_streamed = !ring->graph_requests.empty();
     if (ring->graph_requests.empty()) {
         ring->timing_current = false;

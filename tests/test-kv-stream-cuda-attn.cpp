@@ -984,7 +984,9 @@ int main() {
     });
 
     t.test("share tuner buckets streamed pages by powers of two", [](testing & t) {
-        const std::pair<uint32_t, uint32_t> cases[] = { {1, 0}, {2, 1}, {40, 5}, {370, 8}, {511, 8}, {512, 9} };
+        const std::pair<uint32_t, uint32_t> cases[] = {
+            {1, 0}, {2, 1}, {40, 5}, {370, 8}, {511, 8}, {512, 9}, {UINT32_MAX, 31},
+        };
         for (const auto & [pages, expected] : cases) {
             t.assert_equal(std::to_string(pages) + " pages", expected, ggml_cuda_kv_stream_share_tuner::bucket(pages));
         }
@@ -1199,6 +1201,27 @@ int main() {
         t.assert_true("two arms left, no verdict", !tuner.decided(key));
         tuner.decline(key, 3);
         t.assert_true("one arm left decides", tuner.decided(key));
+        t.assert_equal(uint32_t(0), tuner.arm(key));
+    });
+
+    t.test("a deferred share arm eventually leaves the trial", [](testing & t) {
+        using tuner_t = ggml_cuda_kv_stream_share_tuner;
+        tuner_t tuner;
+        const ggml_cuda_kv_stream_share_key key = { 1, 1 };
+        tuner.decline(key, 1);
+        tuner.decline(key, 2);
+        tuner.defer(key, 0);
+        tuner.defer(key, tuner_t::N_ARMS);
+        t.assert_true("share 0 and an invalid arm are never deferred",
+            !tuner.dropped(key, 0) && !tuner.decided(key));
+        for (uint32_t n = 0; n + 1 < tuner_t::MAX_DEFERRALS; ++n) {
+            tuner.defer(key, 3);
+        }
+        t.assert_true("the arm remains available inside the deferral budget",
+            !tuner.dropped(key, 3) && !tuner.decided(key));
+        tuner.defer(key, 3);
+        t.assert_true("the arm is dropped when its deferral budget is exhausted", tuner.dropped(key, 3));
+        t.assert_true("one remaining arm decides the key", tuner.decided(key));
         t.assert_equal(uint32_t(0), tuner.arm(key));
     });
 
@@ -3835,6 +3858,75 @@ int main() {
             !lines.empty() && lines[0].find("cpu share 0.4") != std::string::npos);
         t.assert_true("share 0.2 is marked dropped",
             !lines.empty() && lines[0].find("0.2 0.000 ms dropped") != std::string::npos);
+    });
+
+    t.test("a share that rounds too low early is retried when the streamed pages grow", [](testing & t) {
+        if (!ggml_cuda_kv_stream_cpu_attn_supported()) {
+            t.skip("CPU attention needs AVX-512 F, DQ, VNNI, F16C and FMA");
+            return;
+        }
+        constexpr int64_t n_kv = 4*256;
+        constexpr int64_t n_batch = 1;
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+        const observe_latency_fn_t observe_fn = query_observe_latency_fn(backend.get());
+        if (!t.assert_true("observe latency proc address resolves", observe_fn != nullptr)) {
+            return;
+        }
+        auto runtime = make_runtime(make_stream_params(backend.get(), 3, 4, 1, 32));
+        if (!t.assert_true("runtime initializes", runtime != nullptr)) {
+            return;
+        }
+        t.assert_true("cpu split scratch allocates",
+            ggml_backend_cuda_kv_stream_set_cpu_split(runtime.get(), 2, N_Q_HEAD, 4, -1.0f));
+
+        // one resident page; page 3 starts dead, so two streamed pages, bucket 1 for both
+        std::vector<uint8_t> live = { 1, 1, 1, 0 };
+        t.assert_true("the reduced live set applies",
+            ggml_backend_cuda_kv_stream_set_live_pages(runtime.get(), live.data(), live.size()));
+        const attention_inputs inputs = make_inputs(n_kv, n_batch, n_kv);
+        const std::vector<uint64_t> before = run_share_graphs(
+            backend.get(), runtime.get(), observe_fn, inputs, n_kv, n_batch, 20,
+            [](uint64_t) { return 10.5; });
+        t.assert_true("two streamed pages place no cpu pages",
+            std::all_of(before.begin(), before.end(), [](uint64_t p) { return p == 0; }));
+
+        live[3] = 1;
+        t.assert_true("the grown live set applies",
+            ggml_backend_cuda_kv_stream_set_live_pages(runtime.get(), live.data(), live.size()));
+        log_capture log("selected cpu share");
+        const std::vector<uint64_t> after = run_share_graphs(
+            backend.get(), runtime.get(), observe_fn, inputs, n_kv, n_batch, 10,
+            [](uint64_t p) { return p == 2 ? 10.0 : 10.5; });
+        t.assert_equal("cpu pages after growth", pages_text(std::vector<uint64_t>(10, 2)), pages_text(after));
+        const auto lines = log.snapshot();
+        t.assert_equal("one verdict line, decided after the growth", size_t(1), lines.size());
+        t.assert_true("the verdict is share 0.6",
+            !lines.empty() && lines[0].find("cpu share 0.6") != std::string::npos);
+        t.assert_true("share 0.6 keeps its samples",
+            !lines.empty() && lines[0].find("0.6 0.000 ms dropped") == std::string::npos);
+
+        auto stable_runtime = make_runtime(make_stream_params(backend.get(), 3, 4, 1, 32));
+        if (!t.assert_true("stable runtime initializes", stable_runtime != nullptr)) {
+            return;
+        }
+        t.assert_true("stable cpu split scratch allocates",
+            ggml_backend_cuda_kv_stream_set_cpu_split(stable_runtime.get(), 2, N_Q_HEAD, 4, -1.0f));
+        live[3] = 0;
+        t.assert_true("the stable live set applies",
+            ggml_backend_cuda_kv_stream_set_live_pages(stable_runtime.get(), live.data(), live.size()));
+        const std::vector<uint64_t> stable = run_share_graphs(
+            backend.get(), stable_runtime.get(), observe_fn, inputs, n_kv, n_batch,
+            ggml_cuda_kv_stream_share_tuner::MAX_DEFERRALS + 16,
+            [](uint64_t) { return 10.5; });
+        t.assert_true("stable two-page graphs place no cpu pages",
+            std::all_of(stable.begin(), stable.end(), [](uint64_t p) { return p == 0; }));
+        const auto stable_lines = log.snapshot();
+        t.assert_equal("the stable key also emits one verdict line", size_t(2), stable_lines.size());
+        t.assert_true("the stable key settles on share 0",
+            stable_lines.size() == 2 && stable_lines[1].find("cpu share 0.0") != std::string::npos);
     });
 
     t.test("a pinned or diagnostic share does not rotate", [](testing & t) {

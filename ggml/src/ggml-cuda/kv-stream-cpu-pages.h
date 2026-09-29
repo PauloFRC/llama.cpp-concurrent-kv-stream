@@ -4,12 +4,17 @@
 #include "kv-stream-geometry.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <vector>
 
 // below this many pages a job may cost more than it saves
 constexpr uint32_t GGML_CUDA_KV_STREAM_CPU_SPLIT_MIN_PAGES = 2;
+
+inline uint32_t ggml_cuda_kv_stream_cpu_pages_for(float share, uint32_t streamed_pages) {
+    return uint32_t(std::lround(share*float(streamed_pages)));
+}
 
 // why a layer cannot hand its pages to the CPU; BLOCK_OK means it can
 enum ggml_cuda_kv_stream_cpu_split_block {

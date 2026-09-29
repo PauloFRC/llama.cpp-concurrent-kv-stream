@@ -16,6 +16,7 @@ struct ggml_cuda_kv_stream_share_key {
 class ggml_cuda_kv_stream_share_tuner {
 public:
     static constexpr uint32_t N_ARMS = 4;
+    static constexpr uint32_t MAX_DEFERRALS = 16;
     static constexpr float SHARES[N_ARMS] = { 0.0f, 0.2f, 0.4f, 0.6f };
 
     explicit ggml_cuda_kv_stream_share_tuner(
@@ -76,6 +77,19 @@ public:
         }
     }
 
+    void defer(const ggml_cuda_kv_stream_share_key & key, uint32_t arm) {
+        if (arm == 0 || arm >= N_ARMS) {
+            return;
+        }
+        entry & e = table_[pack(key)];
+        if (e.decided || e.dropped[arm] || e.kept[arm].size() >= kept_samples_) {
+            return;
+        }
+        if (++e.deferrals[arm] >= MAX_DEFERRALS) {
+            decline(key, arm);
+        }
+    }
+
     void decline(const ggml_cuda_kv_stream_share_key & key, uint32_t arm) {
         if (arm == 0 || arm >= N_ARMS) {
             return;
@@ -130,6 +144,7 @@ private:
     struct entry {
         std::array<std::vector<double>, N_ARMS> kept;
         std::array<uint32_t, N_ARMS> warmups = {};
+        std::array<uint32_t, N_ARMS> deferrals = {};
         std::array<bool, N_ARMS> dropped = {};
         uint32_t next = 0;
         uint32_t verdict = 0;

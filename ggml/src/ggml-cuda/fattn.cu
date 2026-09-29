@@ -278,7 +278,6 @@ struct kv_stream_cpu_split {
     uint32_t context_pages = 0;
     float share = -1.0f;
     cudaStream_t side_stream = nullptr;
-    cudaEvent_t copied = nullptr;
     float * q = nullptr;
     uint16_t * mask = nullptr;
     float * result = nullptr;
@@ -306,9 +305,6 @@ struct kv_stream_cpu_split {
         GGML_ASSERT((pool == nullptr || pool->idle()) && "cpu pool busy at split teardown");
         CUDA_CHECK(cudaDeviceSynchronize());
         pool.reset();
-        if (copied != nullptr) {
-            CUDA_CHECK(cudaEventDestroy(copied));
-        }
         if (side_stream != nullptr) {
             CUDA_CHECK(cudaStreamDestroy(side_stream));
         }
@@ -692,7 +688,6 @@ bool ggml_cuda_kv_stream_transfer_ring_set_cpu_split(
     split->context_pages = context_pages;
     split->share = share;
     if (cudaStreamCreateWithFlags(&split->side_stream, cudaStreamNonBlocking) != cudaSuccess ||
-        cudaEventCreateWithFlags(&split->copied, cudaEventDisableTiming) != cudaSuccess ||
         cudaHostAlloc(reinterpret_cast<void **>(&split->q), row_bytes, cudaHostAllocDefault) != cudaSuccess ||
         cudaHostAlloc(reinterpret_cast<void **>(&split->mask), mask_bytes, cudaHostAllocDefault) != cudaSuccess ||
         cudaHostAlloc(reinterpret_cast<void **>(&split->result), row_bytes, cudaHostAllocMapped) != cudaSuccess ||
@@ -1977,7 +1972,6 @@ static uint32_t kv_stream_cpu_split_dispatch(
     }
     GGML_ASSERT(Q->ne[1] <= split.graph.mask_rows);
     CUDA_CHECK(cudaMemcpyAsync(split.q, Q->data, ggml_nbytes(Q), cudaMemcpyDeviceToHost, split.side_stream));
-    CUDA_CHECK(cudaEventRecord(split.copied, split.side_stream));
 
     kv_stream_cpu_job job;
     ggml_cuda_kv_stream_cpu_attn_params & p = job.params;
@@ -2846,7 +2840,6 @@ void ggml_cuda_flash_attn_ext_streamed(
         const kv_stream_cpu_split & split = *transfer_ring->cpu_split;
         GGML_ASSERT(size_t(nrows) <= split.max_rows);
         cpu_join->join();
-        CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), split.copied, 0));
         ggml_cuda_kernel_launch(kv_stream_accumulate_chunk_results<GGML_CUDA_KV_STREAM_HEAD_DIM>, launch_params,
             split.result_device, split.result_meta_device, accumulator.ptr, accumulator_meta.ptr, nrows, first_chunk, 1);
         CUDA_CHECK(cudaGetLastError());

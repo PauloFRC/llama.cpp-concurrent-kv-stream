@@ -29,6 +29,20 @@ enum ggml_cuda_kv_stream_cpu_split_block {
     GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_COUNT,
 };
 
+inline ggml_cuda_kv_stream_cpu_split_block ggml_cuda_kv_stream_cpu_split_get_cache_block(
+        ggml_type type_k, ggml_type type_v, int64_t head_dim_k, int64_t head_dim_v) {
+    if (type_k != GGML_TYPE_Q8_0) {
+        return GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_K_TYPE;
+    }
+    if (type_v != GGML_TYPE_Q4_0) {
+        return GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_V_TYPE;
+    }
+    if (head_dim_k != GGML_CUDA_KV_STREAM_HEAD_DIM || head_dim_v != GGML_CUDA_KV_STREAM_HEAD_DIM) {
+        return GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_HEAD_DIM;
+    }
+    return GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_OK;
+}
+
 inline ggml_cuda_kv_stream_cpu_split_block ggml_cuda_kv_stream_cpu_split_get_block(const ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
@@ -40,20 +54,16 @@ inline ggml_cuda_kv_stream_cpu_split_block ggml_cuda_kv_stream_cpu_split_get_blo
     memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
     memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
 
-    if (K->type != GGML_TYPE_Q8_0) {
-        return GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_K_TYPE;
-    }
-    if (V->type != GGML_TYPE_Q4_0) {
-        return GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_V_TYPE;
+    const ggml_cuda_kv_stream_cpu_split_block cache_block =
+        ggml_cuda_kv_stream_cpu_split_get_cache_block(K->type, V->type, Q->ne[0], V->ne[0]);
+    if (cache_block != GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_OK) {
+        return cache_block;
     }
     if (Q->type != GGML_TYPE_F32) {
         return GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_Q_TYPE;
     }
     if (ggml_nbytes(Q) != size_t(ggml_nelements(Q))*sizeof(float)) {
         return GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_Q_GAP;
-    }
-    if (Q->ne[0] != GGML_CUDA_KV_STREAM_HEAD_DIM || V->ne[0] != GGML_CUDA_KV_STREAM_HEAD_DIM) {
-        return GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_HEAD_DIM;
     }
     if (Q->ne[1] > GGML_CUDA_KV_STREAM_MAX_DECODE_QUERY_TOKENS) {
         return GGML_CUDA_KV_STREAM_CPU_SPLIT_BLOCK_QUERY_TOKENS;

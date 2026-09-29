@@ -1564,7 +1564,7 @@ ggml_backend_buffer_type_t llama_kv_cache::kv_stream_init_runtime(
     using mark_dirty_rows_fn_t = kv_stream_runtime_owner::mark_dirty_rows_fn_t;
     using set_live_pages_fn_t = kv_stream_runtime_owner::set_live_pages_fn_t;
     using invalidate_fn_t = kv_stream_runtime_owner::invalidate_fn_t;
-    using cpu_attn_supported_fn_t = kv_stream_runtime_owner::cpu_attn_supported_fn_t;
+    using cpu_split_reason_fn_t = const char * (*)(ggml_type, ggml_type, uint32_t, uint32_t);
 
     auto * type_pair_supported_fn = (type_pair_supported_fn_t) ggml_backend_reg_get_proc_address(
         reg, "ggml_backend_cuda_kv_stream_type_pair_supported");
@@ -1594,14 +1594,8 @@ ggml_backend_buffer_type_t llama_kv_cache::kv_stream_init_runtime(
         reg, "ggml_backend_cuda_kv_stream_set_live_pages");
     auto * invalidate_fn = (invalidate_fn_t) ggml_backend_reg_get_proc_address(
         reg, "ggml_backend_cuda_kv_stream_invalidate");
-    auto * cpu_attn_supported_fn = (cpu_attn_supported_fn_t) ggml_backend_reg_get_proc_address(
-        reg, "ggml_backend_cuda_kv_stream_cpu_attn_supported");
-
-    if (cpu_threads > 0 && cpu_attn_supported_fn != nullptr && !cpu_attn_supported_fn()) {
-        throw std::runtime_error(
-            "block KV streaming CPU attention is not available in this build or on this CPU "
-            "(it needs AVX-512 F, DQ, VNNI, F16C and FMA)");
-    }
+    auto * cpu_split_reason_fn = (cpu_split_reason_fn_t) ggml_backend_reg_get_proc_address(
+        reg, "ggml_backend_cuda_kv_stream_cpu_split_reason");
 
     if (type_pair_supported_fn == nullptr || page_bytes_fn == nullptr ||
             workspace_bytes_fn == nullptr || runtime_new_fn == nullptr ||
@@ -1635,6 +1629,18 @@ ggml_backend_buffer_type_t llama_kv_cache::kv_stream_init_runtime(
             page_tokens, &conversion_bytes)) {
         throw std::runtime_error("invalid block KV streaming conversion workspace geometry");
     }
+
+    if (cpu_threads > 0) {
+        if (cpu_split_reason_fn == nullptr) {
+            throw std::runtime_error(
+                "block KV streaming CPU attention is not in this CUDA backend");
+        }
+        if (const char * reason = cpu_split_reason_fn(
+                type_k, type_v, hparams.n_embd_head_k(il), hparams.n_embd_head_v(il))) {
+            throw std::runtime_error(std::string("block KV streaming CPU attention cannot run: ") + reason);
+        }
+    }
+
     kv_stream_runtime.runtime = runtime_new_fn(
         dev, stage_bytes, page_bytes, conversion_bytes, layer_count);
     kv_stream_runtime.free_fn = runtime_free_fn;
@@ -1646,7 +1652,6 @@ ggml_backend_buffer_type_t llama_kv_cache::kv_stream_init_runtime(
     kv_stream_runtime.mark_dirty_rows_fn = mark_dirty_rows_fn;
     kv_stream_runtime.set_live_pages_fn = set_live_pages_fn;
     kv_stream_runtime.invalidate_fn = invalidate_fn;
-    kv_stream_runtime.cpu_attn_supported_fn = cpu_attn_supported_fn;
     kv_stream_runtime.layer_count = layer_count;
     if (kv_stream_runtime.runtime == nullptr) {
         throw std::runtime_error("failed to create CUDA block KV streaming runtime");
@@ -1667,21 +1672,15 @@ void llama_kv_cache::kv_stream_init_cpu_split(
     }
     const uint32_t n_threads_max = std::thread::hardware_concurrency();
     const uint32_t n_threads_eff = llama_kv_stream_cpu_threads_resolve(n_threads, n_threads_max);
-    if (kv_stream_runtime.cpu_attn_supported_fn == nullptr) {
-        LLAMA_LOG_WARN("%s: this build has no CPU attention over streamed KV pages; the split stays off\n",
-            __func__);
-        return;
-    }
     using set_cpu_split_fn_t = bool (*)(void *, uint32_t, uint32_t, uint32_t, float);
     auto * set_cpu_split_fn = (set_cpu_split_fn_t) ggml_backend_reg_get_proc_address(
         ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_kv_stream_set_cpu_split");
     if (set_cpu_split_fn == nullptr) {
-        LLAMA_LOG_WARN("%s: the CUDA backend does not export the CPU split entry point "
-            "(libllama and ggml-cuda builds do not match); the split stays off\n", __func__);
-        return;
+        throw std::runtime_error(
+            "block KV streaming CPU attention is not in this CUDA backend (libllama and ggml-cuda builds do not match)");
     }
     if (!set_cpu_split_fn(kv_stream_runtime.runtime, n_threads_eff, n_head, context_pages, share)) {
-        return; // the ggml side warns when the scratch allocation fails
+        throw std::runtime_error("block KV streaming CPU attention failed to start, see the log above");
     }
     if (n_threads_eff != n_threads) {
         LLAMA_LOG_WARN("%s: %u CPU attention threads requested, clamped to this machine's %u\n",

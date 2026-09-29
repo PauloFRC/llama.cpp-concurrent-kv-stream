@@ -70,6 +70,7 @@
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml-cuda/kv-stream-cpu-attn.h"
+#include "ggml-cuda/kv-stream-cpu-pages.h"
 #include "ggml.h"
 
 #include <algorithm>
@@ -6493,9 +6494,13 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_cuda_buffer_set_preferred_host") == 0) {
         return (void *) ggml_backend_cuda_buffer_set_preferred_host;
     }
-    if (strcmp(name, "ggml_backend_cuda_kv_stream_cpu_attn_supported") == 0) {
-        return (void *) +[]() {
-            return ggml_cuda_kv_stream_cpu_attn_supported();
+    if (strcmp(name, "ggml_backend_cuda_kv_stream_cpu_split_reason") == 0) {
+        return (void *) +[](ggml_type type_k, ggml_type type_v, uint32_t head_dim_k, uint32_t head_dim_v) -> const char * {
+            if (!ggml_cuda_kv_stream_cpu_attn_supported()) {
+                return "it needs a CUDA build for x86-64 and a CPU with AVX-512 F, DQ, VNNI, F16C and FMA";
+            }
+            return ggml_cuda_kv_stream_cpu_split_block_reason(
+                ggml_cuda_kv_stream_cpu_split_get_cache_block(type_k, type_v, head_dim_k, head_dim_v));
         };
     }
     if (strcmp(name, "ggml_backend_cuda_kv_stream_type_pair_supported") == 0) {

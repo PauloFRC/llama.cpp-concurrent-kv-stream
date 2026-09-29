@@ -292,6 +292,14 @@ invalidate_fn_t query_invalidate_fn(ggml_backend_t backend) {
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_kv_stream_invalidate"));
 }
 
+using cpu_split_reason_fn_t = const char * (*)(ggml_type, ggml_type, uint32_t, uint32_t);
+
+cpu_split_reason_fn_t query_cpu_split_reason_fn(ggml_backend_t backend) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+    return reinterpret_cast<cpu_split_reason_fn_t>(
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_kv_stream_cpu_split_reason"));
+}
+
 size_t query_conversion_bytes(ggml_backend_t backend, ggml_type type_k, ggml_type type_v) {
     using workspace_fn_t = bool (*)(
         ggml_type, ggml_type, uint32_t, uint32_t, uint32_t, uint32_t, size_t *);
@@ -1284,6 +1292,31 @@ int main() {
                 static_cast<ggml_cuda_kv_stream_cpu_split_block>(block));
             t.assert_true("every block reason is named", reason != nullptr && reason[0] != '\0');
         }
+    });
+
+    t.test("the cpu split reason names why a cache cannot split", [](testing & t) {
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        if (!t.assert_true("CUDA backend initializes", backend != nullptr)) {
+            return;
+        }
+        const cpu_split_reason_fn_t reason_fn = query_cpu_split_reason_fn(backend.get());
+        if (!t.assert_true("cpu split reason proc address resolves", reason_fn != nullptr)) {
+            return;
+        }
+        auto reason = [&](ggml_type type_k, ggml_type type_v, uint32_t head_dim) {
+            const char * text = reason_fn(type_k, type_v, head_dim, head_dim);
+            return std::string(text == nullptr ? "" : text);
+        };
+        if (!ggml_cuda_kv_stream_cpu_attn_supported()) {
+            t.assert_true("a build without the kernel names AVX-512",
+                reason(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, HEAD_DIM).find("AVX-512") != std::string::npos);
+            return;
+        }
+        t.assert_equal("q8_0 K and q4_0 V at head dim 256 can split",
+            std::string(), reason(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, HEAD_DIM));
+        t.assert_equal("an f16 K", std::string("K cache is not q8_0"), reason(GGML_TYPE_F16, GGML_TYPE_Q4_0, HEAD_DIM));
+        t.assert_equal("a q8_0 V", std::string("V cache is not q4_0"), reason(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, HEAD_DIM));
+        t.assert_equal("head dim 128", std::string("head dim is not 256"), reason(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 128));
     });
 
     t.test("cpu split reports a declining layer once per run", [](testing & t) {

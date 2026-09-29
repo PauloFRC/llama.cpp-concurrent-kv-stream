@@ -39,6 +39,8 @@ Example using the tested cache configuration:
 
 The best value for `--kv-stream-stage-mib` depends on the model, context capacity, GPU, and other VRAM consumers. Start conservatively and increase it while checking startup and peak VRAM use.
 
+`--kv-stream-cpu-threads N` lets N CPU threads compute attention over part of the streamed pages while the GPU handles the rest. It needs a CUDA build for x86-64, a CPU with AVX-512 F, DQ, VNNI, F16C and FMA, `-ctk q8_0 -ctv q4_0` and a head dim of 256.
+
 ### Batch and micro-batch sizes
 
 `-b` sets the logical prompt batch size and `-ub` sets the largest physical batch submitted to one graph. This branch no longer requires `256/256`; `-ub` may be any positive value no larger than `-b`.

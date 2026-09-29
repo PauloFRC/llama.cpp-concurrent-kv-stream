@@ -1772,6 +1772,40 @@ int main() {
 #endif
     });
 
+    t.test("a pool thread that cannot be pinned warns and still runs its jobs", [](testing & t) {
+#if defined(__linux__)
+        cpu_set_t allowed;
+        CPU_ZERO(&allowed);
+        if (!t.assert_true("affinity query works", sched_getaffinity(0, sizeof(allowed), &allowed) == 0)) {
+            return;
+        }
+        int outside = -1;
+        for (int cpu = CPU_SETSIZE - 1; cpu >= 0 && outside < 0; --cpu) {
+            if (!CPU_ISSET(cpu, &allowed)) {
+                outside = cpu;
+            }
+        }
+        if (outside < 0) {
+            t.skip("every cpu is in the affinity mask");
+            return;
+        }
+        struct job {};
+        constexpr int n_threads = 2;
+        log_capture log("runs unpinned");
+        std::atomic<int> runs{0};
+        {
+            ggml_cuda_kv_stream_cpu_pool<job> pool(n_threads, 1, [&](const job &, int, int) { ++runs; }, {outside});
+            const uint32_t id = pool.arm({});
+            pool.release();
+            pool.wait(id);
+        }
+        t.assert_equal("every thread ran the job", n_threads, runs.load());
+        t.assert_equal("one warning per thread", size_t(n_threads), log.snapshot().size());
+#else
+        t.skip("CPU pinning needs Linux");
+#endif
+    });
+
     t.test("cpu attention kernel agrees with CUDA attention", [](testing & t) {
         if (!ggml_cuda_kv_stream_cpu_attn_supported()) {
             t.skip("CPU attention needs AVX-512 F, DQ, VNNI, F16C and FMA");

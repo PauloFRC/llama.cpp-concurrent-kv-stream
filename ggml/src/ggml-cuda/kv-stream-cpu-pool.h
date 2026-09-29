@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml.h"
+#include "../ggml-impl.h"
 
 #include <condition_variable>
 #include <cstdint>
@@ -64,9 +65,21 @@ public:
         GGML_ASSERT(cpus.empty() && "CPU pinning needs Linux");
 #endif
         threads_.reserve(n_threads);
-        for (int thread = 0; thread < n_threads; ++thread) {
-            const int cpu = cpus.empty() ? -1 : cpus[thread % cpus.size()];
-            threads_.emplace_back([this, thread, cpu] { run(thread, cpu); });
+        try {
+            for (int thread = 0; thread < n_threads; ++thread) {
+                const int cpu = cpus.empty() ? -1 : cpus[thread % cpus.size()];
+                threads_.emplace_back([this, thread, cpu] { run(thread, cpu); });
+            }
+        } catch (...) {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                stop_ = true;
+            }
+            ready_cv_.notify_all();
+            for (auto & thread : threads_) {
+                thread.join();
+            }
+            throw;
         }
     }
 
@@ -132,7 +145,9 @@ private:
             cpu_set_t set;
             CPU_ZERO(&set);
             CPU_SET(cpu, &set);
-            GGML_ASSERT(pthread_setaffinity_np(pthread_self(), sizeof(set), &set) == 0);
+            if (pthread_setaffinity_np(pthread_self(), sizeof(set), &set) != 0) {
+                GGML_LOG_WARN("kv stream cpu pool: cannot pin a worker to cpu %d, it runs unpinned\n", cpu);
+            }
         }
 #else
         GGML_UNUSED(cpu);
